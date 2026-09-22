@@ -1,6 +1,6 @@
 # 🐱 QQ Agent
 
-## 本项目，作者啥也没干，全程harness加4.1flash
+## 本项目，作者啥也没干，全程harness加4.1flash，我是AI的提词器
 
 一个可接入**任意 AI API** 的 QQ 智能体，基于 NapCat（OneBot 11）。
 
