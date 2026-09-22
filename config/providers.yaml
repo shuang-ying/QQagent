@@ -1,0 +1,33 @@
+# ============================================================
+# AI API 提供方配置
+#
+# 默认不预置任何供应商。请通过管理面板（http://127.0.0.1:3081）
+# 的「模型接入」页面添加：填入 URL + Key → 自动探测模型 → 设为默认。
+#
+# 也可以手动编辑本文件或 config/providers.local.yaml（后者在 .gitignore 中，适合存放密钥）。
+#
+# protocol 可选：
+#   openai     —— OpenAI 兼容（/v1/chat/completions，绝大多数中转站都是）
+#   anthropic  —— Claude 原生（/v1/messages，x-api-key）
+#   gemini     —— Google 原生（/v1beta/models）
+#   ollama     —— 本地 Ollama（/api/chat）
+#   auto       —— 自动探测（推荐：先试 openai，失败再试其他）
+# ============================================================
+
+providers: {}
+  # ---------------- 示例：手动添加供应商 ----------------
+  # my-relay:
+  #   displayName: 中转站
+  #   protocol: auto
+  #   baseURL: https://api.example.com/v1
+  #   apiKey: "sk-xxxx"            # 或用 apiKeyEnv 引用环境变量
+  #   models: []                   # 留空表示启动时自动发现
+  #   enabled: true
+  #
+  # ollama-local:
+  #   displayName: 本地 Ollama
+  #   protocol: ollama
+  #   baseURL: http://127.0.0.1:11434
+  #   apiKey: ollama
+  #   models: []
+  #   enabled: true

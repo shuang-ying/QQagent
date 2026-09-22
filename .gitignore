@@ -1,0 +1,20 @@
+node_modules/
+dist/
+data/
+runtime/
+logs/
+*.log
+
+# 本地私密配置：含 API key，绝不外传
+config/providers.local.yaml
+config/app.local.yaml
+.env
+.env.local
+
+.DS_Store
+Thumbs.db
+
+# 表情包：从 QQ 收藏下载的图是你的个人内容，且可能涉及版权，不要提交
+config/stickers/qq/
+# AI 识别结果属于生成状态，首次加载会自动重建
+config/stickers/manifest.json

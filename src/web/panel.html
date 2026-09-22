@@ -1,0 +1,1560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QQ Agent 管理面板</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --border:#2a2f3a;
+    --text:#e4e7ec; --dim:#8b93a1; --accent:#6b8afd; --accent2:#4a6cf7;
+    --ok:#3ecf8e; --warn:#f0b429; --err:#f45b69; --pink:#ff7ab6;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6}
+  .layout{display:flex;min-height:100vh}
+  nav{width:200px;background:var(--panel);border-right:1px solid var(--border);padding:20px 0;position:sticky;top:0;height:100vh;flex-shrink:0}
+  nav h1{font-size:15px;padding:0 20px 16px;font-weight:600}
+  nav h1 small{display:block;font-size:11px;color:var(--dim);font-weight:400;margin-top:2px}
+  nav a{display:block;padding:9px 20px;color:var(--dim);text-decoration:none;border-left:2px solid transparent;cursor:pointer;font-size:13px}
+  nav a:hover{color:var(--text);background:var(--panel2)}
+  nav a.active{color:var(--accent);border-left-color:var(--accent);background:var(--panel2)}
+  main{flex:1;padding:24px 28px;max-width:1200px;overflow-x:hidden}
+  .page{display:none}
+  .page.active{display:block}
+  h2{font-size:19px;margin-bottom:4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:16px}
+  .card h3{font-size:14px;margin-bottom:12px}
+  .grid{display:grid;gap:12px}
+  .grid.c2{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+  .grid.c3{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  .grid.c4{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+  .stat{background:var(--panel2);border-radius:8px;padding:14px}
+  .stat .v{font-size:22px;font-weight:600}
+  .stat .k{font-size:12px;color:var(--dim)}
+  label{display:block;font-size:12px;color:var(--dim);margin-bottom:5px}
+  input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:7px;font-family:inherit;font-size:13px;outline:none}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+  textarea{resize:vertical;min-height:80px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  button{background:var(--accent2);color:#fff;border:none;padding:8px 16px;border-radius:7px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s}
+  button:hover{background:var(--accent)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--dim)}
+  button.ghost:hover{background:var(--panel2);color:var(--text)}
+  button.sm{padding:4px 10px;font-size:12px}
+  button.danger{background:transparent;border:1px solid var(--err);color:var(--err)}
+  .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+  .row>*{flex:1;min-width:140px}
+  .row>button{flex:0 0 auto}
+  .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;background:var(--panel2);color:var(--dim);margin-right:4px}
+  .tag.ok{background:rgba(62,207,142,.15);color:var(--ok)}
+  .tag.err{background:rgba(244,91,105,.15);color:var(--err)}
+  .tag.warn{background:rgba(240,180,41,.15);color:var(--warn)}
+  .tag.acc{background:rgba(107,138,253,.15);color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  tr:hover td{background:var(--panel2)}
+  .msg{padding:8px 12px;border-radius:7px;margin-bottom:8px;font-size:13px}
+  .msg.ok{background:rgba(62,207,142,.12);color:var(--ok)}
+  .msg.err{background:rgba(244,91,105,.12);color:var(--err)}
+  .msg.info{background:rgba(107,138,253,.12);color:var(--accent)}
+  .log{background:#0a0c10;border-radius:8px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;max-height:500px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:#b8c0cc}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:var(--accent)}
+  .persona-card{display:flex;gap:12px;align-items:flex-start}
+  .persona-emoji{font-size:26px;line-height:1}
+  .muted{color:var(--dim);font-size:12px}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-1px;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .empty{text-align:center;color:var(--dim);padding:30px;font-size:13px}
+  .emotion-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+  .scroll{max-height:420px;overflow:auto}
+  details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
+  details[open] summary{color:var(--text)}
+  .kv{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .kv:last-child{border-bottom:none}
+  .kv span:first-child{color:var(--dim)}
+
+  /* 开关 */
+  .switch{position:relative;display:inline-block;width:42px;height:23px;flex:0 0 auto}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;inset:0;background:#39404f;transition:.2s;border-radius:23px}
+  .slider:before{position:absolute;content:"";height:17px;width:17px;left:3px;bottom:3px;background:#fff;transition:.2s;border-radius:50%}
+  .switch input:checked + .slider{background:var(--ok)}
+  .switch input:disabled + .slider{opacity:.45;cursor:not-allowed}
+  .slider:before{transition:.2s}
+  .switch input:checked + .slider:before{transform:translateX(19px)}
+  .toggle-row{display:flex;align-items:flex-start;gap:12px;padding:11px 12px;background:var(--panel2);border-radius:8px}
+  .toggle-row .txt{flex:1;min-width:0}
+  .toggle-row .t{font-size:13px}
+  .toggle-row .d{font-size:12px;color:var(--dim);margin-top:2px}
+  .toggle-row select{margin-top:7px;font-size:12px;padding:5px 8px}
+
+  /* 模态框 */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:flex-start;justify-content:center;z-index:100;overflow:auto;padding:40px 16px}
+  .modal.open{display:flex}
+  .modal-box{background:var(--panel);border:1px solid var(--border);border-radius:12px;width:100%;max-width:720px;padding:22px}
+  .modal-box h3{margin-bottom:14px;font-size:16px}
+  .field{margin-bottom:13px}
+  .field label{display:block;font-size:12px;color:var(--dim);margin-bottom:5px}
+  .modal-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:18px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .role-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;background:var(--panel2);border-radius:8px;margin-bottom:10px}
+  .role-row .meta{flex:1 1 180px;min-width:160px}
+  .role-row select{flex:1 1 150px;min-width:130px;font-size:12px;padding:6px 8px}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:rgba(107,138,253,.15);color:var(--accent)}
+  .pill.grey{background:var(--panel);color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav>
+    <h1>🐱 QQ Agent<small>管理面板</small></h1>
+    <a data-page="overview" class="active">📊 概览</a>
+    <a data-page="providers">🔌 模型接入</a>
+    <a data-page="personas">🎭 人格</a>
+    <a data-page="stickers">🖼 表情包</a>
+    <a data-page="access">🔐 权限</a>
+    <a data-page="memory">🧠 记忆</a>
+    <a data-page="emotion">📈 情绪</a>
+    <a data-page="logs">📜 日志</a>
+  </nav>
+  <main>
+    <div id="toast"></div>
+
+    <div class="page active" id="page-overview">
+      <h2>运行概览</h2>
+      <div class="sub">Agent 实时状态与数据统计</div>
+      <div class="card"><h3>连接状态</h3><div class="grid c4" id="statusGrid"></div></div>
+      <div class="card"><h3>数据统计</h3><div class="grid c4" id="statsGrid"></div></div>
+      <div class="card">
+        <h3>功能开关 <span class="muted" style="font-weight:400">改动即时生效并写回 config/app.yaml</span></h3>
+        <div id="featureGroups"></div>
+      </div>
+      <div class="card"><h3>Token 用量</h3><div class="grid c3" id="usageGrid"></div><div id="usageTable"></div></div>
+    </div>
+
+    <div class="page" id="page-providers">
+      <h2>模型接入</h2>
+      <div class="sub">填入任意 AI API 的地址和密钥，点击「搜索模型」自动探测可用模型列表，然后保存为供应商</div>
+      <div class="card">
+        <h3>搜索可用模型</h3>
+        <div class="row" style="margin-bottom:10px">
+          <div style="flex:2"><label>API 地址（支持各种写法）</label><input id="discUrl" placeholder="https://api.example.com  或  https://api.example.com/v1"></div>
+          <div style="flex:2"><label>API Key</label><input id="discKey" type="password" placeholder="sk-..."></div>
+          <div style="flex:0 0 130px"><label>协议</label>
+            <select id="discProto">
+              <option value="auto">自动探测</option>
+              <option value="openai">OpenAI 兼容</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="gemini">Gemini</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </div>
+          <button id="discBtn">搜索模型</button>
+        </div>
+        <div class="muted">地址可写成 <span class="mono">https://x.com</span>、<span class="mono">https://x.com/v1</span>，甚至直接粘贴 <span class="mono">/chat/completions</span> 完整端点，都会自动归一化。</div>
+        <div id="discResult" style="margin-top:14px"></div>
+        <div id="saveProviderForm" style="display:none;margin-top:14px"></div>
+      </div>
+      <div class="card">
+        <h3>已配置的供应商</h3>
+        <div class="muted" style="margin-bottom:10px" id="defaultModelInfo"></div>
+        <div id="providerList"></div>
+      </div>
+
+      <div class="card">
+        <h3>模型用途 <span class="muted" style="font-weight:400">不同环节可以各用各的模型，留空表示继承默认</span></h3>
+        <div class="muted" id="roleDefaultInfo" style="margin-bottom:12px"></div>
+        <div id="roleList"></div>
+        <div id="embeddingStats" style="margin-top:12px"></div>
+      </div>
+    </div>
+
+    <div class="page" id="page-access">
+      <h2>访问控制</h2>
+      <div class="sub">控制谁能用、在哪些群能用、谁是管理员；改动立即生效并写回 config/app.yaml</div>
+
+      <div class="card">
+        <h3>当前生效范围</h3>
+        <div class="grid c3" id="accessSummary"></div>
+      </div>
+
+      <div class="card">
+        <h3>QQ 名单</h3>
+        <div class="muted" style="margin-bottom:12px">
+          每行一个 QQ 号，也可以用逗号/空格分隔。留空表示不限制。
+        </div>
+        <div id="accessLists"></div>
+        <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+          <button id="accessSaveBtn" onclick="saveAccess()">保存名单</button>
+          <button class="ghost" onclick="loadAccess()">重新载入</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>管理员开关</h3>
+        <div id="accessFlags"></div>
+      </div>
+
+      <div class="card">
+        <h3>提示</h3>
+        <div class="muted" style="line-height:1.9">
+          · <b>黑名单优先级最高</b>：在黑名单里的 QQ 一律不处理（连命令也不响应）。<br>
+          · <b>白名单非空即启用</b>：用户白名单只填一个人，就只有那个人能用（私聊和群聊都算）。<br>
+          · <b>群白名单</b>只影响群聊，私聊不受影响。<br>
+          · 开启「仅管理员」前请先填管理员 QQ，否则没人能用这些命令 —— 面板会拦下这种配置。<br>
+          · 提示词注入无法 100% 杜绝，最有效的还是<b>控制机器人进哪些群</b>。
+        </div>
+      </div>
+    </div>
+
+    <div class="page" id="page-personas">
+      <h2>人格系统</h2>
+      <div class="sub">每个会话（私聊 / 每个群）可独立设置人格；也可以自己新增人格</div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+          <h3 style="margin:0">可用人格 <span class="muted" id="personaCount"></span></h3>
+          <div style="display:flex;gap:8px">
+            <button class="sm ghost" onclick="reloadPersonas()">重新加载文件</button>
+            <button class="sm" onclick="openPersonaEditor(null)">＋ 新建人格</button>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:12px">默认人格：<span class="tag acc" id="defaultPersona"></span></div>
+        <div class="grid c2" id="personaList"></div>
+      </div>
+      <div class="card"><h3>会话人格设置</h3>
+        <div class="scroll" id="sessionList"></div>
+      </div>
+    </div>
+
+    <div class="page" id="page-stickers">
+      <h2>表情包</h2>
+      <div class="sub">把 QQ 账号的收藏表情拉到本地，让 AI 看懂每张图的意思，再按聊天情境自动发出去</div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <h3 style="margin:0">库状态 <span class="muted" id="stkCount"></span></h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="sm" id="stkImportBtn" onclick="importStickers()">⬇ 从 QQ 收藏导入</button>
+            <button class="sm" id="stkAnalyzeBtn" onclick="analyzeStickers()">🤖 用 AI 识别含义</button>
+            <button class="sm ghost" onclick="reloadStickers()">重新扫描</button>
+          </div>
+        </div>
+        <div id="stkStats" class="grid c2" style="margin-top:12px"></div>
+        <div id="stkHint" class="muted" style="margin-top:10px"></div>
+        <div id="stkProgress" class="muted" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+          <h3 style="margin:0">关于「自动发送」</h3>
+          <button class="sm ghost" onclick="pushStickerDesc()">↗ 把描述回写到 QQ</button>
+        </div>
+        <div class="muted" style="line-height:1.9">
+          两条路都开着，可以各自开关（在「概览 → 功能开关 → 回复行为」）：<br>
+          <b>① 模型自主决定</b>：提示词里带上每张图的标签和描述，模型觉得该发时会在正文末尾写
+          <span class="mono">[表情:标签]</span>，正文照常发，然后单独发一条图。<br>
+          <b>② 按情绪自动补图</b>：模型没主动发时，命中情绪且强度够就自己补一张。
+          受<b>冷却</b>和<b>概率</b>限制 —— 每次都发会显得很机械，也容易招人烦。<br>
+          <span class="muted">建议：先只开 ①，观察一阵再考虑开 ②；② 的冷却别低于 120 秒。</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+          <h3 style="margin:0">表情包列表</h3>
+          <div class="muted" id="stkFilterInfo"></div>
+        </div>
+        <div class="grid c3" id="stkList"></div>
+      </div>
+    </div>
+
+    <div class="page" id="page-memory">
+      <h2>记忆系统</h2>
+      <div class="sub">以 QQ 号为唯一 ID，跨会话共享身份类事实，对话内容按会话隔离</div>
+      <div class="card">
+        <div class="row">
+          <div><label>搜索记忆 / 消息</label><input id="memQuery" placeholder="输入关键词，如：可乐、职业"></div>
+          <button id="memSearchBtn">搜索</button>
+        </div>
+        <div id="memSearchResult" style="margin-top:14px"></div>
+      </div>
+      <div class="card"><h3>用户列表 <span class="muted" id="userCount"></span></h3><div class="scroll" id="userList"></div></div>
+      <div class="card" id="userDetailCard" style="display:none">
+        <h3 id="userDetailTitle"></h3>
+        <div id="userDetail"></div>
+      </div>
+
+      <div class="card">
+        <h3>话题（每个会话下的多条对话线）</h3>
+        <div class="muted" style="margin-bottom:12px">
+          一个私聊/群可以开多个话题，各自独立上下文与摘要；人格和 token 用量按话题统计。
+          QQ 里用 <span class="mono">/new</span> 和 <span class="mono">/topics</span> 操作。
+        </div>
+        <div class="row" style="margin-bottom:12px">
+          <div><label>选择会话</label><select id="convScope" onchange="loadConversations()"><option value="">— 先加载会话 —</option></select></div>
+          <div style="flex:0 0 220px"><label>新话题标题（可留空）</label><input id="convNewTitle" placeholder="例如：读书记录"></div>
+          <button onclick="newConversation()">＋ 新建话题</button>
+        </div>
+        <div id="convList"></div>
+      </div>
+    </div>
+
+    <div class="page" id="page-emotion">
+      <h2>情绪分析</h2>
+      <div class="sub">规则 + LLM 混合提取，EMA 平滑跟踪用户情绪状态</div>
+      <div class="card">
+        <div class="row">
+          <div><label>选择用户</label><select id="emoUser"><option value="">— 请先加载用户 —</option></select></div>
+          <button id="emoLoadBtn">查看情绪</button>
+        </div>
+      </div>
+      <div id="emoContent"></div>
+    </div>
+
+    <div class="page" id="page-logs">
+      <h2>运行日志</h2>
+      <div class="sub">最近的服务端日志</div>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <div style="flex:0 0 150px"><label>显示行数</label>
+            <select id="logLines"><option>100</option><option selected>200</option><option>500</option></select>
+          </div>
+          <button id="logRefresh">刷新</button>
+        </div>
+        <div class="log" id="logBox">加载中…</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 人格编辑器 -->
+<div class="modal" id="personaModal">
+  <div class="modal-box">
+    <h3 id="personaModalTitle">编辑人格</h3>
+    <input type="hidden" id="pf_originalId">
+    <div class="grid2">
+      <div class="field">
+        <label>人格 ID（英文小写，创建后建议不要再改）</label>
+        <input id="pf_id" placeholder="my-persona">
+      </div>
+      <div class="field">
+        <label>显示名称</label>
+        <input id="pf_name" placeholder="我的人格">
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="field">
+        <label>图标 Emoji</label>
+        <input id="pf_emoji" placeholder="🤖">
+      </div>
+      <div class="field">
+        <label>一句话描述</label>
+        <input id="pf_desc" placeholder="简短说明这个人格的性格">
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="field">
+        <label>温度 temperature（0~2，越高越随性）</label>
+        <input id="pf_temp" type="number" step="0.1" min="0" max="2" placeholder="留空用全局默认">
+      </div>
+      <div class="field">
+        <label>最大回复 tokens（留空用全局默认）</label>
+        <input id="pf_maxTokens" type="number" min="1" placeholder="留空用全局默认">
+      </div>
+    </div>
+    <div class="field">
+      <label>System Prompt（人格设定，越具体越稳定）</label>
+      <textarea id="pf_prompt" style="min-height:160px" placeholder="你是一个……&#10;&#10;说话风格：……"></textarea>
+    </div>
+    <div class="field">
+      <label>预设对话（可选）：作为<b>真实对话轮次</b>发给模型，比写在提示词里更能稳住语气。每行一条，格式 <span class="mono">用户说=它回答</span></label>
+      <textarea id="pf_examples" style="min-height:90px" placeholder="在吗=在的喵~ 主人叫小白做什么呀？&#10;今天好累啊=呜……主人辛苦啦喵，要不要休息一会儿？"></textarea>
+    </div>
+    <div class="field">
+      <label>出错时的回复（可选）：模型调用失败时用它代替默认文案，建议按人格口吻写</label>
+      <input id="pf_errmsg" placeholder="呜…小白刚刚走神了一下，能再说一遍吗喵？">
+    </div>
+    <div class="field">
+      <label>情绪调制（可选）：用户情绪 → 你该怎么调整语气，每行一条，格式 <span class="mono">情绪=提示</span></label>
+      <textarea id="pf_emotion" style="min-height:90px" placeholder="joy=跟着一起开心&#10;sadness=放软语气安慰对方&#10;anger=先安抚情绪，不要顶嘴"></textarea>
+    </div>
+    <div class="field">
+      <label>触发关键词（可选，逗号分隔；命中即回复，仅在不要求 @ 时生效）</label>
+      <input id="pf_keywords" placeholder="猫咪, 喵">
+    </div>
+    <div class="field">
+      <label>被戳一戳时的回应（可选，每行一条；被戳时随机挑一条）</label>
+      <textarea id="pf_pokereplies" style="min-height:60px" placeholder="喵！别戳啦~&#10;在的在的，主人找我吗？"></textarea>
+    </div>
+    <div id="pf_error"></div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closePersonaEditor()">取消</button>
+      <button onclick="savePersona()" id="pf_saveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function api(p, opt) {
+  const r = await fetch(p, opt);
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { const j = await r.json(); msg = j.error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+const post = (p, body) => api(p, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtTime = (ts) => ts ? new Date(ts).toLocaleString('zh-CN', {hour12:false}) : '-';
+const fmtAgo = (ts) => {
+  if (!ts) return '-';
+  const d = Date.now() - ts;
+  if (d < 60000) return Math.floor(d/1000) + ' 秒前';
+  if (d < 3600000) return Math.floor(d/60000) + ' 分钟前';
+  if (d < 86400000) return Math.floor(d/3600000) + ' 小时前';
+  return Math.floor(d/86400000) + ' 天前';
+};
+const EMOTION_COLOR = { joy:'#3ecf8e','calm-happy':'#7dd3a0',sadness:'#6b8afd',anger:'#f45b69',anxiety:'#f0b429',surprise:'#ff7ab6',neutral:'#8b93a1' };
+
+function toast(msg, type) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (type || 'info');
+  d.textContent = msg;
+  $('toast').appendChild(d);
+  setTimeout(() => d.remove(), 4000);
+}
+function fmtDuration(ms) {
+  const s = Math.floor(ms/1000);
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s/60) + ' 分 ' + (s%60) + ' 秒';
+  return Math.floor(s/3600) + ' 小时 ' + Math.floor((s%3600)/60) + ' 分';
+}
+
+document.querySelectorAll('nav a').forEach((a) => {
+  a.onclick = () => {
+    document.querySelectorAll('nav a').forEach((x) => x.classList.remove('active'));
+    document.querySelectorAll('.page').forEach((x) => x.classList.remove('active'));
+    a.classList.add('active');
+    $('page-' + a.dataset.page).classList.add('active');
+    if (a.dataset.page === 'providers') { loadProviders(); loadRoles(); }
+    if (a.dataset.page === 'personas') loadPersonas();
+    if (a.dataset.page === 'stickers') loadStickers();
+    if (a.dataset.page === 'access') loadAccess();
+    if (a.dataset.page === 'memory') { loadUsers(); loadConvScopes(); }
+    if (a.dataset.page === 'emotion') loadEmoUsers();
+    if (a.dataset.page === 'logs') loadLogs();
+    if (a.dataset.page === 'overview') loadFeatures();
+  };
+});
+
+async function loadOverview() {
+  try {
+    const d = await api('/api/overview');
+    const rt = d.runtime;
+    $('statusGrid').innerHTML = [
+      '<div class="stat"><div class="k">NapCat 连接</div><div class="v" style="color:' + (rt.napcatConnected ? 'var(--ok)' : 'var(--err)') + ';font-size:16px">' + (rt.napcatConnected ? '● 已连接' : '● 未连接') + '</div></div>',
+      '<div class="stat"><div class="k">机器人账号</div><div class="v" style="font-size:15px">' + esc(rt.nickname || '-') + '<div class="muted mono">' + (rt.selfId || '-') + '</div></div></div>',
+      '<div class="stat"><div class="k">运行时长</div><div class="v" style="font-size:16px">' + fmtDuration(rt.uptimeMs) + '</div></div>',
+      '<div class="stat"><div class="k">启动时间</div><div class="v" style="font-size:13px">' + fmtTime(rt.startedAt) + '</div></div>'
+    ].join('');
+
+    const s = d.stats;
+    $('statsGrid').innerHTML = [['用户',s.users],['会话',s.sessions],['消息',s.messages],['长期记忆',s.facts],['摘要',s.summaries],['情绪记录',s.emotionRecords]]
+      .map((x) => '<div class="stat"><div class="v">' + x[1] + '</div><div class="k">' + x[0] + '</div></div>').join('');
+
+    // 默认模型信息
+    const llm = d.llm || {};
+    $('statsGrid').innerHTML += '<div class="stat"><div class="v" style="font-size:13px;color:var(--accent)">' + esc(llm.defaultProvider || '未配置') + '</div><div class="k">默认供应商</div></div>' +
+      '<div class="stat"><div class="v" style="font-size:13px;color:var(--accent)">' + esc(llm.defaultModel || '自动') + '</div><div class="k">默认模型</div></div>' +
+      '<div class="stat"><div class="v">' + (llm.providerCount || 0) + '</div><div class="k">供应商数</div></div>';
+
+    // 功能开关（可交互，独立拉取）
+    loadFeatures();
+
+    const u = d.usage;
+    $('usageGrid').innerHTML = [['输入 tokens',u.totalPrompt.toLocaleString()],['输出 tokens',u.totalCompletion.toLocaleString()],['调用次数',u.totalCalls]]
+      .map((x) => '<div class="stat"><div class="v" style="font-size:18px">' + x[1] + '</div><div class="k">' + x[0] + '</div></div>').join('');
+
+    $('usageTable').innerHTML = u.byModel.length === 0 ? '' :
+      '<table><tr><th>Provider / 模型</th><th>调用</th><th>输入</th><th>输出</th></tr>' +
+      u.byModel.map((m) => '<tr><td class="mono">' + esc(m.provider) + '/' + esc(m.model) + '</td><td>' + m.calls + '</td><td>' + m.promptTokens.toLocaleString() + '</td><td>' + m.completionTokens.toLocaleString() + '</td></tr>').join('') + '</table>';
+  } catch (e) { toast('加载概览失败: ' + e.message, 'err'); }
+}
+
+function setDiscBusy(busy) {
+  $('discBtn').disabled = busy;
+  $('discBtn').innerHTML = busy ? '<span class="spinner"></span>探测中…' : '搜索模型';
+}
+
+$('discBtn').onclick = async () => {
+  const baseURL = $('discUrl').value.trim();
+  if (!baseURL) return toast('请填写 API 地址', 'err');
+  setDiscBusy(true);
+  $('discResult').innerHTML = '<div class="muted">正在探测，可能需要几秒…</div>';
+  $('saveProviderForm').style.display = 'none';
+  try {
+    const d = await post('/api/providers/discover', { baseURL: baseURL, apiKey: $('discKey').value.trim(), protocol: $('discProto').value });
+    if (!d.ok) {
+      const attempts = (d.attempts || []).map((a) =>
+        '<div class="kv"><span class="mono">' + esc(a.url) + '</span><span style="color:var(--err);text-align:right;max-width:60%">' + esc(a.status == null ? '' : a.status) + ' ' + esc(a.note) + '</span></div>').join('');
+      $('discResult').innerHTML = '<div class="msg err">' + esc(d.error || '探测失败') + '</div>' +
+        (attempts ? '<details><summary>查看探测详情（' + (d.attempts||[]).length + ' 次尝试）</summary><div style="margin-top:8px">' + attempts + '</div></details>' : '');
+      toast('未能发现模型', 'err');
+      return;
+    }
+    $('discResult').innerHTML = '<div class="msg ok">✅ 发现 <b>' + d.count + '</b> 个模型（协议：' + esc(d.protocol) + '）</div>' +
+      '<div class="scroll" style="max-height:360px"><table><tr><th>模型 ID</th><th>上下文</th><th>标签</th><th></th></tr>' +
+      d.models.map((m) => '<tr><td class="mono">' + esc(m.id) + '</td><td class="muted">' +
+        (m.contextWindow ? (m.contextWindow >= 1000000 ? (m.contextWindow/1000000) + 'M' : Math.round(m.contextWindow/1000) + 'K') : '-') +
+        '</td><td>' + (m.tags||[]).slice(0,4).map((t) => '<span class="tag' + (t === 'vision' ? ' acc' : '') + '">' + esc(t) + '</span>').join('') + '</td>' +
+        '<td><button class="sm" id="quickSet_' + esc(m.id).replace(/[^a-zA-Z0-9_-]/g,'') + '" onclick="saveAndSetDefault(\'' + esc(baseURL) + '\',\'' + esc($('discKey').value.trim()) + '\',\'' + esc($('discProto').value) + '\',\'' + esc(d.protocol) + '\',\'' + esc(m.id) + '\')">保存并设为默认</button></td></tr>').join('') +
+      '</table></div>';
+
+    // 显示「保存为供应商」表单
+    $('saveProviderForm').style.display = 'block';
+    $('saveProviderForm').innerHTML =
+      '<div style="border-top:1px solid var(--border);padding-top:14px">' +
+      '<h3 style="margin-bottom:10px">💾 保存为供应商</h3>' +
+      '<div class="muted" style="margin-bottom:10px">将上面的 URL + Key 保存为一个供应商，之后可在列表中管理和切换模型。</div>' +
+      '<div class="row" style="margin-bottom:10px">' +
+        '<div style="flex:1"><label>供应商标识（英文，唯一）</label><input id="saveKey" placeholder="如：my-relay"></div>' +
+        '<div style="flex:1"><label>显示名称</label><input id="saveName" placeholder="如：我的中转站"></div>' +
+      '</div>' +
+      '<button id="saveProvBtn" onclick="saveNewProvider()">保存供应商</button>' +
+      '</div>';
+
+    toast('发现 ' + d.count + ' 个模型', 'ok');
+  } catch (e) {
+    $('discResult').innerHTML = '<div class="msg err">' + esc(e.message) + '</div>';
+    toast('探测出错', 'err');
+  } finally { setDiscBusy(false); }
+};
+
+window.saveNewProvider = async () => {
+  const key = $('saveKey').value.trim();
+  if (!key) return toast('请填写供应商标识', 'err');
+  if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(key)) return toast('标识需以字母开头，只能含字母数字、中划线、下划线', 'err');
+  const baseURL = $('discUrl').value.trim();
+  const apiKey = $('discKey').value.trim();
+  const protocol = $('discProto').value;
+  const displayName = $('saveName').value.trim() || key;
+  try {
+    const d = await post('/api/providers/add', { key, displayName, baseURL, apiKey, protocol, enabled: true });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    if (d.ok) {
+      $('saveProviderForm').style.display = 'none';
+      loadProviders();
+    }
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.saveAndSetDefault = async (baseURL, apiKey, protocolSel, protocolDisc, modelId) => {
+  // 用发现时的 URL + Key 快速保存并设为默认
+  const key = window.prompt('请输入供应商标识（英文，唯一，如 my-relay）：');
+  if (!key) return;
+  if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(key)) return toast('标识需以字母开头，只能含字母数字、中划线、下划线', 'err');
+  try {
+    const protocol = protocolSel === 'auto' ? protocolDisc : protocolSel;
+    const d = await post('/api/providers/add', { key, displayName: key, baseURL, apiKey, protocol, enabled: true });
+    if (!d.ok) return toast(d.error, 'err');
+    const d2 = await post('/api/providers/set-default', { providerKey: key, model: modelId });
+    toast(d2.ok ? '已保存并设为默认：' + key + '/' + modelId : d2.error, d2.ok ? 'ok' : 'err');
+    if (d2.ok) {
+      $('saveProviderForm').style.display = 'none';
+      loadProviders();
+    }
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+async function loadProviders() {
+  try {
+    const d = await api('/api/providers');
+    // 显示当前默认模型
+    const defProv = d.defaultProvider || '(未配置)';
+    const defModel = d.defaultModel || '(自动选择第一个)';
+    $('defaultModelInfo').innerHTML = '当前默认：<span class="tag acc">' + esc(defProv) + '</span> / <span class="tag acc">' + esc(defModel) + '</span> <span class="muted">（重启后完全生效）</span>';
+
+    $('providerList').innerHTML = d.providers.length === 0 ? '<div class="empty">还没有配置供应商。在上方填写 API 地址和密钥，搜索模型后即可保存。</div>' :
+      d.providers.map((p) => '<div class="card" style="margin-bottom:10px;background:var(--panel2)">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
+          '<div><b>' + esc(p.displayName) + '</b> <span class="muted mono">(' + esc(p.key) + ')</span> ' +
+            (p.isDefault ? '<span class="tag acc">默认</span>' : '') +
+            '<span class="tag' + (p.enabled ? ' ok' : '') + '">' + (p.enabled ? '启用' : '禁用') + '</span>' +
+            '<span class="tag">' + esc(p.protocol) + '</span>' +
+            (p.hasKey ? '<span class="tag ok">密钥已配置</span>' : '<span class="tag err">缺少密钥</span>') +
+            '<div class="muted mono" style="margin-top:4px">' + esc(p.baseURL) + '</div>' +
+            (p.keyPreview ? '<div class="muted mono">' + esc(p.keyPreview) + '</div>' : '') +
+            '<div class="muted">已缓存 ' + p.modelCount + ' 个模型</div></div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+            '<button class="sm ghost" onclick="discoverExisting(\'' + esc(p.key) + '\')">发现模型</button>' +
+            '<button class="sm ghost" onclick="testProvider(\'' + esc(p.key) + '\')">测试连接</button>' +
+            (p.isDefault ? '' : '<button class="sm" onclick="setDefaultProvider(\'' + esc(p.key) + '\')">设为默认供应商</button>') +
+            '<button class="sm danger" onclick="deleteProvider(\'' + esc(p.key) + '\')">删除</button>' +
+          '</div>' +
+        '</div><div id="prov-' + esc(p.key) + '"></div></div>').join('');
+  } catch (e) { toast('加载 Provider 失败', 'err'); }
+}
+
+window.discoverExisting = async (key) => {
+  const box = $('prov-' + key);
+  box.innerHTML = '<div class="muted" style="margin-top:10px"><span class="spinner"></span>正在发现模型…</div>';
+  try {
+    const d = await post('/api/providers/discover', { providerKey: key });
+    if (!d.ok) { box.innerHTML = '<div class="msg err" style="margin-top:10px">' + esc(d.error) + '</div>'; return; }
+    // 获取当前默认模型
+    const provInfo = await api('/api/providers');
+    const defModel = provInfo.defaultModel;
+    box.innerHTML = '<div class="msg ok" style="margin-top:10px">✅ ' + d.count + ' 个模型（' + esc(d.protocol) + '）</div>' +
+      '<div class="scroll" style="max-height:240px"><table><tr><th>模型</th><th>上下文</th><th></th></tr>' +
+      d.models.slice(0, 200).map((m) => '<tr><td class="mono">' + esc(m.id) + (m.id === defModel ? ' <span class="tag acc">当前默认</span>' : '') + '</td><td class="muted">' +
+        (m.contextWindow ? Math.round(m.contextWindow/1000) + 'K' : '-') + '</td>' +
+        '<td><button class="sm" onclick="setDefault(\'' + esc(key) + '\',\'' + esc(m.id) + '\')">设为默认</button></td></tr>').join('') +
+      '</table></div>';
+  } catch (e) { box.innerHTML = '<div class="msg err" style="margin-top:10px">' + esc(e.message) + '</div>'; }
+};
+
+window.testProvider = async (key) => {
+  const box = $('prov-' + key);
+  box.innerHTML = '<div class="muted" style="margin-top:10px"><span class="spinner"></span>测试中…</div>';
+  try {
+    const d = await post('/api/providers/test', { providerKey: key });
+    box.innerHTML = '<div class="msg ' + (d.ok ? 'ok' : 'err') + '" style="margin-top:10px">' +
+      (d.ok ? '✅ 连通正常' : '❌ 失败') + ' ｜ 协议 ' + esc(d.protocol) + ' ｜ 模型 ' + d.modelCount + ' 个 ｜ 延迟 ' + d.latencyMs + 'ms' +
+      (d.reply ? '<div class="muted" style="margin-top:4px">模型回复：' + esc(d.reply.slice(0,100)) + '</div>' : '') +
+      (d.error ? '<div style="margin-top:4px">' + esc(d.error) + '</div>' : '') + '</div>';
+  } catch (e) { box.innerHTML = '<div class="msg err" style="margin-top:10px">' + esc(e.message) + '</div>'; }
+};
+
+window.setDefault = async (providerKey, model) => {
+  try {
+    const d = await post('/api/providers/set-default', { providerKey: providerKey, model: model });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadProviders();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.setDefaultProvider = async (providerKey) => {
+  // 仅设为默认供应商，模型用空（自动选第一个）
+  try {
+    const d = await post('/api/providers/set-default', { providerKey: providerKey, model: '' });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadProviders();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.deleteProvider = async (key) => {
+  if (!confirm('确定删除供应商「' + key + '」？此操作不可恢复。')) return;
+  try {
+    const d = await api('/api/providers/' + encodeURIComponent(key), { method: 'DELETE' });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadProviders();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+async function loadPersonas() {
+  try {
+    const d = await api('/api/personas');
+    window._personas = d.personas;
+    $('personaCount').textContent = '（' + d.personas.length + ' 个）';
+    $('defaultPersona').textContent = d.default;
+    $('personaList').innerHTML = d.personas.map((p) => '<div class="card" style="background:var(--panel2);margin:0">' +
+      '<div class="persona-card"><div class="persona-emoji">' + esc(p.emoji) + '</div><div style="flex:1;min-width:0">' +
+        '<b>' + esc(p.name) + '</b> <span class="tag">' + esc(p.id) + '</span>' + (p.id === d.default ? '<span class="tag acc">默认</span>' : '') +
+        '<div class="muted" style="margin:4px 0 8px">' + esc(p.description) + '</div>' +
+        '<div class="muted">温度 ' + (p.temperature == null ? '-' : p.temperature) + ' ｜ 上限 ' + (p.maxTokens == null ? '-' : p.maxTokens) + ' tokens ｜ 情绪调制 ' + Object.keys(p.emotionModulation||{}).length + ' 档 ｜ 示例 ' + p.exampleCount + '</div>' +
+        '<details style="margin-top:6px"><summary>查看 System Prompt</summary>' +
+        '<pre class="mono" style="white-space:pre-wrap;background:var(--bg);padding:10px;border-radius:6px;margin-top:6px;max-height:260px;overflow:auto">' + esc(p.systemPrompt) + '</pre></details>' +
+        '<div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">' +
+          (p.id === d.default ? '' : '<button class="sm" onclick="setDefaultPersona(\'' + esc(p.id) + '\')">设为默认</button>') +
+          '<button class="sm ghost" onclick="openPersonaEditor(\'' + esc(p.id) + '\')">编辑</button>' +
+          '<button class="sm danger" onclick="removePersona(\'' + esc(p.id) + '\')">删除</button>' +
+        '</div>' +
+      '</div></div></div>').join('');
+
+    const s = await api('/api/personas/scope');
+    $('sessionList').innerHTML = s.sessions.length === 0 ? '<div class="empty">还没有会话记录。收到消息后这里会列出所有会话，可单独设置人格。</div>' :
+      '<table><tr><th>会话</th><th>类型</th><th>消息数</th><th>最后活跃</th><th>人格</th></tr>' +
+      s.sessions.map((x) => '<tr><td class="mono">' + esc(x.scope) + '<div class="muted">' + esc(x.title || '') + '</div></td>' +
+        '<td>' + (x.scopeType === 'group' ? '群聊' : '私聊') + '</td><td>' + x.messageCount + '</td>' +
+        '<td class="muted">' + fmtAgo(x.lastActive) + '</td>' +
+        '<td><select onchange="setScopePersona(\'' + esc(x.scope) + '\', this.value)" style="padding:4px;font-size:12px">' +
+        '<option value="">（用默认）</option>' +
+        d.personas.map((p) => '<option value="' + esc(p.id) + '"' + (x.personaId === p.id ? ' selected' : '') + '>' + esc(p.emoji) + ' ' + esc(p.name) + '</option>').join('') +
+        '</select></td></tr>').join('') + '</table>';
+  } catch (e) { toast('加载人格失败: ' + e.message, 'err'); }
+}
+
+window.setScopePersona = async (scope, personaId) => {
+  if (!personaId) return toast('请选择一个人格', 'info');
+  try {
+    const d = await post('/api/personas/scope', { scope: scope, personaId: personaId });
+    toast(d.ok ? '已切换该会话人格' : d.error, d.ok ? 'ok' : 'err');
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+// ============ 默认人格 / 人格增删改 ============
+window.setDefaultPersona = async (id) => {
+  try {
+    const d = await post('/api/personas/default', { personaId: id });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    if (d.ok) loadPersonas();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.reloadPersonas = async () => {
+  try {
+    const d = await post('/api/personas/reload', {});
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    if (d.ok) loadPersonas();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.removePersona = async (id) => {
+  if (!confirm('确定删除人格「' + id + '」？\n对应的 config/personas/' + id + '.yaml 会被删除。')) return;
+  try {
+    const r = await fetch('/api/personas/' + encodeURIComponent(id), { method: 'DELETE' });
+    const d = await r.json().catch(() => ({}));
+    toast(d.ok ? d.message : (d.error || '删除失败'), d.ok ? 'ok' : 'err');
+    if (d.ok) loadPersonas();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.openPersonaEditor = (id) => {
+  const list = window._personas || [];
+  const p = id ? list.find((x) => x.id === id) : null;
+  $('personaModalTitle').textContent = p ? ('编辑人格：' + p.name) : '新建人格';
+  $('pf_originalId').value = p ? p.id : '';
+  $('pf_id').value = p ? p.id : '';
+  $('pf_id').disabled = Boolean(p); // 已有 id 不允许在这里改（改 id 会生成新文件）
+  $('pf_name').value = p ? p.name : '';
+  $('pf_emoji').value = p ? (p.emoji || '') : '🤖';
+  $('pf_desc').value = p ? (p.description || '') : '';
+  $('pf_temp').value = p && p.temperature != null ? p.temperature : '';
+  $('pf_maxTokens').value = p && p.maxTokens != null ? p.maxTokens : '';
+  $('pf_prompt').value = p ? p.systemPrompt : '';
+  $('pf_keywords').value = p && p.triggers ? (p.triggers.keywords || []).join(', ') : '';
+  $('pf_errmsg').value = p ? (p.errorMessage || '') : '';
+  $('pf_pokereplies').value = p && p.pokeReplies ? p.pokeReplies.join('\n') : '';
+  $('pf_examples').value = p && p.examples
+    ? p.examples.map((e) => e.user + '=' + e.assistant).join('\n')
+    : '';
+  $('pf_emotion').value = p && p.emotionModulation
+    ? Object.entries(p.emotionModulation).map(([k, v]) => k + '=' + v).join('\n')
+    : '';
+  $('pf_error').innerHTML = '';
+  $('personaModal').classList.add('open');
+};
+
+window.closePersonaEditor = () => {
+  $('personaModal').classList.remove('open');
+};
+
+function parseEmotionModulation(text) {
+  const out = {};
+  for (const line of String(text || '').split('\n')) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const i = s.indexOf('=');
+    if (i <= 0) continue;
+    const k = s.slice(0, i).trim();
+    const v = s.slice(i + 1).trim();
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 解析预设对话：每行一条，格式 `用户说=它回答`。
+ * 找不到 '=' 的行跳过（第一条 = 之后的内容都算回答，所以用 indexOf）。
+ */
+function parseExamples(text) {
+  const out = [];
+  for (const line of String(text || '').split('\n')) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const i = s.indexOf('=');
+    if (i <= 0) continue;
+    const user = s.slice(0, i).trim();
+    const assistant = s.slice(i + 1).trim();
+    if (user && assistant) out.push({ user: user, assistant: assistant });
+  }
+  return out.slice(0, 10); // 上限，避免把上下文挤满
+}
+
+window.savePersona = async () => {  const originalId = $('pf_originalId').value;
+  const id = (originalId || $('pf_id').value).trim();
+  const name = $('pf_name').value.trim();
+  const systemPrompt = $('pf_prompt').value;
+
+  const errs = [];
+  if (!id) errs.push('请填写人格 ID');
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(id)) errs.push('人格 ID 只能用小写字母、数字、下划线和短横线');
+  if (!name) errs.push('请填写显示名称');
+  if (!systemPrompt.trim()) errs.push('请填写 System Prompt');
+  if (errs.length) {
+    $('pf_error').innerHTML = '<div class="msg err">' + errs.map(esc).join('<br>') + '</div>';
+    return;
+  }
+
+  const tempRaw = $('pf_temp').value.trim();
+  const maxRaw = $('pf_maxTokens').value.trim();
+
+  const persona = {
+    id: id,
+    name: name,
+    emoji: $('pf_emoji').value.trim() || '🤖',
+    description: $('pf_desc').value.trim(),
+    systemPrompt: systemPrompt,
+    emotionModulation: parseEmotionModulation($('pf_emotion').value),
+    triggers: {
+      keywords: $('pf_keywords').value.split(',').map((s) => s.trim()).filter(Boolean),
+      command: '',
+    },
+    examples: parseExamples($('pf_examples').value),
+    pokeReplies: $('pf_pokereplies').value.split('\n').map((s) => s.trim()).filter(Boolean),
+    errorMessage: $('pf_errmsg').value.trim(),
+  };
+  if (tempRaw !== '') persona.temperature = Number(tempRaw);
+  if (maxRaw !== '') persona.maxTokens = Number(maxRaw);
+
+  $('pf_saveBtn').disabled = true;
+  try {
+    const d = originalId
+      ? await post('/api/personas/' + encodeURIComponent(originalId) + '/update', { persona: persona })
+      : await post('/api/personas/create', { persona: persona });
+    if (!d.ok) {
+      $('pf_error').innerHTML = '<div class="msg err">' + esc(d.error || '保存失败') + '</div>';
+      return;
+    }
+    toast(d.message, 'ok');
+    closePersonaEditor();
+    loadPersonas();
+  } catch (e) {
+    $('pf_error').innerHTML = '<div class="msg err">' + esc(e.message) + '</div>';
+  } finally {
+    $('pf_saveBtn').disabled = false;
+  }
+};
+
+// ============ 访问控制 ============
+window._access = null;
+
+// ============ 表情包 ============
+let stkCache = null;
+
+async function loadStickers() {
+  const box = $('stkList');
+  if (!box) return;
+  try {
+    const d = await api('/api/stickers');
+    stkCache = d;
+
+    $('stkCount').textContent = d.count ? '（' + d.count + ' 张可用）' : '（空）';
+
+    const understoodPct = d.count ? Math.round((d.understood / d.count) * 100) : 0;
+    $('stkStats').innerHTML = [
+      ['可用图片', d.count],
+      ['AI 已理解', d.understood + ' (' + understoodPct + '%)'],
+      ['待识别', d.pending],
+      ['来自 QQ 收藏', d.qqSourced],
+      ['标签数', Object.keys(d.tags || {}).length],
+      ['文件缺失', d.missing]
+    ].map((x) => '<div class="stat"><div class="v" style="font-size:16px">' + x[1] + '</div><div class="k">' + x[0] + '</div></div>').join('');
+
+    const st = d.autoSend || {};
+    const on = d.enabled;
+    $('stkHint').innerHTML =
+      (on ? '<span class="tag ok">表情包已开启</span>' : '<span class="tag err">表情包未开启</span>') +
+      ' 目录 <span class="mono">' + esc(d.dir) + '</span>' +
+      (d.dirExists ? '' : ' <span class="tag err">目录不存在</span>') +
+      '<br>自动补图 ' + (st.enabled ? '<span class="tag ok">开</span>' : '<span class="tag">关</span>') +
+      ' 情绪 ' + esc((st.emotions || []).join('/') || '未设置') +
+      ' 最低强度 ' + (st.minIntensity ?? '-') +
+      ' 概率 ' + (st.probability ?? '-') +
+      ' 冷却 ' + (st.cooldownSec ?? '-') + 's' +
+      ' 只发已理解 ' + (st.requireDesc ? '<span class="tag ok">是</span>' : '<span class="tag">否</span>');
+
+    const files = d.files || [];
+    $('stkFilterInfo').textContent = files.length + ' 张';
+    if (files.length === 0) {
+      box.innerHTML = '<div class="msg info">还没有表情包。点上面的「从 QQ 收藏导入」，或把图片放进 <span class="mono">' +
+        esc(d.dir) + '</span>（文件名就是标签），再点「重新扫描」。</div>';
+      return;
+    }
+
+    box.innerHTML = files.map((f, i) => renderStickerCard(f, i)).join('');
+  } catch (e) {
+    box.innerHTML = '<div class="msg err">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+// 用下标而不是文件名传给按钮：文件名是不可信输入，
+// 直接拼进 onclick 字符串会被引号/反斜杠搞坏（甚至注入）。下标永远是安全整数。
+function stkAt(i) {
+  return (stkCache && stkCache.files && stkCache.files[i]) || null;
+}
+
+function renderStickerCard(f, i) {
+  const tags = (f.tags || []).map((t) => '<span class="tag acc">' + esc(t) + '</span>').join('');
+  const emo = (f.emotions || []).map((t) => '<span class="tag">' + esc(t) + '</span>').join('');
+  const src = f.source === 'qq' ? '<span class="tag warn">QQ收藏</span>' : '<span class="tag">本地</span>';
+  const analyzed = f.analyzed ? '<span class="tag ok">已理解</span>' : '<span class="tag err">未识别</span>';
+  const missing = f.missing ? '<span class="tag err">文件缺失</span>' : '';
+
+  return '<div class="card" style="margin:0;padding:12px">' +
+    '<div style="display:flex;gap:8px;align-items:flex-start">' +
+      (f.missing
+        ? '<div style="width:64px;height:64px;flex:0 0 64px;border-radius:6px;background:var(--panel2)"></div>'
+        : '<img src="' + f.url + '" loading="lazy" style="width:64px;height:64px;flex:0 0 64px;object-fit:contain;border-radius:6px;background:var(--panel2)" alt="">') +
+      '<div style="min-width:0;flex:1">' +
+        '<div class="mono" style="font-size:11px;color:var(--dim);word-break:break-all">' + esc(f.file) + '</div>' +
+        '<div style="margin-top:4px">' + tags + emo + src + analyzed + missing + '</div>' +
+      '</div>' +
+    '</div>' +
+    (f.desc ? '<div style="margin-top:8px;font-size:13px">' + esc(f.desc) + '</div>' : '') +
+    (f.useWhen ? '<div class="muted" style="font-size:12px;margin-top:2px">用在：' + esc(f.useWhen) + '</div>' : '') +
+    '<div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">' +
+      '<button class="sm ghost" onclick="editStickerAt(' + i + ')">编辑</button>' +
+      '<button class="sm ghost" onclick="analyzeOneAt(' + i + ')">重新识别</button>' +
+      '<button class="sm ghost" onclick="deleteStickerAt(' + i + ')">删除</button>' +
+    '</div>' +
+  '</div>';
+}
+
+window.reloadStickers = async () => {
+  try {
+    const d = await post('/api/stickers/reload', {});
+    toast(d.message || '已重新扫描', d.ok ? 'ok' : 'err');
+    loadStickers();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.importStickers = async () => {
+  const btn = $('stkImportBtn');
+  btn.disabled = true;
+  $('stkProgress').textContent = '正在从 NapCat 读取收藏表情并下载…（图片多时可能要等一会儿）';
+  try {
+    const d = await post('/api/stickers/import-qq', { limit: 200 });
+    if (d.ok) {
+      let m = '导入完成：新增 ' + d.added + ' 张';
+      if (d.skipped) m += '，已存在跳过 ' + d.skipped;
+      if (d.failed) m += '，失败 ' + d.failed;
+      $('stkProgress').innerHTML = esc(m) +
+        (d.added > 0 ? '<br>下一步点「🤖 用 AI 识别含义」，AI 才能按情境挑图。' : '');
+      toast(m, 'ok');
+    } else {
+      $('stkProgress').innerHTML = '<span style="color:var(--err)">' +
+        esc((d.errors && d.errors[0]) || d.error || '导入失败') + '</span>';
+      toast('导入失败', 'err');
+    }
+    loadStickers();
+  } catch (e) {
+    $('stkProgress').innerHTML = '<span style="color:var(--err)">' + esc(e.message) + '</span>';
+  } finally { btn.disabled = false; }
+};
+
+window.analyzeStickers = async (force) => {
+  const btn = $('stkAnalyzeBtn');
+  btn.disabled = true;
+  const pending = stkCache ? stkCache.pending : '?';
+  $('stkProgress').textContent = force
+    ? '正在重新识别全部表情包…'
+    : '正在识别 ' + pending + ' 张待处理的表情包…（每张都要过一次视觉模型）';
+  try {
+    const d = await post('/api/stickers/analyze', force ? { force: true } : {});
+    let m = '识别完成：成功 ' + d.ok + '，失败 ' + d.failed;
+    if (d.skipped) m += '，跳过 ' + d.skipped;
+    m += '<br><span class="muted">模型：' + esc(d.model || '-') + '</span>';
+    if (d.preview && d.preview.length) {
+      m += '<div style="margin-top:8px">' + d.preview.map((p) =>
+        '<div class="muted" style="font-size:12px">' + esc(p.file) + ' → ' +
+        (p.tags || []).map((t) => '<span class="tag acc">' + esc(t) + '</span>').join('') +
+        esc(p.desc) + '</div>').join('') + '</div>';
+    }
+    if (d.errors && d.errors.length) {
+      m += '<div style="margin-top:8px;color:var(--err)">' + d.errors.map(esc).join('<br>') + '</div>';
+    }
+    $('stkProgress').innerHTML = m;
+    toast('识别完成：成功 ' + d.ok + '，失败 ' + d.failed, d.failed === 0 ? 'ok' : 'err');
+    loadStickers();
+  } catch (e) {
+    $('stkProgress').innerHTML = '<span style="color:var(--err)">' + esc(e.message) + '</span>';
+    toast('识别失败', 'err');
+  } finally { btn.disabled = false; }
+};
+
+window.analyzeOneAt = async (i) => {
+  const f = stkAt(i);
+  if (!f) return;
+  $('stkProgress').textContent = '正在重新识别 ' + f.file + '…';
+  try {
+    const d = await post('/api/stickers/analyze', { files: [f.file], force: true });
+    toast(d.ok ? '已更新' : ('失败：' + ((d.errors && d.errors[0]) || '未知')), d.ok ? 'ok' : 'err');
+    loadStickers();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.editStickerAt = async (i) => {
+  const f = stkAt(i);
+  if (!f) return;
+  const tags = prompt('标签（逗号分隔，模型用 [表情:标签] 引用）', (f.tags || []).join(', '));
+  if (tags === null) return;
+  const desc = prompt('描述（一句话说清图里是什么）', f.desc || '');
+  if (desc === null) return;
+  const useWhen = prompt('什么情境适合发', f.useWhen || '');
+  if (useWhen === null) return;
+  const emotions = prompt('对应情绪（逗号分隔，如 joy,sadness）', (f.emotions || []).join(', '));
+  if (emotions === null) return;
+  try {
+    const d = await post('/api/stickers/entry', {
+      file: f.file,
+      tags: tags.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+      desc,
+      useWhen,
+      emotions: emotions.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+    });
+    toast(d.ok ? '已保存' : (d.error || '保存失败'), d.ok ? 'ok' : 'err');
+    loadStickers();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.deleteStickerAt = async (i) => {
+  const f = stkAt(i);
+  if (!f) return;
+  if (!confirm('确定删除 ' + f.file + '？文件会被真正删掉。')) return;
+  try {
+    const d = await post('/api/stickers/delete', { files: [f.file] });
+    toast(d.message || '已删除', d.ok ? 'ok' : 'err');
+    loadStickers();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.pushStickerDesc = async () => {
+  try {
+    const d = await post('/api/stickers/push-desc', {});
+    toast(d.message || '完成', d.ok ? 'ok' : 'err');
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+async function loadAccess() {
+  try {
+    const d = await api('/api/access');
+    window._access = d;
+
+    const s = d.summary || {};
+    $('accessSummary').innerHTML = [
+      ['用户范围', s.userScope, (s.denied ? s.denied + ' 人在黑名单' : '黑名单为空')],
+      ['群范围', s.groupScope, '未设则所有群都能用'],
+      ['管理员', s.admins > 0 ? s.admins + ' 人' : '未设置', s.admins > 0 ? '可执行管理命令' : '「仅管理员」类开关将被拒绝'],
+    ].map((x) => '<div class="stat"><div class="k">' + esc(x[0]) + '</div>' +
+      '<div class="v" style="font-size:14px">' + esc(x[1]) + '</div>' +
+      '<div class="muted" style="margin-top:4px">' + esc(x[2]) + '</div></div>').join('');
+
+    $('accessLists').innerHTML = d.lists.map((l) => {
+      const id = 'acc_' + l.id;
+      const count = (l.value || []).length;
+      return '<div class="field"><label>' + esc(l.name) +
+        ' <span class="tag' + (count > 0 ? ' acc' : '') + '">' + count + ' 个</span></label>' +
+        '<textarea id="' + id + '" style="min-height:64px" placeholder="每行一个 QQ 号，如&#10;10001&#10;10002">' +
+        esc((l.value || []).join('\n')) + '</textarea>' +
+        '<div class="muted" style="margin-top:4px">' + esc(l.desc) + '</div></div>';
+    }).join('');
+
+    $('accessFlags').innerHTML = d.flags.map((f) => {
+      const inputId = 'accf_' + f.id;
+      return '<div class="toggle-row" style="margin-bottom:10px">' +
+        '<div class="txt"><div class="t">' + esc(f.name) + '</div><div class="d">' + esc(f.desc) + '</div></div>' +
+        '<label class="switch"><input type="checkbox" id="' + inputId + '"' + (f.value ? ' checked' : '') +
+        ' onchange="applyAccessFlag(\'' + f.id + '\', this.checked, this)"><span class="slider"></span></label>' +
+        '</div>';
+    }).join('');
+  } catch (e) {
+    $('accessLists').innerHTML = '<div class="msg err">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+window.saveAccess = async () => {
+  const d = window._access;
+  if (!d) return;
+  const lists = {};
+  for (const l of d.lists) {
+    const el = $('acc_' + l.id);
+    if (el) lists[l.id] = el.value;
+  }
+  $('accessSaveBtn').disabled = true;
+  try {
+    const r = await post('/api/access', { lists: lists });
+    if (r.ok) {
+      toast(r.message || '已保存', 'ok');
+      await loadAccess();
+    } else {
+      toast(r.error || '保存失败', 'err');
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('accessSaveBtn').disabled = false;
+  }
+};
+
+window.applyAccessFlag = async (name, value, el) => {
+  if (el) el.disabled = true;
+  try {
+    const r = await post('/api/access', { flags: { [name]: value } });
+    if (r.ok) {
+      toast(r.message || '已更新', 'ok');
+      await loadAccess();
+    } else {
+      toast(r.error || '更新失败', 'err');
+      await loadAccess(); // 回滚 UI 到真实状态
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+    await loadAccess();
+  } finally {
+    if (el) el.disabled = false;
+  }
+};
+
+// ============ 功能开关 ============
+async function loadFeatures() {
+  const box = $('featureGroups');
+  if (!box) return;
+  try {
+    const d = await api('/api/settings');
+    const groups = d.groups || {};
+    box.innerHTML = Object.keys(groups).map((g) =>
+      '<div style="margin-bottom:16px">' +
+        '<div class="muted" style="margin-bottom:8px;font-weight:600">' + esc(g) + '</div>' +
+        '<div class="grid c2">' + groups[g].map((s) => renderToggle(s)).join('') + '</div>' +
+      '</div>').join('');
+  } catch (e) {
+    box.innerHTML = '<div class="msg err">加载设置失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderToggle(s) {
+  const inputId = 'set_' + s.path.replace(/\./g, '_');
+  if (s.type === 'boolean') {
+    return '<div class="toggle-row">' +
+      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '</div></div>' +
+      '<label class="switch"><input type="checkbox" id="' + inputId + '"' + (s.value ? ' checked' : '') +
+        ' onchange="applySetting(\'' + s.path + '\', this.checked, this)"><span class="slider"></span></label>' +
+    '</div>';
+  }
+  if (s.type === 'number') {
+    const range = (s.min !== undefined || s.max !== undefined)
+      ? '（' + (s.min !== undefined ? s.min : '') + ' ~ ' + (s.max !== undefined ? s.max : '') + '）' : '';
+    return '<div class="toggle-row">' +
+      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div></div>' +
+      '<input type="number" id="' + inputId + '" style="width:96px" value="' + esc(s.value) + '"' +
+        (s.min !== undefined ? ' min="' + s.min + '"' : '') + (s.max !== undefined ? ' max="' + s.max + '"' : '') +
+        ' step="any" onchange="applySetting(\'' + s.path + '\', Number(this.value), this)">' +
+    '</div>';
+  }
+  if (s.type === 'string[]') {
+    const v = Array.isArray(s.value) ? s.value.join(', ') : (s.value || '');
+    return '<div class="toggle-row">' +
+      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '（逗号分隔）</div></div>' +
+      '<input id="' + inputId + '" style="width:200px" value="' + esc(v) + '"' +
+        ' onchange="applySetting(\'' + s.path + '\', this.value, this)">' +
+    '</div>';
+  }
+  // enum
+  return '<div class="toggle-row">' +
+    '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '</div>' +
+      '<select onchange="applySetting(\'' + s.path + '\', this.value, this)">' +
+        (s.options || []).map((o) => '<option value="' + esc(o.value) + '"' +
+          (String(s.value) === String(o.value) ? ' selected' : '') + '>' + esc(o.label) + '</option>').join('') +
+      '</select>' +
+    '</div>' +
+  '</div>';
+}
+
+window.applySetting = async (path, value, el) => {
+  if (el) el.disabled = true;
+  try {
+    const d = await post('/api/settings', { patch: { [path]: value } });
+    if (d.ok) {
+      toast(d.message || '已更新', 'ok');
+      // 语义检索开关会影响 embedding 就绪状态提示
+      if (path.indexOf('semantic') >= 0) loadRoles();
+    } else {
+      toast(d.error || '更新失败', 'err');
+      loadFeatures(); // 回滚 UI 到真实值
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+    loadFeatures();
+  } finally {
+    if (el) el.disabled = false;
+  }
+};
+
+// ============ 模型用途 ============
+async function loadRoles() {
+  const box = $('roleList');
+  if (!box) return;
+  try {
+    const d = await api('/api/llm/roles');
+    window._roles = d.roles;
+    $('roleDefaultInfo').innerHTML = '默认：<span class="pill">' + esc(d.defaultProvider || '未配置') +
+      '</span> / <span class="pill">' + esc(d.defaultModel || '自动') + '</span>' +
+      ' ｜ 语义检索：' + (d.semanticReady
+        ? '<span class="pill">已就绪</span>'
+        : '<span class="pill grey">未配置向量模型</span>') +
+      ' ｜ 图片理解：' + (d.vision && d.vision.ok
+        ? '<span class="pill">可用</span>'
+        : '<span class="pill grey">不可用</span>');
+
+    // 图片理解配错是最难自查的问题（发了图没反应），单独醒目提示
+    if (d.vision && !d.vision.ok && d.vision.warning) {
+      $('roleDefaultInfo').innerHTML +=
+        '<div class="msg err" style="margin-top:10px">🖼 ' + esc(d.vision.warning) + '</div>';
+    }
+
+    const providers = d.providers || [];
+    if (providers.length === 0) {
+      box.innerHTML = '<div class="empty">还没有供应商，请先在上方添加</div>';
+      return;
+    }
+
+    box.innerHTML = d.roles.map((r) => {
+      const pid = 'rp_' + r.role, mid = 'rm_' + r.role;
+      return '<div class="role-row">' +
+        '<div class="meta"><b>' + esc(r.name) + '</b> <span class="tag">' + esc(r.role) + '</span>' +
+          (r.overridden ? ' <span class="pill">已自定义</span>' : '') +
+          '<div class="muted" style="margin-top:3px">' + esc(r.desc) + ' · ' + esc(r.hint) + '</div></div>' +
+        '<select id="' + pid + '" onchange="onRoleProviderChange(\'' + r.role + '\')">' +
+          '<option value="">（用默认供应商）</option>' +
+          providers.map((p) => '<option value="' + esc(p.key) + '"' +
+            ((r.overrideProvider || '') === p.key ? ' selected' : '') + '>' + esc(p.displayName) + '</option>').join('') +
+        '</select>' +
+        '<select id="' + mid + '" onchange="onRoleModelChange(\'' + r.role + '\')">' +
+          '<option value="">（自动/默认）</option>' +
+        '</select>' +
+        (r.role === 'embedding'
+          ? '<button class="sm ghost" onclick="testEmbedding()">测试向量化</button>'
+          : '') +
+        '<span class="muted" style="flex:1 1 100%;font-size:12px">当前生效：' +
+          esc(r.provider || '未配置') + ' / ' + esc(r.model || '自动') + '</span>' +
+      '</div>';
+    }).join('');
+
+    // 逐个填充模型下拉（用已缓存/已发现的模型，避免大量并发请求）
+    for (const r of d.roles) {
+      await fillRoleModels(r.role);
+    }
+
+    $('embeddingStats').innerHTML = (d.embedding && d.embedding.total > 0)
+      ? '<div class="muted">已建立向量索引 <b>' + d.embedding.total + '</b> 条' +
+        (d.embedding.models || []).map((m) => '（' + esc(m.model) + ': ' + m.count + '）').join(' ') + '</div>'
+      : '<div class="muted">还没有建立向量索引（配置「向量化」并开启「语义检索记忆」后会自动补算）</div>';
+  } catch (e) {
+    box.innerHTML = '<div class="msg err">加载模型用途失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+/** 填充某个用途的模型下拉：优先用该供应商已发现的模型 */
+async function fillRoleModels(role) {
+  const sel = $('rm_' + role);
+  if (!sel) return;
+  const pSel = $('rp_' + role);
+  const providerKey = pSel ? pSel.value : '';
+  const meta = (window._roles || []).find((x) => x.role === role);
+  const current = meta ? meta.overrideModel : '';
+
+  sel.innerHTML = '<option value="">（自动/默认）</option>';
+  if (!providerKey) return;
+
+  try {
+    const d = await api('/api/providers/' + encodeURIComponent(providerKey) + '/models');
+    const models = d.models || [];
+    sel.innerHTML = '<option value="">（自动/默认）</option>' +
+      models.map((m) => '<option value="' + esc(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' +
+        esc(m.id) + '</option>').join('') +
+      (current && !models.some((m) => m.id === current)
+        ? '<option value="' + esc(current) + '" selected>' + esc(current) + '（当前，未在列表）</option>'
+        : '');
+  } catch (e) {
+    // 发现失败时至少保留当前值，允许手填
+    sel.innerHTML = '<option value="">（自动/默认）</option>' +
+      (current ? '<option value="' + esc(current) + '" selected>' + esc(current) + '</option>' : '');
+  }
+}
+
+window.onRoleProviderChange = async (role) => {
+  const pSel = $('rp_' + role);
+  const providerKey = pSel ? pSel.value : '';
+  // 先写 provider，再刷新模型列表
+  await applyRole(role, { provider: providerKey, model: '' });
+  await fillRoleModels(role);
+};
+
+window.onRoleModelChange = async (role) => {
+  const mSel = $('rm_' + role);
+  await applyRole(role, { model: mSel ? mSel.value : '' });
+};
+
+async function applyRole(role, patch) {
+  const payload = {};
+  if (patch.provider !== undefined) payload['llm.roles.' + role + '.provider'] = patch.provider;
+  if (patch.model !== undefined) payload['llm.roles.' + role + '.model'] = patch.model;
+  try {
+    const d = await post('/api/settings', { patch: payload });
+    if (d.ok) {
+      toast(d.message || '已更新', 'ok');
+      await loadRoles();
+    } else {
+      toast(d.error || '更新失败', 'err');
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+window.testEmbedding = async () => {
+  const pSel = $('rp_embedding'), mSel = $('rm_embedding');
+  const providerKey = pSel ? pSel.value : '';
+  const model = mSel ? mSel.value : '';
+  if (!model) return toast('请先为「向量化」选择模型', 'err');
+  toast('正在测试向量化…', 'info');
+  try {
+    const d = await post('/api/llm/roles/test-embedding', { providerKey: providerKey, model: model });
+    if (d.ok) toast('向量化可用，维度 ' + d.dim + '（' + d.latencyMs + 'ms）', 'ok');
+    else toast('失败：' + d.error, 'err');
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+// ============ 话题（会话下的对话线） ============
+async function loadConvScopes() {
+  try {
+    const d = await api('/api/personas/scope');
+    const sel = $('convScope');
+    if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— 选择会话 —</option>' +
+      (d.sessions || []).map((s) =>
+        '<option value="' + esc(s.scope) + '">' + esc(s.title || s.scope) + '（' + s.messageCount + ' 条）</option>').join('');
+    if (cur) sel.value = cur;
+    if (!sel.value && (d.sessions || []).length > 0) sel.value = d.sessions[0].scope;
+    await loadConversations();
+  } catch (e) { /* 静默 */ }
+}
+
+async function loadConversations() {
+  const scope = $('convScope') ? $('convScope').value : '';
+  const box = $('convList');
+  if (!box) return;
+  if (!scope) { box.innerHTML = '<div class="empty">先选一个会话</div>'; return; }
+  try {
+    const d = await api('/api/sessions/' + encodeURIComponent(scope) + '/conversations');
+    if (!d.conversations.length) { box.innerHTML = '<div class="empty">还没有话题</div>'; return; }
+    box.innerHTML = '<table><tr><th>话题</th><th>消息</th><th>tokens</th><th>人格</th><th>最后活跃</th><th></th></tr>' +
+      d.conversations.map((x) =>
+        '<tr' + (x.isCurrent ? ' style="background:rgba(107,138,253,.08)"' : '') + '>' +
+        '<td>' + (x.isCurrent ? '<span class="pill">当前</span> ' : '') + esc(x.title || '未命名') +
+          (x.archived ? ' <span class="tag warn">已归档</span>' : '') + '</td>' +
+        '<td>' + x.messageCount + '</td>' +
+        '<td class="muted">' + (x.tokenUsage || 0).toLocaleString() + '</td>' +
+        '<td class="muted">' + esc(x.personaId || '继承') + '</td>' +
+        '<td class="muted">' + fmtAgo(x.lastActive) + '</td>' +
+        '<td style="white-space:nowrap">' +
+          (x.isCurrent ? '' : '<button class="sm ghost" onclick="switchConversation(\'' + esc(x.id) + '\')">切换</button> ') +
+          '<button class="sm ghost" onclick="renameConversation(\'' + esc(x.id) + '\',\'' + esc(x.title || '') + '\')">改名</button> ' +
+          '<button class="sm ghost" onclick="archiveConversation(\'' + esc(x.id) + '\',' + (x.archived ? 'false' : 'true') + ')">' + (x.archived ? '恢复' : '归档') + '</button> ' +
+          '<button class="sm danger" onclick="deleteConversation(\'' + esc(x.id) + '\')">删除</button>' +
+        '</td></tr>').join('') + '</table>';
+  } catch (e) {
+    box.innerHTML = '<div class="msg err">加载话题失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+window.newConversation = async () => {
+  const scope = $('convScope').value;
+  if (!scope) return toast('请先选择会话', 'err');
+  try {
+    const d = await post('/api/conversations/new', { scope: scope, title: $('convNewTitle').value.trim() });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    if (d.ok) { $('convNewTitle').value = ''; loadConversations(); }
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.switchConversation = async (id) => {
+  try {
+    const d = await post('/api/conversations/' + encodeURIComponent(id) + '/switch', {});
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadConversations();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.renameConversation = async (id, old) => {
+  const t = prompt('话题标题：', old || '');
+  if (t === null) return;
+  try {
+    const d = await post('/api/conversations/' + encodeURIComponent(id) + '/rename', { title: t });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadConversations();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.archiveConversation = async (id, archived) => {
+  try {
+    const d = await post('/api/conversations/' + encodeURIComponent(id) + '/archive', { archived: archived });
+    toast(d.ok ? d.message : d.error, d.ok ? 'ok' : 'err');
+    loadConversations();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+window.deleteConversation = async (id) => {
+  if (!confirm('删除这个会话话题？\n该话题下的消息和摘要会一并删除，且不可恢复。')) return;
+  try {
+    const r = await fetch('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' });
+    const d = await r.json().catch(() => ({}));
+    toast(d.ok ? d.message : (d.error || '删除失败'), d.ok ? 'ok' : 'err');
+    if (d.ok) loadConversations();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+async function loadUsers() {
+  try {
+    const d = await api('/api/users');
+    $('userCount').textContent = '（' + d.users.length + ' 人）';
+    $('userList').innerHTML = d.users.length === 0 ? '<div class="empty">还没有用户数据。有人在 QQ 里和机器人说话后，这里会显示。</div>' :
+      '<table><tr><th>QQ 号</th><th>昵称</th><th>消息数</th><th>记忆</th><th>最后活跃</th><th></th></tr>' +
+      d.users.map((u) => '<tr><td class="mono">' + u.userId + '</td>' +
+        '<td>' + esc(u.nickname) + (u.aliases.length > 1 ? ' <span class="muted">(曾用: ' + u.aliases.filter((a) => a !== u.nickname).slice(0,3).map(esc).join(', ') + ')</span>' : '') + '</td>' +
+        '<td>' + u.messageCount + '</td>' +
+        '<td>' + (u.factCount > 0 ? '<span class="tag acc">' + u.factCount + '</span>' : '0') + '</td>' +
+        '<td class="muted">' + fmtAgo(u.lastSeen) + '</td>' +
+        '<td><button class="sm ghost" onclick="showUser(' + u.userId + ')">详情</button></td></tr>').join('') + '</table>';
+    $('emoUser').innerHTML = '<option value="">— 选择用户 —</option>' +
+      d.users.map((u) => '<option value="' + u.userId + '">' + esc(u.nickname) + ' (' + u.userId + ')</option>').join('');
+  } catch (e) { toast('加载用户失败', 'err'); }
+}
+
+window.showUser = async (id) => {
+  try {
+    const d = await api('/api/users/' + id);
+    $('userDetailCard').style.display = 'block';
+    $('userDetailTitle').innerHTML = '用户详情：' + esc(d.user.nickname) + ' <span class="mono muted">' + d.user.userId + '</span>';
+
+    const facts = d.facts.length === 0 ? '<div class="empty">还没有抽取到长期记忆</div>' :
+      '<table><tr><th>类型</th><th>内容</th><th>置信度</th><th>跨会话</th><th>来源</th><th>召回</th><th></th></tr>' +
+      d.facts.map((f) => '<tr><td><span class="tag">' + esc(f.factTypeCn) + '</span></td><td>' + esc(f.content) + '</td>' +
+        '<td>' + (f.confidence*100).toFixed(0) + '%</td>' +
+        '<td>' + (f.shareable ? '<span class="tag ok">共享</span>' : '<span class="tag">本会话</span>') + '</td>' +
+        '<td class="mono muted">' + esc(f.scope) + '</td><td>' + f.hitCount + '</td>' +
+        '<td><button class="sm danger" onclick="delFact(' + f.id + ',' + id + ')">删除</button></td></tr>').join('') + '</table>';
+
+    const sessions = d.sessions.length === 0 ? '' :
+      '<h3 style="margin:16px 0 8px">参与的会话</h3><table><tr><th>会话</th><th>消息数</th><th>最后活跃</th><th>当前情绪</th></tr>' +
+      d.sessions.map((s) => '<tr><td class="mono">' + esc(s.scope) + '<div class="muted">' + esc(s.title||'') + '</div></td>' +
+        '<td>' + s.messageCount + '</td><td class="muted">' + fmtAgo(s.lastActive) + '</td>' +
+        '<td>' + (s.emotion ? '<span class="emotion-dot" style="background:' + (EMOTION_COLOR[s.emotion.label]||'#888') + '"></span>' + esc(s.emotion.labelCn) + ' <span class="muted">' + s.emotion.intensity.toFixed(2) + '</span>' : '<span class="muted">-</span>') + '</td></tr>').join('') + '</table>';
+
+    $('userDetail').innerHTML =
+      '<div class="grid c4" style="margin-bottom:14px">' +
+        '<div class="stat"><div class="v">' + d.user.messageCount + '</div><div class="k">消息数</div></div>' +
+        '<div class="stat"><div class="v">' + d.facts.length + '</div><div class="k">记忆条数</div></div>' +
+        '<div class="stat"><div class="v" style="font-size:13px">' + fmtTime(d.user.firstSeen) + '</div><div class="k">首次见面</div></div>' +
+        '<div class="stat"><div class="v" style="font-size:13px">' + fmtTime(d.user.lastSeen) + '</div><div class="k">最后活跃</div></div>' +
+      '</div><h3 style="margin-bottom:8px">长期记忆</h3>' + facts + sessions;
+    $('userDetailCard').scrollIntoView({ behavior:'smooth' });
+  } catch (e) { toast('加载用户详情失败: ' + e.message, 'err'); }
+};
+
+window.delFact = async (fid, uid) => {
+  if (!confirm('确定删除这条记忆？')) return;
+  try {
+    await api('/api/facts/' + fid, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    showUser(uid);
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('memSearchBtn').onclick = async () => {
+  const q = $('memQuery').value.trim();
+  if (!q) return toast('请输入关键词', 'err');
+  try {
+    const d = await api('/api/memory/search?q=' + encodeURIComponent(q));
+    $('memSearchResult').innerHTML =
+      '<div class="msg info">找到 ' + d.facts.length + ' 条记忆、' + d.messages.length + ' 条消息</div>' +
+      (d.facts.length ? '<h3 style="margin:12px 0 6px">记忆</h3><table><tr><th>用户</th><th>类型</th><th>内容</th><th>置信度</th></tr>' +
+        d.facts.map((f) => '<tr><td class="mono">' + f.userId + '</td><td><span class="tag">' + esc(f.factTypeCn) + '</span></td><td>' + esc(f.content) + '</td><td>' + (f.confidence*100).toFixed(0) + '%</td></tr>').join('') + '</table>' : '') +
+      (d.messages.length ? '<h3 style="margin:12px 0 6px">消息</h3><table><tr><th>时间</th><th>会话</th><th>发送者</th><th>内容</th></tr>' +
+        d.messages.map((m) => '<tr><td class="muted">' + fmtTime(m.createdAt) + '</td><td class="mono">' + esc(m.scope) + '</td><td>' + esc(m.senderName || m.userId) + '</td><td>' + esc(m.content.slice(0,120)) + '</td></tr>').join('') + '</table>' : '');
+  } catch (e) { toast(e.message, 'err'); }
+};
+$('memQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('memSearchBtn').click(); });
+
+async function loadEmoUsers() {
+  try {
+    const d = await api('/api/users');
+    $('emoUser').innerHTML = '<option value="">— 选择用户 —</option>' +
+      d.users.map((u) => '<option value="' + u.userId + '">' + esc(u.nickname) + ' (' + u.userId + ')</option>').join('');
+  } catch (e) {}
+}
+
+$('emoLoadBtn').onclick = async () => {
+  const id = $('emoUser').value;
+  if (!id) return toast('请选择用户', 'err');
+  try {
+    const d = await api('/api/users/' + id + '/emotion?limit=200');
+    if (d.history.length === 0) {
+      $('emoContent').innerHTML = '<div class="card"><div class="empty">该用户还没有情绪记录</div></div>';
+      return;
+    }
+    const last = d.history[d.history.length - 1];
+    const counts = {};
+    d.history.forEach((h) => { counts[h.labelCn] = (counts[h.labelCn] || 0) + 1; });
+    const avg = (k) => d.history.reduce((a, h) => a + h[k], 0) / d.history.length;
+
+    const bars = [['效价 (好坏)', avg('valence'), -1, 1], ['唤醒 (激动)', avg('arousal'), 0, 1], ['支配 (掌控)', avg('dominance'), 0, 1], ['强度', avg('intensity'), 0, 1]]
+      .map((x) => {
+        const pct = ((x[1] - x[2]) / (x[3] - x[2])) * 100;
+        return '<div style="margin-bottom:10px"><div class="muted" style="margin-bottom:4px">' + x[0] + '：' + x[1].toFixed(2) + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></div>';
+      }).join('');
+
+    $('emoContent').innerHTML =
+      '<div class="card"><h3>当前情绪状态</h3><div class="grid c3">' +
+        '<div class="stat"><div class="k">情绪</div><div class="v" style="font-size:18px;color:' + (EMOTION_COLOR[last.label]||'#888') + '">' + esc(last.labelCn) + '</div></div>' +
+        '<div class="stat"><div class="k">强度</div><div class="v">' + last.intensity.toFixed(2) + '</div></div>' +
+        '<div class="stat"><div class="k">记录数</div><div class="v">' + d.history.length + '</div></div></div>' +
+        '<div style="margin-top:16px">' + bars + '</div></div>' +
+      '<div class="card"><h3>情绪分布</h3><div class="grid c4">' +
+        Object.keys(counts).map((k) => '<div class="stat"><div class="v" style="font-size:18px">' + counts[k] + '</div><div class="k">' + esc(k) + '</div></div>').join('') +
+        '</div></div>' +
+      '<div class="card"><h3>情绪时间线（最近 ' + Math.min(d.history.length, 60) + ' 条）</h3><div class="scroll">' +
+        '<table><tr><th>时间</th><th>情绪</th><th>效价</th><th>唤醒</th><th>支配</th><th>强度</th></tr>' +
+        d.history.slice(-60).reverse().map((h) => '<tr><td class="muted">' + fmtTime(h.createdAt) + '</td>' +
+          '<td><span class="emotion-dot" style="background:' + (EMOTION_COLOR[h.label]||'#888') + '"></span>' + esc(h.labelCn) + '</td>' +
+          '<td>' + h.valence.toFixed(2) + '</td><td>' + h.arousal.toFixed(2) + '</td><td>' + h.dominance.toFixed(2) + '</td><td>' + h.intensity.toFixed(2) + '</td></tr>').join('') +
+        '</table></div></div>';
+  } catch (e) { toast('加载情绪失败: ' + e.message, 'err'); }
+};
+
+async function loadLogs() {
+  try {
+    const d = await api('/api/logs?lines=' + $('logLines').value);
+    $('logBox').textContent = (d.lines || []).join('\n') || '（暂无日志）';
+    $('logBox').scrollTop = $('logBox').scrollHeight;
+  } catch (e) { $('logBox').textContent = '加载失败: ' + e.message; }
+}
+$('logRefresh').onclick = loadLogs;
+
+// 点击遮罩关闭人格编辑器
+$('personaModal').addEventListener('click', (e) => { if (e.target === $('personaModal')) closePersonaEditor(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePersonaEditor(); });
+
+loadOverview();
+setInterval(loadOverview, 10000);
+</script>
+</body>
+</html>

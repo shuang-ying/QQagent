@@ -1,0 +1,264 @@
+# ============================================================
+# QQ Agent 总配置
+# 修改后重启生效（开发模式下 tsx watch 会自动重载）
+#
+# 这是**发行版**默认配置：不含任何个人信息，行为开关都取保守值。
+# 上手建议：先双击 start.bat，然后在面板里配好模型再逐项打开功能。
+# ============================================================
+
+app:
+  name: qq-agent
+  timezone: Asia/Shanghai
+
+log:
+  level: info          # trace | debug | info | warn | error
+  pretty: true         # 终端彩色输出；生产可设 false 走 JSON
+
+storage:
+  dbPath: data/brain.db
+  logDir: logs
+
+# ------------------------------------------------------------
+# NapCat / OneBot 11 接入
+# 装好 NapCat 后，Agent 作为 WS 客户端【反向连入】NapCat
+# NapCat 侧需开启：网络配置 -> 新建 WebSocket 服务端
+#   端口 3001，消息格式 array 或 string 均可（本 Agent 都支持）
+# ------------------------------------------------------------
+napcat:
+  enabled: true
+  mode: reverse-ws-client      # Agent 主动连 NapCat 的 WS 服务端
+  url: ws://127.0.0.1:3001
+  accessToken: ""              # 与 NapCat 的 token 保持一致；无则留空
+  selfId: 0                    # 留 0 自动从 login_info 获取机器人 QQ
+  reconnect:
+    initialMs: 1000
+    maxMs: 30000
+    factor: 1.8
+  heartbeat:
+    intervalMs: 30000
+    timeoutMs: 10000
+
+# ------------------------------------------------------------
+# 访问控制：谁能用、在哪些群能用、谁是管理员
+# 这三处都可以在管理面板的「权限」页里点选，不必手改本文件
+#
+# ⚠ 第一次用请务必先填好这三项，否则任何人都能用这个机器人，
+#   也能用命令切换人格/查看记忆。
+# ------------------------------------------------------------
+trigger:
+  private: always              # always | keyword | prefix
+  privateKeywords: []
+  group:
+    requireAt: true             # 必须 @机器人 才回复（建议保持 true，避免群里刷屏）
+    keywords: []               # 额外触发词（如 "猫咪"），空数组表示不启用
+    prefixes: []               # 前缀触发（如 "/ai"）
+    cooldownMs: 5000           # 同一会话两次回复的最小间隔
+    maxConcurrent: 2           # 同一会话并发生成上限
+    ignoreSelf: true
+    enabledGroups: []          # 群白名单，如 [123456789]；空数组 = 所有群都能用
+    # 记录群内所有人的发言作为上下文（机器人能"听懂"群聊），
+    # 但记忆只归属说话人本人的 QQ
+    recordAllMessages: true
+  allowUsers: []               # 用户白名单；空数组 = 所有人可用
+  denyUsers: []                # 用户黑名单，优先级最高
+  admins: []                   # 管理员 QQ，如 [123456789]；可使用管理类命令
+  commandAdminOnly: true       # true = 只有管理员能用命令
+  personaAdminOnly: true       # true = 只有管理员能切换人格
+
+# ------------------------------------------------------------
+# 人格作用范围：按会话（私聊 / 每个群）分别设置
+# ------------------------------------------------------------
+persona:
+  default: catgirl             # 默认人格 id（可选：catgirl / blue-fish / cool / genki / gentle / sage / tsundere）
+  # 按会话覆盖：私聊或某个群使用不同人格
+  # 例：
+  #   private: gentle         # 所有私聊用温柔姐姐
+  #   groups:
+  #     123456789: cool       # 工作群用冷酷助手
+  scope:
+    private: ""                # 留空 = 用 default
+    groups: {}
+  # 用户可用命令切换人格（如 /persona cool）
+  commandEnabled: true
+  commandPrefix: "/persona"
+
+# ------------------------------------------------------------
+# 主动发言（机器人主动搭话）
+# 默认**关闭**：刚上手时不建议直接开，它会自己找话聊。
+# 想开启就把 enabled 改成 true，并先把频率调保守些。
+# ------------------------------------------------------------
+proactive:
+  enabled: false
+  # off 关闭 | probability 只看每几句消息 | relevant 只看话题相关 | hybrid 两者结合
+  mode: hybrid
+  everyNMessages: 8            # 「每几句消息」：每积累这么多条群消息算一个机会点
+  probability: 0.3             # 基础概率：机会点且话题不相关时，发言的概率
+  relevanceProbability: 0.7    # 话题相关时的发言概率（通常设得比基础概率高）
+  relevanceThreshold: 0.6      # 相关度阈值，低于它就走基础概率那条路
+  minIntervalMs: 600000        # 同一会话两次主动发言最小间隔（毫秒，0=不限制）
+  minGapAfterBotMs: 180000     # 距机器人上次说话的最小间隔（毫秒，0=不限制）
+  maxPerHourPerScope: 3        # 每会话每小时上限（0=不限制；想关主动发言请用 enabled/mode）
+  imageLookback: 3             # 主动搭话时回看最近几张历史图片一起理解（0=不看图）
+  quietHours: ["23:00-08:00"]  # 免打扰时段，不主动发言
+  onlyWhenAddressed: false     # true = 仅在被提及时才可能接话
+
+# ------------------------------------------------------------
+# 大模型
+# 供应商在 config/providers.local.yaml 里配，或直接在面板「模型接入」页加。
+# 这里留空 = 启动后用面板选；选完会自动写回本文件。
+# ------------------------------------------------------------
+llm:
+  defaultProvider: ""
+  defaultModel: ""
+  fallback: []                 # 例: [my-backup]，主供应商失败时按序回退
+  # ----------------------------------------------------------
+  # 模型用途：不同环节适合不同模型，可分别指定
+  #   chat      主对话      emotion   情绪分析（高频，建议用便宜的小模型）
+  #   summary   上下文压缩  facts     记忆抽取
+  #   embedding 向量化      vision    图片理解
+  # provider / model 留空 = 继承上面的 defaultProvider / defaultModel
+  # 推荐在管理面板「模型用途」页点选，无需手改本文件
+  # ----------------------------------------------------------
+  roles:
+    chat:
+      provider: ""
+      model: ""
+    emotion:
+      provider: ""
+      model: ""
+    summary:
+      provider: ""
+      model: ""
+    facts:
+      provider: ""
+      model: ""
+    embedding:
+      provider: ""
+      model: ""
+    vision:
+      provider: ""
+      model: ""
+  # 手工纠正模型能力推断。
+  # 推断只能看模型名，中转站改名后会判错 —— 例如把 deepseek-flash
+  # 叫成 deepseek-v4.1-flash，就可能被误判成"不支持图片"。
+  # 判错时在这里覆盖即可，不用改代码：
+  #   modelOverrides:
+  #     "deepseek-v4.1-flash": { vision: true }
+  #     "某个老模型":           { vision: false }
+  modelOverrides: {}
+  request:
+    timeoutMs: 120000
+    maxRetries: 2
+    retryDelayMs: 800
+  generation:
+    temperature: 0.8
+    maxTokens: 1024
+    stream: true               # 流式生成，首字更快
+    # 摘要（上下文压缩）用更大的预算：推理模型会先输出思维链，
+    # 预算太小会导致摘要正文为空、压缩静默失效
+    summaryMaxTokens: 1200
+
+# ------------------------------------------------------------
+# 记忆系统（以 QQ 号为唯一 ID）
+# ------------------------------------------------------------
+memory:
+  recentTurns: 12              # 塞进 prompt 的最近对话轮数
+  factExtraction: true         # 自动抽取长期事实（喜好/身份/约定）
+  # 注：抽取用哪个模型由 llm.roles.facts 决定（旧字段 factExtractionModel 仍兼容）
+  retrieval:
+    fts: true                  # 关键词全文检索
+    limit: 20                  # 单次召回上限
+    timeDecayHalfLifeDays: 30  # 记忆权重时间衰减半衰期
+    # 语义检索：需要先在「模型用途 -> 向量化」配置 embedding 模型
+    semantic: true             # 打开后按语义相似度召回，未配置模型时自动退回关键词
+    semanticMinScore: 0.35     # 语义召回的最低余弦相似度
+    # 跨会话记忆策略：
+    #   identity-facts = 只共享"用户是谁"的中性事实（昵称/喜好/身份），对话内容按群隔离
+    #   full           = 全部共享（有隐私风险）
+    #   none           = 完全不共享
+    crossScopeSharing: identity-facts
+    # 允许跨群共享的事实类别
+    shareableFactTypes: ["identity", "preference", "skill", "goal"]
+  summary:
+    enabled: true
+    triggerMessages: 40        # 未摘要消息超过该数量触发压缩
+    keepRecentTurns: 8         # 压缩时保留的最近轮数
+    maxLevel: 3                # 最大摘要层级(L1/L2/L3)递归压缩
+
+# ------------------------------------------------------------
+# 情绪提取
+# ------------------------------------------------------------
+emotion:
+  enabled: true
+  mode: hybrid                 # rule | llm | hybrid
+  # 注：分析用哪个模型由 llm.roles.emotion 决定（旧字段 model 仍兼容）
+  smoothing: 0.3               # 情绪状态 EMA 平滑系数 0~1
+  affectPersona: true          # 让情绪影响人格语气（同一个人格会"心情不同"）
+  dimensions:
+    - valence                  # 效价：愉悦度
+    - arousal                  # 唤醒度：激动程度
+    - dominance                # 支配度：掌控感
+
+# ------------------------------------------------------------
+# 上下文压缩
+# ------------------------------------------------------------
+context:
+  maxTokensRatio: 0.70         # 最多使用模型上下文的 70%
+  modelContextWindow: 32768    # 未知模型的默认上下文窗口
+  reserveForReply: 1024        # 为回复预留 token
+  compressStrategy: layered    # trim | summary | layered
+
+# ------------------------------------------------------------
+# 回复行为：让机器人更像真人
+# 分条发送与延迟算法的思路参考 AstrBot 的 respond stage
+# ------------------------------------------------------------
+reply:
+  # 分条发送：把一条长回复拆成几条发出，中间有"打字"停顿
+  segmented:
+    enabled: false             # 默认关，避免刷屏；想更像真人可打开
+    intervalMethod: log        # log = 按字数算停顿（更像打字）| random = 固定区间随机
+    logBase: 2.3               # log 底数，越大停顿增长越平缓
+    interval: [1.5, 3.5]       # intervalMethod=random 时的停顿区间（秒）
+    maxSegments: 4             # 最多拆几条
+    minCharsToSplit: 30        # 短于这个字数就不拆
+  mentionOnReply: true         # 群里回复时 @ 对方
+  quoteOnReply: false          # 引用对方那条消息再回复（更清晰但更占屏）
+  typingDelayMs: [0, 0]        # 回复前的"思考"延迟区间（毫秒）；改成 [300,1200] 会明显更自然
+  pokeBack: true               # 被戳一戳就戳回去
+  pokeReply: true              # 被戳时也说一句（人格可用 pokeReplies 自定义）
+  recentImages: 2              # 当前消息没带图时，回看"上次发言之后"新发的几张图（0=关闭）
+  emojiLike:
+    enabled: false             # 给消息点表情回应（👍）
+    emojiId: "128077"
+    onEmotions: ["joy"]
+
+# ------------------------------------------------------------
+# 表情包：模型可在回复末尾用 [表情:标签] 发一张图
+# 目录里放图片，**文件名就是标签**（happy_1.png → happy）
+# 发行版不含图片（自己的收藏表情请用面板「从 QQ 收藏导入」）
+# 详见 config/stickers/README.md
+# ------------------------------------------------------------
+sticker:
+  enabled: false              # 打开后模型才会发表情包；先把图片放进 config/stickers
+  dir: config/stickers
+  manifest: manifest.json     # 每张图的标签与 AI 识别结果存在这里
+  maxPerReply: 1              # 一条回复最多发几张
+  autoOnEmotions: []          # 例: ["joy"]，这些情绪时即使模型没发也补一张
+  maxTagsInPrompt: 40         # 提示词里最多列几个标签
+  descCharsInPrompt: 18       # 每个标签附带的描述截断长度，0 = 不附
+  autoSend:
+    enabled: false            # 按情绪自动补图（建议先只用模型自主决定那条路）
+    emotions: []              # 命中这些情绪才自动发，如 ["sadness"]
+    minIntensity: 0.55        # 情绪太弱不配图
+    probability: 0.35         # 命中后实际发送的概率
+    cooldownSec: 180          # 同一会话两次自动发图的最小间隔（秒）
+    requireDesc: true         # 只发被 AI 理解过（有描述）的图
+
+# ------------------------------------------------------------
+# 管理面板
+# ------------------------------------------------------------
+server:
+  enabled: true
+  host: 127.0.0.1
+  port: 3081
+  authToken: ""                # 留空则仅本机可访问、不校验
