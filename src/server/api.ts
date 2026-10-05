@@ -15,11 +15,12 @@ import { serve } from '@hono/node-server';
 import type { Logger } from '../core/logger.js';
 import type { AppConfig, LlmRoleName, Persona, ProviderConfig } from '../core/types.js';
 import { LLM_ROLE_LABELS, LLM_ROLE_NAMES } from '../core/types.js';
+import {memoryTerms} from '../memory/store.js';
 import type { MemoryStore } from '../memory/store.js';
 import type { ProviderManager } from '../llm/manager.js';
 import type { PersonaManager } from '../persona/manager.js';
 import { discoverModels } from '../llm/discover.js';
-import { resolveApiKey, normalizeBaseUrl, PROJECT_ROOT } from '../config/loader.js';
+import { resolveApiKey, PROJECT_ROOT } from '../config/loader.js';
 import {
   SETTING_DEFS,
   readPath,
@@ -36,6 +37,7 @@ import {
 import { EMOTION_LABELS_CN } from '../emotion/analyzer.js';
 import { FACT_TYPE_CN } from '../memory/extractor.js';
 import { getPanelHtml } from '../web/panel.js';
+import { COMMAND_DEFINITIONS, commandPermission } from '../pipeline/command-permissions.js';
 import { StickerLibrary } from '../persona/stickers.js';
 import { safeRelPath } from '../persona/stickerAnalyze.js';
 import { sniffMime } from '../llm/vision.js';
@@ -51,11 +53,15 @@ export interface ServerDeps {
   /** 运行时状态查询（连接状态、机器人账号等） */
   runtime: () => {
     napcatConnected: boolean;
+    onebot?: { connected: boolean; accountReady: boolean; apiReady: boolean; generation: number;
+      pending: number; bufferedBytes: number; implementation: { name: string; version: string; protocol: string };
+      extensions: Record<string, string> };
     selfId: number;
     nickname: string;
     uptimeMs: number;
     startedAt: number;
   };
+  diagnostics?: () => unknown;
   /** 更新默认 provider + 模型（写回配置文件并热生效） */
   updateDefaultModel: (providerKey: string, modelId: string) => void;
   /** 保存/新增一个供应商（写回 providers.local.yaml 并更新运行时） */
@@ -108,8 +114,9 @@ export interface ServerDeps {
   pushStickerDesc?: () => Promise<{ ok: number; failed: number }>;
 }
 
-export function createServer(deps: ServerDeps): { app: Hono; start: () => void; stop: () => void } {
+export function createServer(deps: ServerDeps): { app: Hono; start: () => void; stop: () => Promise<void> } {
   const { cfg, store, providers, personas, log, runtime } = deps;
+  if (!['127.0.0.1','localhost','::1'].includes(cfg.server.host) && !cfg.server.authToken) throw new Error('非回环面板必须配置 authToken');
   const app = new Hono();
 
   // ==================== 鉴权 ====================
@@ -120,11 +127,38 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     const token =
       c.req.header('authorization')?.replace(/^Bearer\s+/i, '') ??
       c.req.header('x-auth-token') ??
-      c.req.query('token');
+      (c.req.path === '/api/stickers/file' ? c.req.query('token') : undefined);
     if (token !== cfg.server.authToken) {
       return c.json({ ok: false, error: '未授权：token 不正确' }, 401);
     }
     return next();
+  });
+
+  app.use('/api/*', async (c,next) => {
+    if (['POST','PUT','PATCH'].includes(c.req.method)) {
+      const declared=Number(c.req.header('content-length') ?? 0);
+      if (declared>1048576) return c.json({ok:false,error:'请求体过大'},413);
+      const text=await c.req.text();
+      if (Buffer.byteLength(text)>1048576) return c.json({ok:false,error:'请求体过大'},413);
+      if (text) { try { const value=JSON.parse(text); if (!value || typeof value!=='object' || Array.isArray(value)) return c.json({ok:false,error:'请求体必须为 JSON 对象'},400); } catch { return c.json({ok:false,error:'非法 JSON'},400); } }
+    }
+    return next();
+  });
+  app.get('/api/health', c => c.json({ok:true,runtime:runtime(),diagnostics:deps.diagnostics?.(),embedding:store.embeddingStats()}));
+  app.get('/api/memory/forgetting', c => c.json({ok:true,records:store.db.prepare('SELECT * FROM memory_forgetting ORDER BY id DESC LIMIT 100').all()}));
+  app.get('/api/memory/explain', c => {
+    const userId=Number(c.req.query('userId')); const scope=c.req.query('scope'); const query=c.req.query('q') ?? '';
+    if (!Number.isSafeInteger(userId) || userId<=0 || !scope || !query.trim()) return c.json({ok:false,error:'需要有效 userId、scope、q'},400);
+    return c.json({ok:true,strategy:cfg.memory.retrieval.crossScopeSharing,candidates:store.searchFacts(userId,query,{scope,sharing:cfg.memory.retrieval.crossScopeSharing,shareableOnly:cfg.memory.retrieval.crossScopeSharing==='identity-facts',limit:cfg.memory.retrieval.limit}),note:'关键词候选解释；不发起模型请求，不等于本轮最终 prompt。'});
+  });
+  app.patch('/api/facts/:id', async c => {
+    const id=Number(c.req.param('id'));const patch=await c.req.json().catch(()=>null);
+    if (!Number.isSafeInteger(id) || id<=0 || !patch || typeof patch!=='object' || Object.keys(patch).some(k=>!['content','private','confidence'].includes(k)) || (patch.content!==undefined && (typeof patch.content!=='string' || !patch.content.trim() || patch.content.length>2000)) || (patch.private!==undefined && typeof patch.private!=='boolean') || (patch.confidence!==undefined && (typeof patch.confidence!=='number' || !Number.isFinite(patch.confidence) || patch.confidence<0 || patch.confidence>1))) return c.json({ok:false,error:'非法事实修正'},400);
+    const fact=store.db.prepare('SELECT * FROM memory_facts WHERE id=? AND active=1').get(id) as {user_id:number;content:string;private:number;confidence:number} | undefined;
+    if (!fact) return c.json({ok:false,error:'事实不存在'},404);
+    store.db.prepare('UPDATE memory_facts SET content=?,private=?,confidence=?,updated_at=?,keywords=? WHERE id=?').run(patch.content??fact.content,patch.private===undefined?fact.private:Number(patch.private),patch.confidence??fact.confidence,Date.now(),memoryTerms(patch.content??fact.content).join(' '),id);
+    store.deleteFactEmbedding(id);store.notifyFactChange(fact.user_id);
+    return c.json({ok:true});
   });
 
   // ==================== 概览 ====================
@@ -460,6 +494,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         desc: ACCESS_FLAG_LABELS[id as AccessFlagName].desc,
         value: snap.flags[id as AccessFlagName],
       })),
+      commands: COMMAND_DEFINITIONS.map(d => ({...d, value:commandPermission(cfg.trigger,d.id), inherited:cfg.trigger.commandPermissions[d.id]===undefined})),
       /** 提示：当前生效范围概览 */
       summary: {
         userScope:
@@ -484,10 +519,11 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     const body = (await c.req.json().catch(() => ({}))) as {
       lists?: Record<string, unknown>;
       flags?: Record<string, unknown>;
+      commands?: import('../config/settings.js').AccessUpdate['commands'];
     };
-    if (!body.lists && !body.flags) return c.json({ ok: false, error: '没有要更新的内容' }, 400);
+    if (!body.lists && !body.flags && !body.commands) return c.json({ ok: false, error: '没有要更新的内容' }, 400);
 
-    const result = validateAccess(cfg, { lists: body.lists ?? {}, flags: body.flags ?? {} });
+    const result = validateAccess(cfg, { lists: body.lists ?? {}, flags: body.flags ?? {}, commands: body.commands ?? {} });
     if (!result.ok) return c.json({ ok: false, error: result.error }, 400);
     if (result.entries.length === 0) return c.json({ ok: true, changed: 0, message: '没有变化' });
 
@@ -515,6 +551,8 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         temperature: p.temperature,
         maxTokens: p.maxTokens,
         systemPrompt: p.systemPrompt,
+        structured: p.structured,
+        proactiveTopics: p.proactiveTopics,
         emotionModulation: p.emotionModulation,
         triggers: p.triggers,
         examples: p.examples,
@@ -532,7 +570,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       scopeType: s.scope_type,
       targetId: s.target_id,
       title: s.title,
-      personaId: s.persona_id,
+      personaId: personas.resolve(s.scope,s.scope_type==='private'?s.target_id:0).persona.id,
       lastActive: s.last_active,
       messageCount: s.message_count,
     }));
@@ -545,11 +583,14 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
   });
 
   app.post('/api/personas/scope', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { scope?: string; personaId?: string };
+    const body = (await c.req.json().catch(() => ({}))) as { scope?: string; personaId?: string; history?: 'keep'|'new' };
     if (!body.scope) return c.json({ ok: false, error: '缺少 scope' }, 400);
     if (!body.personaId) return c.json({ ok: false, error: '缺少 personaId' }, 400);
-    const ok = personas.setForSession(body.scope, body.personaId);
-    return c.json({ ok, ...(ok ? {} : { error: '人格不存在' }) });
+    if (body.history!==undefined && !['keep','new'].includes(body.history)) return c.json({ok:false,error:'历史处理方式不合法'},400);
+    try {
+      const conversationId=personas.switchForSession(body.scope,body.personaId,body.history??'keep');
+      return c.json({ok:true,conversationId,personaId:body.personaId,history:body.history??'keep'});
+    }catch(e){return c.json({ok:false,error:(e as Error).message},400);}
   });
 
   /** 切换默认人格 */
@@ -980,6 +1021,9 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       keywords: f.keywords,
       confidence: f.confidence,
       shareable: f.shareable === 1,
+      private: f.private === 1,
+      sourceMessageId: f.source_msg_id,
+      replacesId: f.replaces_id,
       scope: f.scope,
       createdAt: f.created_at,
       hitCount: f.hit_count,
@@ -1158,11 +1202,9 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         log.info({ url: `http://${cfg.server.host}:${info.port}` }, '🖥  管理面板已启动');
       });
     },
-    stop: () => {
-      if (server) {
-        server.close();
-        server = null;
-      }
+    stop: async () => {
+      const closing=server;server=null;
+      if(closing)await new Promise<void>((resolve,reject)=>closing.close(error=>error?reject(error):resolve()));
     },
   };
 }

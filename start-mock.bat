@@ -12,6 +12,7 @@ cd /d "%~dp0"
 REM Resolve npm to a FULL PATH before calling it (see start.bat).
 set "NPMPATH="
 for /f "delims=" %%i in ('where npm.cmd 2^>nul') do if not defined NPMPATH set "NPMPATH=%%i"
+if not defined NPMPATH if exist "D:\NodeJs\npm.cmd" set "NPMPATH=D:\NodeJs\npm.cmd"
 
 if not defined NPMPATH (
   echo [X] npm not found. Please install Node.js v22.5 or newer.

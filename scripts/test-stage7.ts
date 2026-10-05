@@ -246,10 +246,11 @@ function testPersonaFiles(): void {
 
   const persona: Persona = {
     id: 'unit-test',
+    structured: {identity:'',speakingStyle:'',interactionStyle:'',answerPrinciples:'',emotionalStyle:''},
     name: '单元测试人格',
     emoji: '🧪',
     description: '测试',
-    systemPrompt: '你是一个用于测试的人格。\n第二行。',
+    systemPrompt: '你是一个用于测试的人格。\n第二行。', proactiveTopics: [],
     examples: [],
     errorMessage: '',
     pokeReplies: [],
@@ -397,6 +398,52 @@ async function testHttp(): Promise<void> {
     const r3 = await j('/api/llm/roles');
     const emb2 = r3.json.roles.find((x: any) => x.role === 'embedding');
     check('embedding 用途可清除（回落到默认）', emb2.model === roles.json.defaultModel);
+
+    // ---- 向量化：三个曾出过错的地方 ----
+    // 1) 面板原来在"供应商留空"时直接 return，模型下拉里看不到已保存的值，
+    //    用户会以为设置没生效（每次打开都变回默认）。
+    //    这里守的是 API 必须把 overrideModel 原样给出来，面板才有东西可显示。
+    const onlyModel = await post('/api/settings', {
+      patch: { 'llm.roles.embedding.provider': '', 'llm.roles.embedding.model': 'only-model-test' },
+    });
+    check('只设模型（供应商留空）可保存', onlyModel.json?.ok === true, JSON.stringify(onlyModel.json));
+    const r4 = await j('/api/llm/roles');
+    const embOnly = r4.json.roles.find((x: any) => x.role === 'embedding');
+    check('只设模型时 overrideModel 仍返回给面板（否则下拉显示不出已保存值）',
+      embOnly.overrideModel === 'only-model-test', JSON.stringify(embOnly.overrideModel));
+    check('只设模型时 overrideProvider 为空（继承默认）', embOnly.overrideProvider === '');
+
+    // 2) 改供应商**不应该**清掉已选模型（面板以前发 model: ''）
+    const afterProvider = await post('/api/settings', {
+      patch: { 'llm.roles.embedding.provider': provKey },
+    });
+    check('改供应商可保存', afterProvider.json?.ok === true);
+    const r5 = await j('/api/llm/roles');
+    const embAfter = r5.json.roles.find((x: any) => x.role === 'embedding');
+    check('改供应商后已选模型仍在', embAfter.overrideModel === 'only-model-test',
+      JSON.stringify(embAfter.overrideModel));
+    check('改供应商后 provider 已更新', embAfter.overrideProvider === provKey);
+
+    // 3) semanticReady 不能拿"继承来的默认模型"冒充已配置
+    //    （主对话模型做不了向量化，冒充会导致面板显示"已就绪"但实际全失败）
+    await post('/api/settings', { patch: { 'llm.roles.embedding.provider': '', 'llm.roles.embedding.model': '' } });
+    const r6 = await j('/api/llm/roles');
+    const embInherit = r6.json.roles.find((x: any) => x.role === 'embedding');
+    check('清空后 embedding 回落到默认模型', embInherit.model === r6.json.defaultModel,
+      `${embInherit.model} vs ${r6.json.defaultModel}`);
+    check('继承默认模型时 semanticReady 必须为 false（别假装已就绪）',
+      r6.json.semanticReady === false, String(r6.json.semanticReady));
+
+    await post('/api/settings', {
+      patch: { 'llm.roles.embedding.provider': provKey, 'llm.roles.embedding.model': 'zzz-embed' },
+    });
+    const r7 = await j('/api/llm/roles');
+    check('显式指定后 semanticReady 为 true', r7.json.semanticReady === true, String(r7.json.semanticReady));
+
+    // 收尾
+    await post('/api/settings', {
+      patch: { 'llm.roles.embedding.provider': '', 'llm.roles.embedding.model': '' },
+    });
   }
 
   // ---- 人格 ----
@@ -1138,6 +1185,114 @@ async function testPanelUi(): Promise<void> {
 // ============================================================
 // G. 图片理解
 // ============================================================
+// H. @人 的归属（主动搭话不能张冠李戴）
+// ============================================================
+async function testMention(): Promise<void> {
+  section('H. @人 的归属');
+
+  const { extractMention, resolveMention, describeParticipants } = await import('../src/pipeline/mention.js');
+  const { ReplyDispatcher } = await import('../src/pipeline/dispatch.js');
+  const { loadConfig: lc } = await import('../src/config/loader.js');
+  const { getLogger: gl } = await import('../src/core/logger.js');
+
+  const people = [
+    { userId: 301, name: '张三', messageId: 11 },
+    { userId: 302, name: '李四', messageId: 22 },
+    { userId: 303, name: '王五', messageId: 33 },
+  ];
+
+  // ---- 解析 ----
+  check('解析: 精确命中', resolveMention('张三', people)?.userId === 301);
+  check('解析: 忽略空白', resolveMention(' 张三 ', people)?.userId === 301);
+  check('解析: 带 @ 前缀也认', resolveMention('@张三', people)?.userId === 301);
+  check('解析: 名字对不上返回 undefined', resolveMention('赵六', people) === undefined);
+  check('解析: 拒绝 @全体成员', resolveMention('全体成员', people) === undefined);
+  check('解析: 拒绝 all', resolveMention('all', people) === undefined);
+  check('解析: 空名字返回 undefined', resolveMention('   ', people) === undefined);
+  check('解析: 部分匹配唯一时命中', resolveMention('小张', [{ userId: 9, name: '小张三' }])?.userId === 9);
+  check('解析: 多个候选时不猜（避免 @错人）',
+    resolveMention('张', [{ userId: 1, name: '张三' }, { userId: 2, name: '张四' }]) === undefined);
+
+  // ---- 从正文里摘标记 ----
+  const m1 = extractMention('[@张三] 你那个 bug 我看了', people);
+  check('摘取: 正文去掉标记', m1.text === '你那个 bug 我看了', JSON.stringify(m1.text));
+  check('摘取: 解析到张三', m1.target?.userId === 301);
+  check('摘取: 标记了 hadMarker', m1.hadMarker === true);
+  check('摘取: 记录原始名字', m1.requested === '张三');
+
+  const m2 = extractMention('哈哈 [@李四] 你也太逗了', people);
+  check('摘取: 标记在中间也能摘', m2.text === '哈哈  你也太逗了' || m2.text === '哈哈 你也太逗了', JSON.stringify(m2.text));
+  check('摘取: 解析到李四', m2.target?.userId === 302);
+
+  const m3 = extractMention('就是随便说说', people);
+  check('摘取: 没标记时原样返回', m3.text === '就是随便说说' && m3.hadMarker === false);
+  check('摘取: 没标记时没有 target', m3.target === undefined);
+
+  // 名字对不上：**必须把标记摘掉**，否则群里会看到字面的 [@赵六]
+  const m4 = extractMention('[@赵六] 你说啥', people);
+  check('摘取: 名字对不上也摘掉标记', m4.text === '你说啥', JSON.stringify(m4.text));
+  check('摘取: 名字对不上时没有 target', m4.target === undefined);
+  check('摘取: 名字对不上仍标记 hadMarker（据此不再兜底 @ 别人）', m4.hadMarker === true);
+
+  // 标记在开头时会留下行首空白，要清掉
+  const m5 = extractMention('[@王五]\n第二行内容', people);
+  check('摘取: 摘掉行首标记后不留空白行', !m5.text.startsWith('\n') && !m5.text.startsWith(' '), JSON.stringify(m5.text));
+
+  // ---- 成员清单 ----
+  const desc = describeParticipants(people, 302);
+  check('清单: 列出所有成员', people.every((p) => desc.includes(p.name)));
+  check('清单: 标出最后说话的人', desc.includes('最后说话的人') && desc.includes('李四（QQ 302）  ← 最后说话的人'));
+  check('清单: 说明 [@名字] 用法', desc.includes('[@名字]') || desc.includes('[@张三]'));
+  check('清单: 空名单返回空串', describeParticipants([], 1) === '');
+
+  // ---- 分发的默认与覆盖行为 ----
+  const cfg = lc();
+  const mk = (over: Record<string, unknown>) =>
+    new ReplyDispatcher({ ...cfg.app.reply, typingDelayMs: [0, 0], segmented: { ...cfg.app.reply.segmented, enabled: false }, ...over }, gl('d'));
+
+  async function sentHead(disp: InstanceType<typeof ReplyDispatcher>, ctx: Record<string, unknown>) {
+    const got: Array<{ scope: string; message: unknown }> = [];
+    const fakeApi = { sendToScope: async (scope: string, message: unknown) => { got.push({ scope, message }); return { message_id: 1 }; } } as never;
+    await disp.send(fakeApi, { scope: 'group:1', scopeType: 'group', userId: 301, ...ctx }, '正文');
+    const segs = (got[0]?.message ?? []) as Array<{ type: string; data: Record<string, unknown> }>;
+    // at 段的 qq 是字符串（OneBot 要求），这里统一转数字再比
+    const atRaw = segs.find((s) => s.type === 'at')?.data?.['qq'];
+    const replyRaw = segs.find((s) => s.type === 'reply')?.data?.['id'];
+    return {
+      at: atRaw === undefined ? undefined : Number(atRaw),
+      // reply 段的 id 同样是字符串
+      reply: replyRaw === undefined ? undefined : Number(replyRaw),
+      segs,
+    };
+  }
+
+  // 默认：@ 当前说话人（被动回复的正确行为）
+  const d1 = await sentHead(mk({ mentionOnReply: true }), {});
+  check('分发: 默认 @ 当前说话人', d1.at === 301, JSON.stringify(d1.at));
+
+  // 显式覆盖：@ 别人
+  const d2 = await sentHead(mk({ mentionOnReply: true }), { mentionUserId: 302 });
+  check('分发: 显式指定时 @ 指定的人', d2.at === 302, JSON.stringify(d2.at));
+
+  // 显式 null：谁都不 @（主动搭话的默认）
+  const d3 = await sentHead(mk({ mentionOnReply: true }), { mentionUserId: null });
+  check('分发: 显式 null 时完全不 @', d3.at === undefined, JSON.stringify(d3.at));
+  check('分发: 不 @ 时正文照常发', d3.segs.some((s) => s.type === 'text'));
+
+  // 私聊不 @
+  const d4 = await sentHead(mk({ mentionOnReply: true }), { scopeType: 'private', mentionUserId: null });
+  check('分发: 私聊不会 @', d4.at === undefined);
+
+  // 引用：显式指定优先
+  const d5 = await sentHead(mk({ quoteOnReply: true }), { messageId: 11, quoteMessageId: 33 });
+  check('分发: 引用可显式指定', d5.reply === 33, JSON.stringify(d5.reply));
+  const d6 = await sentHead(mk({ quoteOnReply: true }), { messageId: 11, quoteMessageId: null });
+  check('分发: 引用可显式关闭', d6.reply === undefined, JSON.stringify(d6.reply));
+  const d7 = await sentHead(mk({ quoteOnReply: true }), { messageId: 11 });
+  check('分发: 未指定时引用触发消息（原行为）', d7.reply === 11, JSON.stringify(d7.reply));
+}
+
+// ============================================================
 async function testVision(): Promise<void> {
   section('G. 图片理解');
 
@@ -1367,7 +1522,7 @@ async function testVision(): Promise<void> {
   check('清空覆盖后回到名字推断', inferModelMeta('deepseek-chat').supportsVision === false);
 
   // 图片 token 估算应对齐文档上限
-  check('图片 token 估算对齐 DeepSeek 文档（1024）', IMAGE_TOKEN_ESTIMATE === 1024, String(IMAGE_TOKEN_ESTIMATE));
+  check('图片 token 使用保守预算', IMAGE_TOKEN_ESTIMATE >= 1024, String(IMAGE_TOKEN_ESTIMATE));
 
   // ---- 确定性验证：图片确实按各协议要求的形状发出去了 ----
   // 这是"模型能不能看图"的**可控那一半**：图片有没有真的进请求体。
@@ -2158,7 +2313,7 @@ async function testStickers(): Promise<void> {
   section('表情包：从 QQ 收藏导入');
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
   let served = 0;
-  const cdn = http.createServer((req, res) => {
+  const cdn = http.createServer((_req, res) => {
     served++;
     res.writeHead(200, { 'content-type': 'image/png' });
     res.end(pngBytes);
@@ -2410,6 +2565,7 @@ async function main(): Promise<void> {
   await testSemantic();
   await testPanelUi();
   await testVision();
+  await testMention();
   await testActions();
   await testPokeEndToEnd();
   await testConversations();

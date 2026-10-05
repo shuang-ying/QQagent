@@ -10,7 +10,7 @@
  *
  * 运行：npm run test:stage1
  */
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer } from 'ws';
 import { NapCatClient } from '../src/napcat/client.js';
 import { getLogger } from '../src/core/logger.js';
 import { normalizeMessageEvent, parseCqCodes, segmentsToText, toCqCodes } from '../src/napcat/normalize.js';
@@ -136,7 +136,7 @@ function testNormalize(): void {
     message: [{ type: 'at', data: { qq: 'all' } }],
     sender: { user_id: USER_QQ, nickname: 'n' },
   } as never);
-  check('@全体: 视为@机器人', atAllEv.mentionsBot === true);
+  check('@全体: 不视为@机器人', atAllEv.mentionsBot === false);
 }
 
 // ============================================================
@@ -253,6 +253,9 @@ async function testRealtime(): Promise<void> {
   await new Promise<void>((r) => wss.once('listening', () => r()));
 
   const cfg: AppConfig['napcat'] = {
+    maxPending: 128,
+    extensions: {},
+    maxBufferedBytes: 1048576,
     enabled: true,
     mode: 'reverse-ws-client',
     url: `ws://127.0.0.1:${PORT}`,

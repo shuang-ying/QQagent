@@ -5,6 +5,7 @@
  * 所有方法都是同步的（node:sqlite 是同步 API），性能足够 QQ 场景。
  */
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { initDatabase, newConversationId } from './schema.js';
@@ -50,6 +51,9 @@ export interface ConversationRow {
 }
 
 export interface MessageRow {
+  persona_id?: string | null;
+  persona_fingerprint?: string | null;
+  conversation_id?: string | null;
   id: number;
   scope: string;
   user_id: number;
@@ -69,6 +73,9 @@ export interface MessageRow {
 }
 
 export interface FactRow {
+  private: number;
+  active: number;
+  replaces_id: number | null;
   id: number;
   user_id: number;
   scope: string;
@@ -110,6 +117,9 @@ export interface EmotionStateRow {
 }
 
 export interface AddMessageInput {
+  personaId?: string;
+  personaFingerprint?: string;
+  conversationId?: string;
   scope: string;
   userId: number;
   role: 'user' | 'assistant';
@@ -131,6 +141,7 @@ export interface FactInput {
   confidence?: number;
   shareable?: boolean;
   sourceMsgId?: number;
+  replacesId?: number;
 }
 
 /** 粗略估算 token 数（中文约 1.5 字/token，英文约 4 字符/token） */
@@ -145,6 +156,19 @@ export class MemoryStore {
   readonly db: DatabaseSync;
   /** scope -> 当前对话 id 缓存（避免热路径反复查库） */
   private convCache = new Map<string, string>();
+  private conversationListeners = new Set<(scope: string, conversationId: string) => void>();
+  onConversationChange(listener: (scope: string, conversationId: string) => void): () => void {
+    this.conversationListeners.add(listener);
+    return () => this.conversationListeners.delete(listener);
+  }
+  private conversationChanged(scope: string, id: string): void {
+    for (const listener of this.conversationListeners) listener(scope, id);
+  }
+  private resolveConversation(scope: string, id?: string): string {
+    if (!id) return this.currentConversationId(scope);
+    if (this.getConversation(id)?.scope !== scope) throw new Error('指定话题不存在或不属于该会话');
+    return id;
+  }
 
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -152,6 +176,9 @@ export class MemoryStore {
   }
 
   close(): void {
+    for (const listener of this.closeListeners) listener();
+    this.closeListeners.clear();
+    this.conversationListeners.clear();
     try {
       this.db.close();
     } catch {
@@ -160,6 +187,9 @@ export class MemoryStore {
   }
 
   // ==================== 用户 ====================
+
+  private closeListeners = new Set<() => void>();
+  onClose(listener: () => void): void { this.closeListeners.add(listener); }
 
   /** 确保用户存在并更新活跃信息；返回用户行 */
   touchUser(userId: number, nickname: string, now = Date.now()): UserRow {
@@ -314,6 +344,26 @@ export class MemoryStore {
       .run(id, scope, title || fallbackTitle, personaId, now, now);
     this.db.prepare('UPDATE sessions SET current_conversation_id = ? WHERE scope = ?').run(id, scope);
     this.convCache.set(scope, id);
+    this.conversationChanged(scope, id);
+    return id;
+  }
+
+  /** 切换人格和话题指针在同一事务提交，提交后才取消旧任务。 */
+  switchSessionPersona(scope:string,personaId:string,history:'keep'|'new',previousPersonaId:string):string {
+    const oldId=this.currentConversationId(scope);
+    let id=oldId;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.setSessionPersona(scope,personaId);
+      if(history==='new') {
+        this.db.prepare('UPDATE conversations SET persona_id=COALESCE(persona_id,?) WHERE id=?').run(previousPersonaId,oldId);
+        id=newConversationId(); const now=Date.now();
+        this.db.prepare('INSERT INTO conversations(id,scope,title,persona_id,token_usage,archived,first_seen,last_active,message_count) VALUES(?,?,?,?,0,0,?,?,0)').run(id,scope,'人格 '+personaId+' 新话题',personaId,now,now);
+        this.db.prepare('UPDATE sessions SET current_conversation_id=? WHERE scope=?').run(id,scope);
+      } else this.db.prepare('UPDATE conversations SET persona_id=? WHERE id=?').run(personaId,id);
+      this.db.exec('COMMIT');
+    } catch(e) {this.db.exec('ROLLBACK');throw e;}
+    this.convCache.set(scope,id); this.conversationChanged(scope,id);
     return id;
   }
 
@@ -321,8 +371,10 @@ export class MemoryStore {
   switchConversation(scope: string, conversationId: string): boolean {
     const conv = this.getConversation(conversationId);
     if (!conv || conv.scope !== scope) return false;
+    const oldId = this.currentConversationId(scope);
     this.db.prepare('UPDATE sessions SET current_conversation_id = ? WHERE scope = ?').run(conversationId, scope);
     this.convCache.set(scope, conversationId);
+    if (oldId !== conversationId) this.conversationChanged(scope, conversationId);
     return true;
   }
 
@@ -339,6 +391,7 @@ export class MemoryStore {
   deleteConversation(id: string): void {
     const conv = this.getConversation(id);
     if (!conv) return;
+    this.conversationChanged(conv.scope, id);
     this.db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(id);
     this.db.prepare('DELETE FROM summaries WHERE conversation_id = ?').run(id);
     this.db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
@@ -399,20 +452,31 @@ export class MemoryStore {
 
   // ==================== 消息 ====================
 
+  beginDelivery(scope: string, conversationId = this.currentConversationId(scope)): number {
+    const now = Date.now();
+    return Number(this.db.prepare('INSERT INTO reply_deliveries(scope, conversation_id, state, created_at, updated_at) VALUES (?,?,?,?,?)')
+      .run(scope, conversationId, 'pending', now, now).lastInsertRowid);
+  }
+
+  finishDelivery(id: number, state: string, pieces: unknown[]): void {
+    this.db.prepare('UPDATE reply_deliveries SET state = ?, pieces = ?, updated_at = ? WHERE id = ?')
+      .run(state, JSON.stringify(pieces), Date.now(), id);
+  }
+
   addMessage(input: AddMessageInput): number {
     const now = input.createdAt ?? Date.now();
     const tokens = input.tokens ?? estimateTokens(input.content);
     const e = input.emotion;
     // 消息归属到「当前对话」，这样开新话题后历史不会串
-    const convId = this.currentConversationId(input.scope);
+    const convId = this.resolveConversation(input.scope, input.conversationId);
 
     const info = this.db
       .prepare(
         `INSERT INTO messages(
            scope, conversation_id, user_id, role, content, raw_segments, message_id, sender_name, tokens,
            emotion_label, emotion_valence, emotion_arousal, emotion_dominance, emotion_intensity,
-           summarized, created_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
+           summarized, created_at, persona_id, persona_fingerprint
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
       )
       .run(
         input.scope,
@@ -430,6 +494,8 @@ export class MemoryStore {
         e?.dominance ?? null,
         e?.intensity ?? null,
         now,
+        input.role === 'assistant' ? input.personaId ?? null : null,
+        input.role === 'assistant' ? input.personaFingerprint ?? null : null,
       );
 
     // 更新计数
@@ -449,12 +515,12 @@ export class MemoryStore {
    * 注意：这里按对话过滤，而不是按 scope —— 这正是多话题隔离的关键。
    * 老数据（conversation_id 为空）在迁移时已回填，不会漏。
    */
-  getRecentMessages(scope: string, limit: number, excludeSummarized = false): MessageRow[] {
-    const convId = this.currentConversationId(scope);
+  getRecentMessages(scope: string, limit: number, excludeSummarized = false, conversationId?: string, cutoffId = Number.MAX_SAFE_INTEGER): MessageRow[] {
+    const convId = this.resolveConversation(scope, conversationId);
     const sql = excludeSummarized
-      ? 'SELECT * FROM messages WHERE conversation_id = ? AND summarized = 0 ORDER BY created_at DESC, id DESC LIMIT ?'
-      : 'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT ?';
-    const rows = this.db.prepare(sql).all(convId, limit) as unknown as MessageRow[];
+      ? 'SELECT * FROM messages WHERE conversation_id = ? AND id <= ? AND summarized = 0 ORDER BY created_at DESC, id DESC LIMIT ?'
+      : 'SELECT * FROM messages WHERE conversation_id = ? AND id <= ? ORDER BY created_at DESC, id DESC LIMIT ?';
+    const rows = this.db.prepare(sql).all(convId, cutoffId, limit) as unknown as MessageRow[];
     return rows.reverse();
   }
 
@@ -474,15 +540,15 @@ export class MemoryStore {
   }
 
   /** 取当前对话未摘要的消息 */
-  getUnsummarizedMessages(scope: string, limit = 500): MessageRow[] {
-    const convId = this.currentConversationId(scope);
+  getUnsummarizedMessages(scope: string, limit = 500, conversationId?: string, cutoffId = Number.MAX_SAFE_INTEGER): MessageRow[] {
+    const convId = this.resolveConversation(scope, conversationId);
     return this.db
-      .prepare('SELECT * FROM messages WHERE conversation_id = ? AND summarized = 0 ORDER BY id ASC LIMIT ?')
-      .all(convId, limit) as unknown as MessageRow[];
+      .prepare('SELECT * FROM messages WHERE conversation_id = ? AND id <= ? AND summarized = 0 ORDER BY id ASC LIMIT ?')
+      .all(convId, cutoffId, limit) as unknown as MessageRow[];
   }
 
-  countUnsummarized(scope: string): number {
-    const convId = this.currentConversationId(scope);
+  countUnsummarized(scope: string, conversationId?: string): number {
+    const convId = this.resolveConversation(scope, conversationId);
     const r = this.db
       .prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ? AND summarized = 0')
       .get(convId) as { n: number };
@@ -516,20 +582,20 @@ export class MemoryStore {
    * 被动回复时回看图片用这个：只有这段时间里出现的图才是"还没被回应过的新图"。
    * 用 id 比较而不是时间戳 —— 同一毫秒内的多条消息用时间戳会全被漏掉。
    */
-  getMessagesSinceLastAssistant(scope: string, limit = 20): MessageRow[] {
-    const convId = this.currentConversationId(scope);
+  getMessagesSinceLastAssistant(scope: string, limit = 20, conversationId?: string, cutoffId = Number.MAX_SAFE_INTEGER): MessageRow[] {
+    const convId = this.resolveConversation(scope, conversationId);
     const rows = this.db
       .prepare(
         `SELECT * FROM messages
-         WHERE conversation_id = ?
+         WHERE conversation_id = ? AND id <= ?
            AND id > COALESCE(
-             (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant'),
+             (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant' AND id <= ?),
              0
            )
-         ORDER BY id ASC LIMIT ?`,
+         ORDER BY id DESC LIMIT ?`,
       )
-      .all(convId, convId, limit) as unknown as MessageRow[];
-    return rows;
+      .all(convId, cutoffId, convId, cutoffId, limit) as unknown as MessageRow[];
+    return rows.reverse();
   }
 
   /** 某会话里机器人最后一次发言的时间（0 = 从没说过） */
@@ -567,7 +633,19 @@ export class MemoryStore {
 
   // ==================== 长期事实 ====================
 
+  private factListeners = new Set<(userId: number) => void>();
+  onFactChange(listener: (userId: number) => void): void { this.factListeners.add(listener); }
+  notifyFactChange(userId: number): void { for (const listener of this.factListeners) listener(userId); }
+
   addFact(input: FactInput): number {
+    const duplicate = this.findSimilarFact(input.userId, input.content, input.scope);
+    if (duplicate) return duplicate.id;
+    if (input.replacesId) {
+      const previous = this.db.prepare('SELECT * FROM memory_facts WHERE id=? AND user_id=? AND scope=? AND fact_type=? AND active=1').get(input.replacesId,input.userId,input.scope,input.factType);
+      if (!previous) throw new Error('替换事实归属或版本无效');
+    }
+    const ownTransaction=!this.db.isTransaction;if(ownTransaction)this.db.exec('BEGIN IMMEDIATE');
+    try {
     const now = Date.now();
     const info = this.db
       .prepare(
@@ -580,38 +658,44 @@ export class MemoryStore {
         input.scope,
         input.factType,
         input.content,
-        input.keywords ?? '',
+        memoryTerms(`${input.content} ${input.keywords ?? ''}`).join(' '),
         input.confidence ?? 0.8,
         input.shareable ? 1 : 0,
         input.sourceMsgId ?? null,
         now,
         now,
       );
+    if (input.replacesId) {
+      this.db.prepare('UPDATE memory_facts SET active=0,updated_at=? WHERE id=?').run(now,input.replacesId);
+      this.db.prepare('UPDATE memory_facts SET replaces_id=? WHERE id=?').run(input.replacesId,Number(info.lastInsertRowid));
+      this.deleteFactEmbedding(input.replacesId);
+    }
+    if(ownTransaction)this.db.exec('COMMIT');
+    this.notifyFactChange(input.userId);
     return Number(info.lastInsertRowid);
+    } catch(e){if(ownTransaction && this.db.isTransaction)this.db.exec('ROLLBACK');throw e;}
   }
 
   /** 查找同用户同类型且内容高度相同的事实，用于去重 */
-  findSimilarFact(userId: number, content: string): FactRow | undefined {
-    const normalized = content.trim();
-    return this.db
-      .prepare('SELECT * FROM memory_facts WHERE user_id = ? AND content = ? LIMIT 1')
-      .get(userId, normalized) as FactRow | undefined;
+  findSimilarFact(userId: number, content: string, scope?: string): FactRow | undefined {
+    const rows = this.db.prepare('SELECT * FROM memory_facts WHERE user_id=? AND active=1' + (scope ? ' AND scope=?' : '')).all(userId,...(scope ? [scope] : [])) as unknown as FactRow[];
+    return rows.find(row => normalizeFact(row.content) === normalizeFact(content));
   }
 
-  getFactsByUser(userId: number, opts: { scope?: string; shareableOnly?: boolean; limit?: number } = {}): FactRow[] {
+  getFactsByUser(userId: number, opts: { scope?: string; shareableOnly?: boolean; sharing?: 'none' | 'identity-facts' | 'full'; limit?: number } = {}): FactRow[] {
     const limit = opts.limit ?? 100;
-    const conds = ['user_id = ?'];
+    const conds = ['user_id = ?', 'active = 1'];
     const params: Array<string | number> = [userId];
     if (opts.scope) {
       // 本会话的事实 + 可跨会话共享的事实
       if (opts.shareableOnly) {
-        conds.push('(scope = ? OR shareable = 1)');
+        conds.push('(scope = ? OR (shareable = 1 AND private = 0))');
       } else {
-        conds.push('scope = ?');
+        conds.push(opts.sharing === 'full' ? '(scope = ? OR private = 0)' : 'scope = ?');
       }
       params.push(opts.scope);
     } else if (opts.shareableOnly) {
-      conds.push('shareable = 1');
+      conds.push('shareable = 1 AND private = 0');
     }
     params.push(limit);
     return this.db
@@ -626,62 +710,34 @@ export class MemoryStore {
   searchFacts(
     userId: number,
     query: string,
-    opts: { scope?: string; shareableOnly?: boolean; limit?: number; halfLifeDays?: number } = {},
+    opts: { scope?: string; shareableOnly?: boolean; sharing?: 'none' | 'identity-facts' | 'full'; limit?: number; halfLifeDays?: number } = {},
   ): Array<FactRow & { score: number }> {
     const limit = opts.limit ?? 20;
     const halfLifeDays = opts.halfLifeDays ?? 30;
 
-    // 构造 FTS 查询：把查询词拆成 OR 连接的词元，提高召回
-    const terms = query
-      .split(/[\s,，。!！?？;；:：、]+/)
-      .map((t) => t.trim())
-      .filter((t) => t.length >= 1)
-      .slice(0, 12)
-      .map((t) => `"${t.replace(/"/g, '""')}"`);
-
+    const terms = memoryTerms(query).slice(0, 15);
+    if (!terms.length) return [];
+    const conditions = ['f.user_id = ?', 'f.active = 1']; const permission: Array<string | number> = [userId];
+    if (opts.scope) { conditions.push(opts.sharing === 'full' ? '(f.scope = ? OR f.private = 0)' : opts.shareableOnly ? '(f.scope = ? OR (f.shareable = 1 AND f.private = 0))' : 'f.scope = ?'); permission.push(opts.scope); }
+    else if (opts.shareableOnly) conditions.push('f.shareable = 1 AND f.private = 0');
+    const where = conditions.join(' AND ');
     let rows: FactRow[] = [];
-    if (terms.length > 0) {
-      try {
-        const ftsQuery = terms.join(' OR ');
-        const raw = this.db
-          .prepare(
-            `SELECT f.*, bm25(memory_facts_fts) AS rank
-             FROM memory_facts_fts
-             JOIN memory_facts f ON f.id = memory_facts_fts.rowid
-             WHERE memory_facts_fts MATCH ? AND f.user_id = ?
-             ORDER BY rank
-             LIMIT ?`,
-          )
-          .all(ftsQuery, userId, limit * 3) as unknown as Array<FactRow & { rank: number }>;
-        rows = raw;
-      } catch {
-        // FTS 查询语法问题则退化为 LIKE
-        rows = [];
-      }
-    }
-
-    // 若 FTS 无结果，退化为关键词 LIKE
-    if (rows.length === 0 && query.trim()) {
-      rows = this.db
-        .prepare(
-          'SELECT * FROM memory_facts WHERE user_id = ? AND (content LIKE ? OR keywords LIKE ?) ORDER BY updated_at DESC LIMIT ?',
-        )
-        .all(userId, `%${query.trim()}%`, `%${query.trim()}%`, limit * 3) as unknown as FactRow[];
-    }
-
-    // 作用域过滤（在内存中做，避免破坏 FTS 排序）
-    let filtered = rows;
-    if (opts.scope) {
-      filtered = rows.filter((r) => r.scope === opts.scope || (opts.shareableOnly && r.shareable === 1));
-    } else if (opts.shareableOnly) {
-      filtered = rows.filter((r) => r.shareable === 1);
-    }
+    try {
+      rows = this.db.prepare(`SELECT f.* FROM memory_facts_fts JOIN memory_facts f ON f.id=memory_facts_fts.rowid
+        WHERE memory_facts_fts MATCH ? AND ${where} ORDER BY bm25(memory_facts_fts) LIMIT ?`)
+        .all(terms.map(t => '"' + t.replace(/"/g,'""') + '"').join(' OR '), ...permission, limit * 3) as unknown as FactRow[];
+    } catch { /* LIKE 仍可检索旧库未分词的事实 */ }
+    const like = terms.map(() => "(f.content LIKE ? ESCAPE '\\' OR f.keywords LIKE ? ESCAPE '\\')").join(' OR ');
+    const likeParams = terms.flatMap(t => { const v = '%' + t.replace(/[\\%_]/g, x => '\\' + x) + '%'; return [v,v]; });
+    const fallback = this.db.prepare(`SELECT f.* FROM memory_facts f WHERE ${where} AND (${like}) ORDER BY updated_at DESC LIMIT ?`)
+      .all(...permission, ...likeParams, limit * 3) as unknown as FactRow[];
+    const filtered = [...new Map([...rows, ...fallback].map(f => [f.id,f])).values()];
 
     // 时间衰减加权：越久没被想起的事实分数越低
     const now = Date.now();
     const scored = filtered.map((f) => {
       const ageDays = (now - f.updated_at) / 86400000;
-      const decay = Math.pow(0.5, ageDays / halfLifeDays);
+      const decay = Math.pow(0.5, ageDays / (['identity', 'skill'].includes(f.fact_type) ? Math.max(halfLifeDays, 365) : halfLifeDays));
       const score = f.confidence * (0.5 + 0.5 * decay) + Math.min(f.hit_count, 5) * 0.05;
       return { ...f, score };
     });
@@ -698,7 +754,16 @@ export class MemoryStore {
   }
 
   deleteFact(id: number): void {
-    this.db.prepare('DELETE FROM memory_facts WHERE id = ?').run(id);
+    const fact = this.db.prepare('SELECT * FROM memory_facts WHERE id=?').get(id) as FactRow | undefined;
+    if (!fact) return;
+    const cutoff = (this.db.prepare('SELECT COALESCE(MAX(id),0) AS n FROM messages WHERE user_id=?').get(fact.user_id) as { n: number }).n;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO memory_forgetting(user_id,scope,content,source_msg_id,cutoff,created_at) VALUES(?,?,?,?,?,?)').run(fact.user_id,fact.scope,fact.content,fact.source_msg_id,cutoff,Date.now());
+      this.db.prepare('DELETE FROM summaries WHERE scope=? AND (id IN (SELECT summary_id FROM summary_sources WHERE message_id=?) OR id NOT IN (SELECT summary_id FROM summary_sources))').run(fact.scope,fact.source_msg_id ?? -1);
+      this.db.prepare('DELETE FROM memory_facts WHERE id=?').run(id);
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
 
   // ==================== 向量（语义检索） ====================
@@ -708,14 +773,15 @@ export class MemoryStore {
   /** 保存/更新一条事实的向量 */
   saveFactEmbedding(factId: number, vec: number[], model: string): void {
     if (vec.length === 0) return;
+    const fact=this.db.prepare('SELECT content FROM memory_facts WHERE id=?').get(factId) as {content:string}|undefined;if(!fact)return;
     this.db
       .prepare(
-        `INSERT INTO fact_embeddings(fact_id, dim, vec, model, created_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO fact_embeddings(fact_id, dim, vec, model, created_at,source_content,content_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(fact_id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec,
-           model=excluded.model, created_at=excluded.created_at`,
+           model=excluded.model, created_at=excluded.created_at,source_content=excluded.source_content,content_hash=excluded.content_hash`,
       )
-      .run(factId, vec.length, vectorToBlob(vec), model, Date.now());
+      .run(factId, vec.length, vectorToBlob(vec), model, Date.now(),fact.content,createHash('sha256').update(fact.content).digest('hex'));
   }
 
   /** 已写入向量的模型名（用于判断换模型后是否需要重算） */
@@ -732,7 +798,7 @@ export class MemoryStore {
       .prepare(
         `SELECT COUNT(*) AS n FROM memory_facts f
          LEFT JOIN fact_embeddings e ON e.fact_id = f.id
-         WHERE f.user_id = ? AND (e.fact_id IS NULL OR e.model <> ?)`,
+         WHERE f.user_id = ? AND f.active = 1 AND (e.fact_id IS NULL OR e.model <> ? OR e.source_content <> f.content)`,
       )
       .get(userId, model) as { n: number } | undefined;
     return row?.n ?? 0;
@@ -754,7 +820,7 @@ export class MemoryStore {
   searchFactsByVector(
     userId: number,
     queryVec: number[],
-    opts: { scope?: string; shareableOnly?: boolean; limit?: number; minScore?: number; model?: string } = {},
+    opts: { scope?: string; shareableOnly?: boolean; sharing?: 'none' | 'identity-facts' | 'full'; limit?: number; minScore?: number; model?: string } = {},
   ): Array<FactRow & { score: number; similarity: number }> {
     const limit = opts.limit ?? 20;
     const minScore = opts.minScore ?? 0.35;
@@ -764,21 +830,23 @@ export class MemoryStore {
       .prepare(
         `SELECT f.*, e.vec AS _vec FROM memory_facts f
          JOIN fact_embeddings e ON e.fact_id = f.id
-         WHERE f.user_id = ? AND e.dim = ? ${opts.model ? 'AND e.model = ?' : ''}
-         LIMIT 5000`,
+         WHERE f.user_id = ? AND f.active = 1 AND e.source_content = f.content AND e.dim = ? ${opts.model ? 'AND e.model = ?' : ''}
+         ${opts.scope ? (opts.sharing === 'full' ? 'AND (f.scope = ? OR f.private = 0)' : opts.shareableOnly ? 'AND (f.scope = ? OR (f.shareable = 1 AND f.private = 0))' : 'AND f.scope = ?') : (opts.shareableOnly ? 'AND f.shareable = 1 AND f.private = 0' : '')}
+         ORDER BY f.updated_at DESC LIMIT 5000`,
       )
       .all(
         ...(opts.model ? [userId, queryVec.length, opts.model] : [userId, queryVec.length]),
+        ...(opts.scope ? [opts.scope] : []),
       ) as unknown as Array<FactRow & { _vec: Uint8Array }>;
 
-    const now = Date.now();
     const scored: Array<FactRow & { score: number; similarity: number }> = [];
 
     for (const r of rows) {
-      if (opts.scope && !(r.scope === opts.scope || (opts.shareableOnly && r.shareable === 1))) continue;
+
       if (!opts.scope && opts.shareableOnly && r.shareable !== 1) continue;
 
-      const sim = cosineSimilarity(queryVec, blobToVector(r._vec));
+      let sim: number;
+      try { sim = cosineSimilarity(queryVec, blobToVector(r._vec)); } catch { continue; }
       if (sim < minScore) continue;
 
       const { _vec, ...fact } = r;
@@ -824,8 +892,9 @@ export class MemoryStore {
     msgFromId: number | null,
     msgToId: number | null,
     msgCount: number,
+    conversationId?: string,
   ): number {
-    const convId = this.currentConversationId(scope);
+    const convId = this.resolveConversation(scope, conversationId);
     const info = this.db
       .prepare(
         'INSERT INTO summaries(scope, conversation_id, level, content, msg_from_id, msg_to_id, msg_count, tokens, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
@@ -836,11 +905,39 @@ export class MemoryStore {
   }
 
   /** 取当前对话的摘要（多话题隔离：不会串到别的话题） */
-  getSummaries(scope: string, level?: number, limit = 20): SummaryRow[] {
-    const convId = this.currentConversationId(scope);
+  commitSummary(scope: string, conversationId: string, level: number, content: string, messageIds: number[], sourceSummaryIds: number[] = []): number {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.getConversation(conversationId)?.scope !== scope) throw new Error('话题已删除或归属不匹配');
+      const originals = new Set(messageIds);
+      const children: SummaryRow[] = [];
+      for (const id of messageIds) {
+        const row = this.db.prepare('SELECT conversation_id,summarized FROM messages WHERE id=?').get(id) as { conversation_id: string; summarized: number } | undefined;
+        if (!row || row.conversation_id !== conversationId || row.summarized) throw new Error('摘要消息已被其他任务处理');
+      }
+      for (const id of sourceSummaryIds) {
+        const child = this.db.prepare('SELECT * FROM summaries WHERE id=? AND conversation_id=? AND NOT EXISTS(SELECT 1 FROM summary_coverage WHERE child_id=summaries.id)').get(id, conversationId) as unknown as SummaryRow | undefined;
+        if (!child) throw new Error('摘要源已被其他任务处理');
+        children.push(child);
+        const source = this.db.prepare('SELECT message_id FROM summary_sources WHERE summary_id=?').all(id) as unknown as { message_id: number }[];
+        for (const row of source) originals.add(row.message_id);
+      }
+      const starts = [...messageIds, ...children.map(c => c.msg_from_id).filter((id): id is number => id !== null)];
+      const ends = [...messageIds, ...children.map(c => c.msg_to_id).filter((id): id is number => id !== null)];
+      const summaryId = this.addSummary(scope, level, content, starts.length ? Math.min(...starts) : null,
+        ends.length ? Math.max(...ends) : null, originals.size || children.reduce((sum, c) => sum + c.msg_count, 0), conversationId);
+      for (const id of originals) this.db.prepare('INSERT INTO summary_sources(summary_id,message_id) VALUES(?,?)').run(summaryId, id);
+      this.markSummarized(messageIds);
+      for (const child of sourceSummaryIds) this.db.prepare('INSERT INTO summary_coverage(child_id,parent_id) VALUES(?,?)').run(child, summaryId);
+      this.db.exec('COMMIT'); return summaryId;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  getSummaries(scope: string, level?: number, limit = 20, conversationId?: string): SummaryRow[] {
+    const convId = this.resolveConversation(scope, conversationId);
     const sql = level
-      ? 'SELECT * FROM summaries WHERE conversation_id = ? AND level = ? ORDER BY created_at DESC LIMIT ?'
-      : 'SELECT * FROM summaries WHERE conversation_id = ? ORDER BY level ASC, created_at ASC LIMIT ?';
+      ? 'SELECT * FROM summaries WHERE conversation_id = ? AND level = ? AND NOT EXISTS(SELECT 1 FROM summary_coverage WHERE child_id=summaries.id) ORDER BY created_at DESC,id DESC LIMIT ?'
+      : 'SELECT * FROM summaries WHERE conversation_id = ? AND NOT EXISTS(SELECT 1 FROM summary_coverage WHERE child_id=summaries.id) ORDER BY level DESC,created_at DESC,id DESC LIMIT ?';
     const rows = level
       ? (this.db.prepare(sql).all(convId, level, limit) as unknown as SummaryRow[])
       : (this.db.prepare(sql).all(convId, limit) as unknown as SummaryRow[]);
@@ -851,14 +948,14 @@ export class MemoryStore {
   getLatestSummary(scope: string): SummaryRow | undefined {
     const convId = this.currentConversationId(scope);
     return this.db
-      .prepare('SELECT * FROM summaries WHERE conversation_id = ? ORDER BY level DESC, created_at DESC LIMIT 1')
+      .prepare('SELECT * FROM summaries WHERE conversation_id = ? AND NOT EXISTS(SELECT 1 FROM summary_coverage WHERE child_id=summaries.id) ORDER BY level DESC, created_at DESC,id DESC LIMIT 1')
       .get(convId) as SummaryRow | undefined;
   }
 
-  countSummaries(scope: string, level: number): number {
-    const convId = this.currentConversationId(scope);
+  countSummaries(scope: string, level: number, conversationId?: string): number {
+    const convId = this.resolveConversation(scope, conversationId);
     const r = this.db
-      .prepare('SELECT COUNT(*) AS n FROM summaries WHERE conversation_id = ? AND level = ?')
+      .prepare('SELECT COUNT(*) AS n FROM summaries WHERE conversation_id = ? AND level = ? AND NOT EXISTS(SELECT 1 FROM summary_coverage WHERE child_id=summaries.id)')
       .get(convId, level) as { n: number };
     return r.n;
   }
@@ -1044,3 +1141,15 @@ export class MemoryStore {
     };
   }
 }
+
+/** 索引和检索共用中文二元词，保持老 unicode61 表兼容。 */
+export function memoryTerms(text: string): string[] {
+  const terms: string[] = [];
+  for (const word of text.normalize('NFKC').toLowerCase().match(/[\u4e00-\u9fff]+|[a-z0-9_.+-]+/g) ?? []) {
+    if (/^[\u4e00-\u9fff]+$/.test(word) && word.length > 2) for (let i=0;i<word.length-1;i++) terms.push(word.slice(i,i+2));
+    else terms.push(word);
+  }
+  return [...new Set(terms)];
+}
+
+export function normalizeFact(content: string): string { return content.normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu,''); }

@@ -16,6 +16,7 @@ import type { MemoryStore } from '../memory/store.js';
 import type { PersonaManager } from '../persona/manager.js';
 import { EMOTION_LABELS_CN } from '../emotion/analyzer.js';
 import { FACT_TYPE_CN } from '../memory/extractor.js';
+import { parseCommand, authorizeCommand } from './command-permissions.js';
 
 export interface CommandContext {
   scope: string;
@@ -50,29 +51,12 @@ export class CommandHandler {
    * 尝试把消息当作命令处理
    */
   async tryHandle(text: string, ctx: Omit<CommandContext, 'arg'>): Promise<CommandResult> {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith('/')) return { handled: false };
-
-    const sp = trimmed.indexOf(' ');
-    const cmd = (sp === -1 ? trimmed : trimmed.slice(0, sp)).toLowerCase();
-    const arg = sp === -1 ? '' : trimmed.slice(sp + 1).trim();
-    const full: CommandContext = { ...ctx, arg };
-
-    // ---- 管理员门禁 ----
-    // 这两项由 TriggerPolicy 判定后传入，这里不再自己读配置，避免两处判定不一致。
-    const personaCmd = cmd === '/persona' || cmd === '/人格';
-    if (personaCmd && !ctx.canSwitchPersona) {
-      return {
-        handled: true,
-        reply: `没有权限切换人格：${ctx.denyReason ?? '仅限管理员'}。`,
-      };
-    }
-    if (!personaCmd && !ctx.canUseCommands) {
-      return {
-        handled: true,
-        reply: `没有权限使用命令：${ctx.denyReason ?? '仅限管理员'}。`,
-      };
-    }
+    const parsed = parseCommand(text);
+    if (!parsed) return { handled: false };
+    const cmd = '/' + parsed.id;
+    const full: CommandContext = { ...ctx, arg: parsed.arg };
+    const gate = authorizeCommand(this.cfg.trigger, parsed.id, ctx.userId);
+    if (!gate.allowed) return { handled: true, reply: gate.reason + '。' };
 
     switch (cmd) {
       case '/help':
@@ -114,7 +98,7 @@ export class CommandHandler {
     const p = this.cfg.persona.commandPrefix;
     return [
       '🐱 可用命令：',
-      `${p} <人格id> — 切换当前会话的人格`,
+      `${p} <人格id> [keep|new] — 切换人格；保留历史或新开话题`,
       `${p}s — 列出所有人格`,
       '/memory — 查看我记得关于你的什么',
       '/forget <关键词> — 让我忘掉某条记忆',
@@ -149,17 +133,19 @@ export class CommandHandler {
       ].join('\n');
     }
 
-    const target = ctx.arg.toLowerCase().replace(/^@/, '');
+    const args=ctx.arg.toLowerCase().split(/\s+/);
+    const target = args[0]!.replace(/^@/, '');
+    const mode=args[1]??'keep';
+    if(args.length>2 || !['keep','new','--new'].includes(mode)) return '用法：/persona <id> [keep|new]\nkeep保留历史；new新开话题，旧话题保留。';
     if (!this.personas.has(target)) {
       const ids = this.personas.list().map((x) => x.id).join(', ');
       return `没有叫「${target}」的人格。\n可用：${ids}`;
     }
 
-    const ok = this.personas.setForSession(ctx.scope, target);
-    if (!ok) return '切换失败。';
+    this.personas.switchForSession(ctx.scope, target, mode === 'keep' ? 'keep' : 'new');
 
     const persona = this.personas.get(target)!;
-    return `人格已切换为 ${persona.emoji} ${persona.name}\n${persona.description}`;
+    return `人格已切换为 ${persona.emoji} ${persona.name}\n${persona.description}\n${mode === 'keep' ? '历史保留，旧人格回复仅作资料。' : '已新开话题，旧话题可以用 /topics 切回。'}`;
   }
 
   private listPersonas(): string {
@@ -180,6 +166,7 @@ export class CommandHandler {
     const facts = this.store.getFactsByUser(ctx.userId, {
       scope: ctx.scope,
       shareableOnly: this.cfg.memory.retrieval.crossScopeSharing === 'identity-facts',
+      sharing: this.cfg.memory.retrieval.crossScopeSharing,
       limit: 30,
     });
     if (facts.length === 0) {
@@ -209,7 +196,7 @@ export class CommandHandler {
   private forget(ctx: CommandContext): string {
     if (!ctx.arg) return '用法：/forget <关键词>\n例如：/forget 可乐';
     const kw = ctx.arg;
-    const facts = this.store.getFactsByUser(ctx.userId, { limit: 500 });
+    const facts = this.store.getFactsByUser(ctx.userId, { scope:ctx.scope, sharing:this.cfg.memory.retrieval.crossScopeSharing, shareableOnly:this.cfg.memory.retrieval.crossScopeSharing==='identity-facts', limit:500 });
     const matched = facts.filter((f) => f.content.includes(kw) || f.keywords.includes(kw));
     if (matched.length === 0) return `没找到包含「${kw}」的记忆。`;
     for (const f of matched) this.store.deleteFact(f.id);

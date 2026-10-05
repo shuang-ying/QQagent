@@ -11,7 +11,8 @@
  * proactive / pipeline）在构造时持有的是子对象的引用，替换会让它们看不到变化。
  */
 import type { AppConfig } from '../core/types.js';
-import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES } from '../core/types.js';
+import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES, COMMAND_IDS, CommandPermissionsSchema, type CommandId, type CommandPermission } from '../core/types.js';
+import { commandPermission } from '../pipeline/command-permissions.js';
 
 export interface SettingOption {
   value: string;
@@ -37,13 +38,6 @@ export const SETTING_DEFS: SettingDef[] = [
     path: 'trigger.group.requireAt',
     label: '群聊必须 @机器人才回复',
     desc: '关闭后机器人会按关键词/主动策略接话',
-    type: 'boolean',
-    group: '对话',
-  },
-  {
-    path: 'trigger.group.recordAllMessages',
-    label: '记录群内所有人的发言',
-    desc: '让机器人理解群聊上下文；记忆仍只归属发言者本人',
     type: 'boolean',
     group: '对话',
   },
@@ -188,15 +182,6 @@ export const SETTING_DEFS: SettingDef[] = [
     group: '主动发言',
   },
   {
-    path: 'proactive.imageLookback',
-    label: '主动搭话时回看几张历史图片',
-    desc: '攒够消息开口时，把最近这几张别人发的图/表情包一起理解（0=不看图，省 token）',
-    type: 'number',
-    min: 0,
-    max: 10,
-    group: '主动发言',
-  },
-  {
     path: 'proactive.quietHours',
     label: '免打扰时段',
     desc: '如 ["23:00-08:00"]，这些时段绝不主动发言',
@@ -261,15 +246,6 @@ export const SETTING_DEFS: SettingDef[] = [
     label: '给消息点表情回应',
     desc: '对方情绪不错时给那条消息贴个 👍（部分实现不支持）',
     type: 'boolean',
-    group: '回复行为',
-  },
-  {
-    path: 'reply.recentImages',
-    label: '回复时回看几张历史图片',
-    desc: '当前消息没带图时，把「机器人上次说话之后」新发的图一起理解（对方先发图再问"这啥"时很有用）。0=关闭',
-    type: 'number',
-    min: 0,
-    max: 5,
     group: '回复行为',
   },
   {
@@ -480,7 +456,7 @@ export const ACCESS_LIST_PATHS = {
 export type AccessListName = keyof typeof ACCESS_LIST_PATHS;
 
 export const ACCESS_LIST_LABELS: Record<AccessListName, { name: string; desc: string }> = {
-  allowUsers: { name: '用户白名单', desc: '非空时，只有名单内的 QQ 能被处理（私聊和群聊都算）' },
+  allowUsers: { name: '用户白名单', desc: '非空时，只有名单内的 QQ 能参与普通聊天；指令使用独立权限' },
   denyUsers: { name: '用户黑名单', desc: '这些 QQ 一律忽略，优先级高于白名单' },
   allowGroups: { name: '群白名单', desc: '非空时，只处理这些群里的消息；私聊不受影响' },
   admins: { name: '管理员 QQ', desc: '可以使用管理类命令（切换人格等）' },
@@ -494,8 +470,8 @@ export const ACCESS_FLAG_PATHS = {
 export type AccessFlagName = keyof typeof ACCESS_FLAG_PATHS;
 
 export const ACCESS_FLAG_LABELS: Record<AccessFlagName, { name: string; desc: string }> = {
-  commandAdminOnly: { name: '命令仅限管理员', desc: '关闭后所有人都能用 /help、/memory、/forget 等' },
-  personaAdminOnly: { name: '仅管理员可切换人格', desc: '关闭后群里任何人都能发 /persona 改本群人格' },
+  commandAdminOnly: { name: '命令仅限管理员', desc: '仅影响尚未单独设置权限的指令' },
+  personaAdminOnly: { name: '仅管理员可切换人格', desc: '仅影响尚未单独设置权限的 /persona' },
 };
 
 export interface AccessSnapshot {
@@ -548,6 +524,7 @@ export function normalizeQqList(input: unknown): { ok: true; value: number[] } |
 export interface AccessUpdate {
   lists?: Partial<Record<AccessListName, unknown>>;
   flags?: Partial<Record<AccessFlagName, unknown>>;
+  commands?: Partial<Record<CommandId, CommandPermission>>;
 }
 
 /**
@@ -587,8 +564,12 @@ export function validateAccess(
     nextFlags[name] = raw;
   }
 
+  const parsedCommands = CommandPermissionsSchema.safeParse(update.commands ?? {});
+  if (!parsedCommands.success) return {ok:false,error:'指令权限必须使用有效的指令名和 admin/all/whitelist'};
+  const nextTrigger = {...cfg.trigger, ...nextFlags, admins:next.admins, commandPermissions:{...cfg.trigger.commandPermissions,...parsedCommands.data}};
+
   // ---- 一致性检查：别把自己锁在外面 ----
-  if ((nextFlags.commandAdminOnly || nextFlags.personaAdminOnly) && next.admins.length === 0) {
+  if (COMMAND_IDS.some(id => commandPermission(nextTrigger,id) === 'admin') && next.admins.length === 0) {
     return {
       ok: false,
       error: '开启「仅管理员」前，请先在管理员 QQ 里至少填一个号，否则没人能用这些命令（包括你）',
@@ -599,17 +580,6 @@ export function validateAccess(
   if (conflicting.length > 0) {
     return { ok: false, error: `管理员 ${conflicting.join(', ')} 同时在黑名单里，请先移除` };
   }
-  // 白名单非空但把管理员排除在外
-  if (next.allowUsers.length > 0) {
-    const excluded = next.admins.filter((a) => !next.allowUsers.includes(a));
-    if (excluded.length > 0) {
-      return {
-        ok: false,
-        error: `管理员 ${excluded.join(', ')} 不在用户白名单里，将无法使用机器人，请一并加入白名单`,
-      };
-    }
-  }
-
   // ---- 生成条目（只记录有变化的） ----
   const currentLists: Record<AccessListName, number[]> = {
     allowUsers: cfg.trigger.allowUsers,
@@ -628,6 +598,9 @@ export function validateAccess(
     }
   }
 
+  for (const [id,value] of Object.entries(parsedCommands.data)) {
+    if (cfg.trigger.commandPermissions[id as CommandId] !== value) entries.push([['trigger','commandPermissions',id],value]);
+  }
   return { ok: true, entries };
 }
 
@@ -637,6 +610,7 @@ export function validateAccess(
     const msg = parsed.error.issues.map((i) => `${i.path.join('.') || '(根)'}: ${i.message}`).join('; ');
     return { ok: false, error: `人格内容不合法：${msg}` };
   }
+  if (!parsed.data.systemPrompt.trim() && !Object.values(parsed.data.structured).some(v=>v.trim())) return {ok:false,error:'请填写原始设定或至少一项结构化人格设定'};
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(parsed.data.id)) {
     return { ok: false, error: '人格 id 只能用小写字母、数字、下划线和短横线，且不超过 32 个字符' };
   }

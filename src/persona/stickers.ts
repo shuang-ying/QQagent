@@ -26,6 +26,16 @@ import {
 /** 支持的图片扩展名 */
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 
+export function canonicalEmotion(label: string): string {
+  const aliases: Record<string, string> = { happy: 'joy', happiness: 'joy', 开心: 'joy', sad: 'sadness', 难过: 'sadness',
+    angry: 'anger', 生气: 'anger', worried: 'anxiety', anxious: 'anxiety', calm: 'calm-happy', surprised: 'surprise' };
+  const value = label.toLowerCase().trim(); return aliases[value] ?? value;
+}
+function words(text: string): string[] {
+  const out = text.toLowerCase().match(/[a-z]{2,}|[\u4e00-\u9fff]+/g) ?? [];
+  return [...new Set(out.flatMap(word => /^[a-z]/.test(word) ? [word] : Array.from({ length: Math.max(0, word.length - 1) }, (_, i) => word.slice(i, i + 2))))];
+}
+
 /** 模型用来表达"发个表情"的标记，如 [表情:happy] */
 export const STICKER_MARKER_RE = /\[\s*表情\s*[:：]\s*([^\]\s]+)\s*\]/g;
 
@@ -120,7 +130,7 @@ export class StickerLibrary {
           tags,
           desc: meta?.desc ?? '',
           useWhen: meta?.useWhen ?? '',
-          emotions: meta?.emotions ?? [],
+          emotions: (meta?.emotions ?? []).map(canonicalEmotion),
           source: meta?.source ?? 'local',
           ...(meta?.resId ? { resId: meta.resId } : {}),
           ...(meta?.md5 ? { md5: meta.md5 } : {}),
@@ -270,17 +280,22 @@ export class StickerLibrary {
    * 但 `requireDesc` 打开时，连"被理解过"都达不到的就不发 —— 避免发出模型看不懂的怪图。
    */
   pickByEmotion(emotion: string, opts: { requireDesc?: boolean } = {}): StickerView | undefined {
-    const pool = this.understood();
-    if (pool.length === 0) {
-      return opts.requireDesc ? undefined : this.random();
-    }
+    return this.candidates('', emotion, 1, { requireDesc: opts.requireDesc })[0];
+  }
 
-    const exact = pool.filter((s) => s.emotions.some((e) => e.toLowerCase() === emotion.toLowerCase()));
-    if (exact.length) {
-      // 同一情绪里，优先还没发过的（简单轮换，减少重复）
-      return pickRandom(exact);
-    }
-    return pickRandom(pool);
+  candidates(context: string, emotion?: string, limit = 6, opts: { excludedFiles?: string[]; requireDesc?: boolean } = {}): StickerView[] {
+    const query = words(context); const label = emotion ? canonicalEmotion(emotion) : '';
+    return this.usable().filter(s => !opts.excludedFiles?.includes(s.file) && (!opts.requireDesc || !!s.desc.trim()))
+      .map(s => {
+        const text = `${s.desc} ${s.useWhen} ${s.tags.join(' ')}`.toLowerCase();
+        const score = query.filter(w => text.includes(w)).length +
+          (label && label !== 'neutral' && [...s.emotions, ...s.tags.map(canonicalEmotion)].includes(label) ? 2 : 0);
+        return { s, score };
+      }).filter(row => row.score > 0).sort((a, b) => b.score - a.score || a.s.file.localeCompare(b.s.file)).slice(0, limit).map(row => row.s);
+  }
+
+  describeCandidatesForPrompt(candidates: StickerView[], descChars = 40): string {
+    return candidates.map(s => `${s.tags.join('/')}: ${s.desc.slice(0, descChars)}；适用：${s.useWhen.slice(0, descChars)}`).join('\n');
   }
 
   /**

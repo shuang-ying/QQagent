@@ -78,7 +78,7 @@ export function setModelOverrides(map: Record<string, ModelOverride> | undefined
 }
 
 /** 取某模型命中的覆盖项（支持精确匹配与“包含”匹配） */
-function findOverride(s: string): ModelOverride | undefined {
+export function findOverride(s: string): ModelOverride | undefined {
   if (modelOverrides[s]) return modelOverrides[s];
   for (const [k, v] of Object.entries(modelOverrides)) {
     if (s.includes(k)) return v;

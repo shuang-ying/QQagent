@@ -18,3 +18,21 @@ Thumbs.db
 config/stickers/qq/
 # AI 识别结果属于生成状态，首次加载会自动重建
 config/stickers/manifest.json
+
+# Local tools, credentials and build packages
+.codex/
+.dsh-lab/
+.workbuddy/
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.db.*
+*.tgz
+scripts/archive/
+docs/online-*.json
+docs/online-*.md
+docs/*-result.json
+docs/*-test-output*.txt
+docs/*-test-first-failure.txt

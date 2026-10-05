@@ -11,6 +11,9 @@
  *  - 中间层级不存在时自动补出映射层级（如 llm.roles.embedding.provider）
  */
 import fs from 'node:fs';
+import {parse} from 'yaml';
+import {atomicWrite} from './atomic.js';
+import {AppConfigSchema} from '../core/types.js';
 
 /** 判断一行是不是「空行或纯注释」（不参与层级判断） */
 function isSkippable(line: string): boolean {
@@ -190,7 +193,10 @@ export function setConfigValues(file: string, entries: Array<[string[], unknown]
     );
   }
 
-  fs.writeFileSync(file, lines.join(eol), 'utf8');
+  const text=lines.join(eol);
+  const parsed=parse(text);
+  if (/app(?:\.local)?\.yaml$/i.test(file)) AppConfigSchema.parse(parsed);
+  atomicWrite(file,text);
 }
 
 /** 单值便捷写法 */

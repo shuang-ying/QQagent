@@ -8,7 +8,9 @@
  *  - 记录 token 用量统计
  */
 import fs from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { Logger } from '../core/logger.js';
 import type {
   AppConfig,
@@ -21,11 +23,13 @@ import type {
 } from '../core/types.js';
 import { resolveApiKey, PROJECT_ROOT } from '../config/loader.js';
 import { discoverModels, testChat } from './discover.js';
-import { inferModelMeta } from './protocol.js';
+import { inferModelMeta, findOverride } from './protocol.js';
+import { fitModelBudget } from './budget.js';
 import { LlmClient, LlmError, type ChatOptions } from './client.js';
 import { embedTexts, type EmbedResult } from './embedding.js';
 
 interface CacheEntry {
+  fingerprint?: string;
   protocol: Exclude<Protocol, 'auto'>;
   models: DiscoveredModel[];
   discoveredAt: number;
@@ -55,7 +59,32 @@ export interface UsageRecord {
   calls: number;
 }
 
+/** 限制解析/发现等待时间，取消后不继续进入模型调用。 */
+async function waitWithin<T>(promise: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new LlmError('请求总时间预算已耗尽')), Math.max(1, ms));
+      abort = () => reject(new LlmError('请求已取消', undefined, false, true));
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    })]);
+  } finally {
+    clearTimeout(timer);
+    if (abort) signal?.removeEventListener('abort', abort);
+  }
+}
+
 export class ProviderManager {
+  private usageDb?: import('node:sqlite').DatabaseSync;
+  attachUsageStore(db: import('node:sqlite').DatabaseSync): void {
+    this.usageDb=db;db.exec('CREATE TABLE IF NOT EXISTS llm_calls (id INTEGER PRIMARY KEY,purpose TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,success INTEGER NOT NULL,prompt_tokens INTEGER NOT NULL,completion_tokens INTEGER NOT NULL,latency_ms INTEGER NOT NULL,retry INTEGER NOT NULL,created_at INTEGER NOT NULL)');
+    for(const row of db.prepare('SELECT provider,model,SUM(prompt_tokens) AS promptTokens,SUM(completion_tokens) AS completionTokens,COUNT(*) AS calls FROM llm_calls WHERE success=1 GROUP BY provider,model').all() as unknown as UsageRecord[]) this.usage.set(row.provider+'/'+row.model,row);
+  }
+  private metric(provider:string,model:string,purpose:string,success:boolean,latency:number,retry=0,prompt=0,completion=0):void {
+    this.usageDb?.prepare('INSERT INTO llm_calls(purpose,provider,model,success,prompt_tokens,completion_tokens,latency_ms,retry,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(purpose,provider,model,Number(success),prompt,completion,Math.round(latency),retry,Date.now());
+  }
   private cache: CacheFile = { version: 1, entries: {} };
   private cachePath: string;
   private readonly client: LlmClient;
@@ -88,16 +117,40 @@ export class ProviderManager {
    *  - model 留空    -> 若 provider 就是默认 provider，则用 llm.defaultModel；
    *                     否则留空（由 resolveModel 取该 provider 的第一个模型）
    */
-  resolveRole(role: LlmRoleName): { provider: string; model: string } {
-    const defProvider = this.llmCfg?.defaultProvider ?? '';
-    const defModel = this.llmCfg?.defaultModel ?? '';
-    const r = this.llmCfg?.roles?.[role];
+  resolveRole(role: LlmRoleName, config = this.llmCfg): { provider: string; model: string } {
+    const defProvider = config?.defaultProvider ?? '';
+    const defModel = config?.defaultModel ?? '';
+    const r = config?.roles?.[role];
 
     const provider = (r?.provider ?? '').trim() || defProvider;
     const explicitModel = (r?.model ?? '').trim();
     const model = explicitModel || (provider === defProvider ? defModel : '');
 
     return { provider, model };
+  }
+
+  /**
+   * 向量化是否**真的**可用。
+   *
+   * 不能只看 `resolveRole('embedding')` 有没有值：那个会继承 llm.defaultModel，
+   * 而默认模型通常是主对话模型（纯文本），拿它去调 /embeddings 必然失败。
+   * 所以必须要求**显式指定**过 embedding 模型。
+   */
+  embeddingReady(): { ok: boolean; provider: string; model: string; reason?: string } {
+    const r = this.resolveRole('embedding');
+    const explicitModel = (this.llmCfg?.roles?.['embedding']?.model ?? '').trim();
+    if (!r.provider) {
+      return { ok: false, provider: '', model: '', reason: '还没选择供应商' };
+    }
+    if (!explicitModel) {
+      return {
+        ok: false,
+        provider: r.provider,
+        model: r.model,
+        reason: '还没为「向量化」选择具体的 embedding 模型（主对话模型是做不了向量化的）',
+      };
+    }
+    return { ok: true, provider: r.provider, model: r.model };
   }
 
   /** 列出所有用途的解析结果（面板用） */
@@ -121,31 +174,21 @@ export class ProviderManager {
    * 很难自查（这正是实际踩到的坑）。
    */
   visionHealth(): { ok: boolean; provider: string; model: string; warning?: string } {
-    const r = this.resolveRole('vision');
-
-    if (!r.provider || !r.model) {
-      // 没单独配不算错：主对话模型支持视觉时也能用
-      const main = this.resolveRole('chat');
-      const mainVision = main.model ? inferModelMeta(main.model).supportsVision : false;
-      if (mainVision) return { ok: true, provider: main.provider, model: main.model };
-      return {
-        ok: false,
-        provider: main.provider,
-        model: main.model,
-        warning: '未配置「图片理解」用途，且主对话模型不支持图片 —— 机器人读不到图片内容',
-      };
+    const candidates = [this.resolveRole('vision'), this.resolveRole('chat')];
+    for (const role of candidates) {
+      const p = this.providers[role.provider];
+      if (!p?.enabled) continue;
+      const cached = this.cache.entries[role.provider];
+      const models = p.models.length ? p.models : cached?.fingerprint === this.fingerprint(p) ? cached.models : [];
+      const id = role.model || models[0]?.id || '';
+      if (!id) continue;
+      const meta = models.find(m => m.id === id);
+      const visual = findOverride(id.toLowerCase())?.vision ?? meta?.supportsVision ?? inferModelMeta(id).supportsVision;
+      if (visual) return { ok: true, provider: role.provider, model: id };
     }
-
-    const meta = inferModelMeta(r.model);
-    if (meta.supportsVision) return { ok: true, provider: r.provider, model: r.model };
-    return {
-      ok: false,
-      provider: r.provider,
-      model: r.model,
-      warning:
-        `${r.model} 不是多模态模型，无法读图。` +
-        '请在下方改选一个支持视觉的模型（如 qwen-vl-max、gpt-4o、gemini、claude）',
-    };
+    const main = candidates[1]!;
+    return { ok: false, provider: main.provider, model: main.model,
+      warning: '图片理解和主聊天模型均未配置可用的视觉能力，请检查人工能力设置或模型元数据' };
   }
 
   /**
@@ -154,7 +197,7 @@ export class ProviderManager {
    */
   async embed(
     texts: string[],
-    opts?: { providerKey?: string; modelId?: string },
+    opts?: { providerKey?: string; modelId?: string; signal?: AbortSignal; timeoutMs?: number },
   ): Promise<EmbedResult> {
     const role = this.resolveRole('embedding');
     const providerKey = opts?.providerKey || role.provider;
@@ -179,14 +222,18 @@ export class ProviderManager {
     // protocol 为 auto 时，embedding 一律按 OpenAI 兼容处理（覆盖 99% 情况）
     const protocol: Exclude<Protocol, 'auto'> = prov.protocol === 'auto' ? 'openai' : prov.protocol;
 
-    return embedTexts({
+    const result = await embedTexts({
       baseURL: prov.baseURL,
       apiKey: resolveApiKey(prov),
       protocol,
       model: modelId,
       texts,
       headers: prov.headers,
+      signal: opts?.signal,
+      timeoutMs: opts?.timeoutMs,
     });
+    this.metric(providerKey,modelId,'embedding',result.ok,result.latencyMs);
+    return result;
   }
 
   // ==================== Provider 动态管理 ====================
@@ -194,6 +241,8 @@ export class ProviderManager {
   /** 运行时添加/更新一个 provider（不写文件，仅更新内存） */
   addProvider(key: string, config: ProviderConfig): void {
     this.providers[key] = config;
+    delete this.cache.entries[key];
+    this.saveCache();
     this.log.info({ provider: key, baseURL: config.baseURL }, '已添加/更新 provider');
   }
 
@@ -220,45 +269,16 @@ export class ProviderManager {
         const parsed = JSON.parse(fs.readFileSync(this.cachePath, 'utf8')) as CacheFile;
         if (parsed?.version === 1 && parsed.entries) {
           this.cache = parsed;
-          // 缓存里存的是**发现当时**推断出的能力标签。
-          // 推断规则升级或用户改了 modelOverrides 之后，这些标签就是过期的
-          // （典型症状：模型明明支持读图，却因为缓存写着 supportsVision=false 而被拒发图片）。
-          // 所以每次加载都用当前规则重算一遍能力，只复用 id 列表。
-          this.rehydrateCapabilities();
+          // 服务元数据保留；人工覆盖在 resolveModel 时应用，配置指纹不符则丢弃。
+          for (const [key, entry] of Object.entries(this.cache.entries)) {
+            if (!this.providers[key] || entry.fingerprint !== this.fingerprint(this.providers[key]!)) delete this.cache.entries[key];
+          }
           this.log.debug({ providers: Object.keys(parsed.entries).length }, '已加载模型缓存');
         }
       }
     } catch (e) {
       this.log.warn({ err: (e as Error).message }, '模型缓存损坏，将重新发现');
       this.cache = { version: 1, entries: {} };
-    }
-  }
-
-  /**
-   * 用当前的能力推断规则重算缓存里的模型能力。
-   * 只保留 id，其余（vision / contextWindow / tags）全部重新推导，
-   * 这样升级推断规则或改 modelOverrides 后无需清缓存即可生效。
-   */
-  private rehydrateCapabilities(): void {
-    let changed = 0;
-    for (const entry of Object.values(this.cache.entries)) {
-      entry.models = entry.models.map((m) => {
-        const meta = inferModelMeta(m.id);
-        if (m.supportsVision !== meta.supportsVision) changed++;
-        return {
-          id: m.id,
-          name: m.name || m.id,
-          ...(meta.contextWindow !== undefined ? { contextWindow: meta.contextWindow } : {}),
-          supportsVision: meta.supportsVision,
-          supportsTools: meta.supportsTools,
-          supportsStream: meta.supportsStream,
-          tags: meta.tags,
-        };
-      });
-    }
-    if (changed > 0) {
-      this.log.info({ changed }, '模型能力缓存已按最新规则刷新');
-      this.saveCache();
     }
   }
 
@@ -269,6 +289,10 @@ export class ProviderManager {
     } catch (e) {
       this.log.warn({ err: (e as Error).message }, '保存模型缓存失败');
     }
+  }
+
+  private fingerprint(p: ProviderConfig): string {
+    return createHash('sha256').update(JSON.stringify([p.baseURL, p.protocol, p.headers, p.apiKey, p.apiKeyEnv, p.models])).digest('hex');
   }
 
   /** 清空某 provider 的缓存，强制重新发现 */
@@ -300,6 +324,7 @@ export class ProviderManager {
   async ensureModels(providerKey: string, force = false): Promise<{ protocol: Exclude<Protocol, 'auto'>; models: DiscoveredModel[] }> {
     const p = this.providers[providerKey];
     if (!p) throw new Error(`Provider 不存在: ${providerKey}`);
+    if (!p.enabled) throw new LlmError(`Provider 已禁用: ${providerKey}`);
 
     // 手动配置的模型优先（用户显式指定，不做网络探测）
     if (!force && p.models.length > 0) {
@@ -308,10 +333,10 @@ export class ProviderManager {
         models: p.models.map((m) => ({
           id: m.id,
           name: m.name || m.id,
-          contextWindow: m.contextWindow,
-          supportsVision: m.supportsVision,
-          supportsTools: m.supportsTools,
-          supportsStream: m.supportsStream ?? true,
+          contextWindow: m.contextWindow ?? inferModelMeta(m.id).contextWindow,
+          supportsVision: m.supportsVision ?? inferModelMeta(m.id).supportsVision,
+          supportsTools: m.supportsTools ?? inferModelMeta(m.id).supportsTools,
+          supportsStream: m.supportsStream ?? inferModelMeta(m.id).supportsStream,
           tags: m.tags,
         })),
       };
@@ -319,7 +344,7 @@ export class ProviderManager {
 
     // 缓存
     const cached = this.cache.entries[providerKey];
-    if (!force && cached && cached.models.length > 0) {
+    if (!force && cached && cached.fingerprint === this.fingerprint(p) && cached.models.length > 0) {
       return { protocol: cached.protocol, models: cached.models };
     }
 
@@ -343,7 +368,8 @@ export class ProviderManager {
     }
 
     this.log.info({ provider: providerKey, protocol: result.protocol, count: result.models.length }, '✅ 模型发现成功');
-    this.cache.entries[providerKey] = { protocol: result.protocol, models: result.models, discoveredAt: Date.now() };
+    if (this.providers[providerKey] !== p) throw new LlmError('供应商已更新，丢弃过时发现结果');
+    this.cache.entries[providerKey] = { protocol: result.protocol, models: result.models, discoveredAt: Date.now(), fingerprint: this.fingerprint(p) };
     this.saveCache();
     return { protocol: result.protocol, models: result.models };
   }
@@ -358,15 +384,17 @@ export class ProviderManager {
     if (!target) throw new Error(`Provider [${providerKey}] 没有任何可用模型`);
 
     const meta = models.find((m) => m.id === target);
+    const override = findOverride(target.toLowerCase());
+    const inferred = inferModelMeta(target);
     return {
       providerKey,
       providerName: p.displayName || providerKey,
       modelId: target,
       modelName: meta?.name ?? target,
       protocol,
-      contextWindow: meta?.contextWindow ?? this.defaultContextWindow,
-      supportsStream: meta?.supportsStream ?? true,
-      supportsVision: meta?.supportsVision ?? false,
+      contextWindow: override?.contextWindow ?? meta?.contextWindow ?? inferred.contextWindow ?? this.defaultContextWindow,
+      supportsStream: meta?.supportsStream ?? inferred.supportsStream,
+      supportsVision: override?.vision ?? meta?.supportsVision ?? inferred.supportsVision ?? false,
     };
   }
 
@@ -411,11 +439,17 @@ export class ProviderManager {
       model: resolved.modelId,
       protocol: resolved.protocol,
       headers: p.headers,
+      timeoutMs: this.llmCfg?.request.timeoutMs,
+      maxRetries: this.llmCfg?.request.maxRetries,
+      retryDelayMs: this.llmCfg?.request.retryDelayMs,
+      temperature: this.llmCfg?.generation.temperature,
+      maxTokens: this.llmCfg?.generation.maxTokens,
       ...overrides,
     };
   }
 
-  private recordUsage(provider: string, model: string, result: LlmResult): void {
+  private recordUsage(provider: string, model: string, result: LlmResult, purpose = 'chat', retry = 0): void {
+    this.metric(provider,model,purpose,true,result.latencyMs,retry,result.usage.promptTokens,result.usage.completionTokens);
     const key = `${provider}/${model}`;
     const cur = this.usage.get(key) ?? { provider, model, promptTokens: 0, completionTokens: 0, calls: 0 };
     cur.promptTokens += result.usage.promptTokens;
@@ -434,79 +468,86 @@ export class ProviderManager {
    * onDelta 每收到一段增量文本即回调；返回最终结果。
    */
   async streamChat(
-    messages: ChatMessage[],
-    providerKey: string,
-    modelId: string | undefined,
-    onDelta: (text: string) => void,
-    overrides: Partial<ChatOptions> = {},
-    fallbackKeys: string[] = [],
+    messages: ChatMessage[], providerKey: string, modelId: string | undefined,
+    onDelta: (text: string) => void, overrides: Partial<ChatOptions> = {}, fallbackKeys: AppConfig['llm']['fallback'] = [],
   ): Promise<LlmResult> {
-    const chain = [providerKey, ...fallbackKeys.filter((k) => k !== providerKey)];
-    let lastErr: Error | null = null;
-
-    for (const key of chain) {
-      try {
-        const resolved = await this.resolveModel(key, modelId);
-        const opts = this.buildChatOptions(key, resolved, { stream: true, ...overrides });
-
-        let result: LlmResult | null = null;
-        const gen = this.client.streamChat(messages, opts);
-        // 只有第一个 provider 才允许把增量推给用户，避免回退时重复输出
-        const isPrimary = key === chain[0];
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          const step = await gen.next();
-          if (step.done) {
-            result = step.value;
-            break;
-          }
-          if (isPrimary && step.value) onDelta(step.value);
-        }
-        if (!result) throw new LlmError('未获得结果');
-
-        result.provider = resolved.providerName;
-        result.model = resolved.modelId;
-        this.recordUsage(key, resolved.modelId, result);
-        return result;
-      } catch (e) {
-        lastErr = e as Error;
-        const isLast = key === chain[chain.length - 1];
-        this.log.warn(
-          { provider: key, model: modelId, err: (e as Error).message, willFallback: !isLast },
-          `Provider [${key}] 调用失败`,
-        );
-        if (isLast) break;
-      }
-    }
-    throw lastErr ?? new LlmError('所有 provider 均调用失败');
+    return this.invoke(messages, providerKey, modelId, overrides, fallbackKeys, onDelta);
   }
 
-  /** 非流式对话（内部任务用），同样带 fallback */
   async chat(
-    messages: ChatMessage[],
-    providerKey: string,
-    modelId: string | undefined,
-    overrides: Partial<ChatOptions> = {},
-    fallbackKeys: string[] = [],
+    messages: ChatMessage[], providerKey: string, modelId: string | undefined,
+    overrides: Partial<ChatOptions> = {}, fallbackKeys: AppConfig['llm']['fallback'] = [],
   ): Promise<LlmResult> {
-    const chain = [providerKey, ...fallbackKeys.filter((k) => k !== providerKey)];
-    let lastErr: Error | null = null;
+    return this.invoke(messages, providerKey, modelId, overrides, fallbackKeys);
+  }
 
-    for (const key of chain) {
-      try {
-        const resolved = await this.resolveModel(key, modelId);
-        const opts = this.buildChatOptions(key, resolved, { stream: false, ...overrides });
-        const result = await this.client.chat(messages, opts);
-        result.provider = resolved.providerName;
-        result.model = resolved.modelId;
-        this.recordUsage(key, resolved.modelId, result);
-        return result;
-      } catch (e) {
-        lastErr = e as Error;
-        this.log.warn({ provider: key, err: (e as Error).message }, `Provider [${key}] 非流式调用失败`);
+  private async invoke(
+    messages: ChatMessage[], providerKey: string, modelId: string | undefined,
+    overrides: Partial<ChatOptions>, fallbackKeys: AppConfig['llm']['fallback'], onDelta?: (text: string) => void,
+  ): Promise<LlmResult> {
+    const timeoutMs = overrides.timeoutMs ?? this.llmCfg?.request.timeoutMs ?? 120000;
+    const deadline = Date.now() + timeoutMs;
+    const signal = overrides.signal;
+    let lastErr: Error = new LlmError('所有 provider 均调用失败');
+    const chain = [{ provider: providerKey, model: modelId }, ...fallbackKeys.map(k =>
+      typeof k === 'string' ? { provider: k, model: undefined } : { provider: k.provider, model: k.model || undefined })];
+    const visited = new Set<string>();
+    for (const candidate of chain) {
+      const key = candidate.provider;
+      const identity = `${key}/${candidate.model ?? ''}`;
+      if (visited.has(identity)) continue;
+      visited.add(identity);
+      for (let attempt = 0; ; attempt++) {
+        if (signal?.aborted) throw new LlmError('请求已取消', undefined, false, true);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new LlmError('请求总时间预算已耗尽');
+        const attemptStarted = Date.now();
+        try {
+          const resolved = await waitWithin(this.resolveModel(key, candidate.model), remaining, signal);
+          if (Date.now() >= deadline) throw new LlmError('请求总时间预算已耗尽');
+          const opts = this.buildChatOptions(key, resolved, { ...overrides, timeoutMs: Math.max(1, deadline - Date.now()) });
+          if (messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image')) && !resolved.supportsVision) {
+            throw new LlmError('该候选模型不支持图片');
+          }
+          const fitted = fitModelBudget(messages, resolved.contextWindow, opts.maxTokens ?? 1024);
+          opts.maxTokens = fitted.maxTokens;
+          let result: LlmResult;
+          const chunks: string[] = [];
+          const useStream = !!onDelta && (overrides.stream ?? this.llmCfg?.generation.stream ?? true) && resolved.supportsStream;
+          if (useStream) {
+            const gen = this.client.streamChat(fitted.messages, opts);
+            while (true) {
+              const step = await gen.next();
+              if (step.done) { result = step.value; break; }
+              chunks.push(step.value);
+            }
+          } else {
+            result = await this.client.chat(fitted.messages, opts);
+            chunks.push(result.content);
+          }
+          if (signal?.aborted) throw new LlmError('请求已取消', undefined, false, true);
+          result.provider = resolved.providerName;
+          result.model = resolved.modelId;
+          this.recordUsage(key, resolved.modelId, result, overrides.purpose ?? 'chat', attempt);
+          // 只有完整成功的一次尝试发布正文，重试/回退不泄露残片。
+          if (onDelta) for (const chunk of chunks) onDelta(chunk);
+          return result;
+        } catch (e) {
+          this.metric(key,candidate.model??'',overrides.purpose??'chat',false,Date.now()-attemptStarted,attempt);
+          lastErr = e as Error;
+          if (signal?.aborted || (e instanceof LlmError && e.cancelled)) throw e;
+          const retries = overrides.maxRetries ?? this.llmCfg?.request.maxRetries ?? 2;
+          const transient = e instanceof LlmError ? e.retriable : e instanceof TypeError;
+          if (!transient || attempt >= retries) break;
+          const waitMs = (overrides.retryDelayMs ?? this.llmCfg?.request.retryDelayMs ?? 800) * 2 ** attempt;
+          if (Date.now() + waitMs >= deadline) throw new LlmError('请求总时间预算已耗尽');
+          this.log.warn({ provider: key, attempt: attempt + 1, waitMs }, '临时错误，重试模型调用');
+          try { await delay(waitMs, undefined, { signal }); }
+          catch { throw new LlmError('请求已取消', undefined, false, true); }
+        }
       }
     }
-    throw lastErr ?? new LlmError('所有 provider 均调用失败');
+    throw lastErr;
   }
 
   /** 连通性自检（面板「测试连接」按钮） */
@@ -548,7 +589,9 @@ export class ProviderManager {
       };
     }
 
+    if (this.providers[providerKey] !== p) throw new LlmError('供应商已更新，丢弃过时连接测试结果');
     this.cache.entries[providerKey] = {
+      fingerprint: this.fingerprint(p),
       protocol: disc.protocol,
       models: disc.models,
       discoveredAt: Date.now(),

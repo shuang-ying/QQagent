@@ -2,12 +2,13 @@
  * QQ Agent 启动入口
  *
  * 组装全部模块：
- *   配置 -> 日志 -> 存储 -> LLM -> 人格 -> 情绪 -> 上下文 -> 管线 -> NapCat
+ *   配置 -> 日志 -> 存储 -> LLM -> 人格 -> 情绪 -> 上下文 -> 管线 -> OneBot
  */
 import path from 'node:path';
 import { loadConfig, PROJECT_ROOT } from './config/loader.js';
-import { initLogger, getLogger } from './core/logger.js';
-import { NapCatClient } from './napcat/client.js';
+import { initLogger, getLogger, flushLogger } from './core/logger.js';
+import { OneBotClient } from './onebot/client.js';
+import { InboundAdmission, EventDeduper } from './pipeline/admission.js';
 import { MemoryStore } from './memory/store.js';
 import { ProviderManager } from './llm/manager.js';
 import { PersonaManager } from './persona/manager.js';
@@ -24,15 +25,18 @@ import { StickerLibrary } from './persona/stickers.js';
 import { importQqFavorites, pushDescToQq } from './persona/stickerImport.js';
 import { analyzeStickers } from './persona/stickerAnalyze.js';
 import { CommandHandler } from './pipeline/commands.js';
-import { stripMention, isQuietHour } from './persona/trigger.js';
+import { stripMention } from './persona/trigger.js';
+import { parseCommand } from './pipeline/command-permissions.js';
 import { createServer } from './server/api.js';
 import { SemanticIndex } from './memory/semantic.js';
+import {atomicWrite,atomicWriteMany} from './config/atomic.js';
+import {AppConfigSchema,ProvidersFileSchema} from './core/types.js';
 import { setConfigValues } from './config/writer.js';
 import { validateSettings } from './config/settings.js';
 import { loadPersonasFromDir, writePersona, deletePersonaFile } from './persona/files.js';
 import fs from 'node:fs';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import type { LlmRoleName, Persona } from './core/types.js';
+import { parse as parseYaml, parseDocument, stringify as stringifyYaml } from 'yaml';
+import type { Persona } from './core/types.js';
 
 async function main(): Promise<void> {
   // ==================== 1. 配置 ====================
@@ -93,7 +97,10 @@ async function main(): Promise<void> {
   // ==================== 5. 人格 / 触发 ====================
   const personaMgr = new PersonaManager(personas, app, store, getLogger('persona'));
   const trigger = new TriggerPolicy(app.trigger, getLogger('trigger'));
-  const proactive = new ProactiveSpeaker(app.proactive, store, getLogger('proactive'));
+  const proactive = new ProactiveSpeaker(app.proactive, store, getLogger('proactive'), {
+    resolvePersona: (scope, userId) => personaMgr.resolve(scope, userId).persona,
+    sharing: () => app.memory.retrieval.crossScopeSharing,
+  });
 
   log.info(
     { 人格: personas.map((p) => `${p.emoji}${p.name}`).join(' '), 默认: app.persona.default },
@@ -115,6 +122,7 @@ async function main(): Promise<void> {
   const contextBuilder = new ContextBuilder(app.context, app.memory, store, getLogger('context'));
 
   // 语义索引：只在配置了 embedding 模型后才真正工作
+  providersMgr.attachUsageStore(store.db);
   const semantic = new SemanticIndex(store, providersMgr, getLogger('semantic'));
 
   const retriever = new MemoryRetriever(store, app.memory, getLogger('memory'), semantic);
@@ -135,7 +143,9 @@ async function main(): Promise<void> {
    * 把当前 cfg 同步到那些需要显式刷新配置的模块。
    * 面板修改「模型用途」或开关后调用。
    */
+  let runtimeConfigVersion = 1;
   function syncRuntime(): void {
+    runtimeConfigVersion++;
     const emo = providersMgr.resolveRole('emotion');
     emotionAnalyzer.configure({
       mode: app.emotion.mode,
@@ -193,19 +203,22 @@ async function main(): Promise<void> {
     stickers,
     getLogger('pipeline'),
   );
+  semantic.attachQueue(pipeline.background);
   const commands = new CommandHandler(app, store, personaMgr, getLogger('cmd'));
 
-  // ==================== 9. NapCat ====================
-  const napcat = new NapCatClient(app.napcat, getLogger('napcat'));
+  // ==================== 9. OneBot ====================
+  const napcat = new OneBotClient(app.napcat, getLogger('napcat'));
+  const admission = new InboundAdmission(trigger);
+  const pokeEvents = new EventDeduper(1024, 2000);
 
   napcat.on('ready', ({ selfId, nickname }) => {
     log.info({ selfId, nickname }, '🤖 机器人已上线');
   });
   napcat.on('reconnecting', ({ attempt, delayMs }) => {
-    log.warn({ attempt, delayMs }, '等待重连 NapCat');
+    log.warn({ attempt, delayMs }, '等待重连 OneBot');
   });
   napcat.on('disconnected', ({ code, reason }) => {
-    log.warn({ code, reason }, '与 NapCat 断开');
+    log.warn({ code, reason }, '与 OneBot 断开');
   });
 
   // ---- 戳一戳：戳回去，也可以说一句 ----
@@ -228,6 +241,7 @@ async function main(): Promise<void> {
           if (!g.allowed) return;
         }
         if (!app.reply.pokeBack && !app.reply.pokeReply) return;
+        if (!pokeEvents.accept(`${ev.selfId}/${ev.scope}/${ev.userId}/${ev.targetId}/${ev.timestamp}`)) return;
 
         // 说一句人格口吻的话（不调 LLM，避免被刷爆；人格可自定义）
         const { persona } = personaMgr.resolve(ev.scope, ev.userId);
@@ -251,7 +265,7 @@ async function main(): Promise<void> {
         // ---- 准入检查（黑白名单）----
         // 命令是在管线之前处理的，所以必须在这里也拦一次，
         // 否则被拉黑/不在白名单的人仍能用 /forget、/persona 等命令。
-        const gate = trigger.checkUser(msg.userId);
+        const gate = admission.admit(msg, parseCommand(msg.text) !== null);
         if (!gate.allowed) {
           log.debug({ userId: msg.userId, scope: msg.scope, reason: gate.reason }, '忽略该用户的消息');
           return;
@@ -261,6 +275,7 @@ async function main(): Promise<void> {
         if (msg.text.trim().startsWith('/')) {
           const cmdGate = trigger.canUseCommands(msg.userId);
           const personaGate = trigger.canSwitchPersona(msg.userId);
+          pipeline.flushPending(msg.scope);
           const cmdResult = await commands.tryHandle(msg.text, {
             scope: msg.scope,
             scopeType: msg.scopeType,
@@ -340,11 +355,13 @@ async function main(): Promise<void> {
     log: getLogger('server'),
     runtime: () => ({
       napcatConnected: napcat.connected,
+      onebot: { ...napcat.health, implementation: napcat.implementation, extensions: napcat.api.extensionCapabilities },
       selfId: napcat.selfId,
       nickname: napcat.nickname,
       uptimeMs: Date.now() - startedAt,
       startedAt,
     }),
+    diagnostics: () => ({configVersion:runtimeConfigVersion,background:pipeline.background.list().slice(-100),scheduler:(pipeline as any).scheduler.stats}),
     updateDefaultModel: (providerKey, modelId) => {
       // 手术式写回，保留 app.yaml 里的注释
       setConfigValues(path.resolve(root, 'config', 'app.yaml'), [
@@ -373,48 +390,24 @@ async function main(): Promise<void> {
       }
       doc.providers[key] = config;
       const yamlText = stringifyYaml(doc);
-      fs.writeFileSync(localPath, yamlText, 'utf8');
+      ProvidersFileSchema.parse(doc);
+      atomicWrite(localPath, yamlText);
 
       // 同时更新运行时
       providersMgr.addProvider(key, config);
       log.info({ key, baseURL: config.baseURL }, '供应商已保存');
     },
     deleteProvider: (key) => {
-      // 从 providers.local.yaml 删除
-      const localPath = path.resolve(root, 'config', 'providers.local.yaml');
-      if (fs.existsSync(localPath)) {
-        try {
-          const doc = parseYaml(fs.readFileSync(localPath, 'utf8')) as { providers: Record<string, unknown> };
-          if (doc?.providers && key in doc.providers) {
-            delete doc.providers[key];
-            const yamlText = stringifyYaml(doc);
-            fs.writeFileSync(localPath, yamlText, 'utf8');
-          }
-        } catch {
-          /* 文件损坏，忽略 */
-        }
+      const referenced = app.llm.defaultProvider === key || Object.values(app.llm.roles).some(role => role.provider === key) || app.llm.fallback.some(item => typeof item === 'string' ? item === key : item.provider === key);
+      if (referenced) throw new Error('供应商仍被默认模型、用途或 fallback 引用，请先修改引用');
+      const edits: Array<[string,string]> = [];
+      for (const name of ['providers.yaml','providers.local.yaml']) {
+        const file=path.resolve(root,'config',name);if(!fs.existsSync(file))continue;
+        const doc=parseDocument(fs.readFileSync(file,'utf8')); if(doc.errors.length)throw new Error('供应商文件损坏，取消删除');
+        doc.deleteIn(['providers',key]);ProvidersFileSchema.parse(doc.toJSON());edits.push([file,String(doc)]);
       }
-      // 同时从 providers.yaml 删除（如果存在）
-      const basePath = path.resolve(root, 'config', 'providers.yaml');
-      if (fs.existsSync(basePath)) {
-        try {
-          const doc = parseYaml(fs.readFileSync(basePath, 'utf8')) as { providers: Record<string, unknown> };
-          if (doc?.providers && key in doc.providers) {
-            delete doc.providers[key];
-            const yamlText = stringifyYaml(doc);
-            // 保留头部注释：如果原文件有注释，用 Document 解析会丢失，所以只在没有注释时才覆盖
-            // 安全做法：只在 local 文件不存在于 base 时才从 base 删除
-            const rawBase = fs.readFileSync(basePath, 'utf8');
-            if (!rawBase.trimStart().startsWith('#')) {
-              fs.writeFileSync(basePath, yamlText, 'utf8');
-            }
-          }
-        } catch {
-          /* 忽略 */
-        }
-      }
-      // 运行时删除
-      providersMgr.removeProvider(key);
+      atomicWriteMany(edits);
+      providersMgr.removeProvider(key); runtimeConfigVersion++;
       log.info({ key }, '供应商已删除');
     },
     reloadPersonas: () => {
@@ -472,6 +465,9 @@ async function main(): Promise<void> {
       if (!result.ok) throw new Error(result.error ?? '配置校验失败');
       if (result.entries.length === 0) return 0;
 
+      const prospective=structuredClone(app) as unknown as Record<string,any>;
+      for(const [keys,value] of result.entries){let target=prospective;for(const key of keys.slice(0,-1))target=target[key];target[keys.at(-1)!]=value;}
+      AppConfigSchema.parse(prospective);
       setConfigValues(path.resolve(root, 'config', 'app.yaml'), result.entries);
 
       // 原地赋值，保证持有子对象引用的模块能立即看到变化
@@ -598,7 +594,7 @@ async function main(): Promise<void> {
   log.info('========================================');
   log.info('  ✅ QQ Agent 已就绪');
   log.info('========================================');
-  log.info(`   NapCat      : ${app.napcat.url}`);
+  log.info(`   OneBot      : ${app.napcat.url}`);
   log.info(`   默认模型    : ${app.llm.defaultProvider || '(未配置)'}${app.llm.defaultModel ? '/' + app.llm.defaultModel : ''}`);
   log.info(`   默认人格    : ${app.persona.default}`);
   log.info(`   情绪提取    : ${app.emotion.enabled ? app.emotion.mode : '关闭'}`);
@@ -614,21 +610,19 @@ async function main(): Promise<void> {
 
   // ==================== 12. 优雅退出 ====================
   let shuttingDown = false;
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info({ signal }, '正在关闭 ...');
-    server.stop();
-    napcat.stop();
-    setTimeout(() => {
-      try {
-        store.close();
-      } catch {
-        /* ignore */
-      }
-      process.exit(0);
-    }, 400);
+    const panelClosed=server.stop();
+    const panelReady=new Promise<boolean>(resolve=>{const timer=setTimeout(()=>resolve(false),15000);panelClosed.then(()=>{clearTimeout(timer);resolve(true);},()=>{clearTimeout(timer);resolve(false);});});
+    napcat.removeAllListeners('message');napcat.removeAllListeners('notice');napcat.stop();
+    const [pipelineDrained,panelDrained]=await Promise.all([pipeline.shutdown(),panelReady]);
+    const drained=pipelineDrained && panelDrained;
+    if(drained)store.close();else log.error('退出超时：任务尚未结束，保留后台恢复状态，不关闭仍可能被访问的数据库');
+    await flushLogger();process.exit(drained?0:1);
   };
+  if(process.env.QQ_QA_CONTROL==='1')process.on('message',message=>{if(message && typeof message==='object' && 'type' in message && message.type==='shutdown')void shutdown('QA controller');});
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 

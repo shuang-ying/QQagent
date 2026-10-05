@@ -196,7 +196,13 @@
       </div>
 
       <div class="card">
-        <h3>管理员开关</h3>
+        <h3>指令权限</h3>
+        <div class="muted" style="margin-bottom:12px">每条指令及其中英文别名共用权限。“白名单和管理员”使用上方用户白名单；名单为空时仅管理员可用。黑名单及群白名单始终生效。</div>
+        <div id="commandPermissions"></div>
+        <button id="commandPermissionsSave" onclick="saveCommandPermissions()">保存指令权限</button>
+      </div>
+      <div class="card">
+        <h3>默认权限（未单独设置的指令）</h3>
         <div id="accessFlags"></div>
       </div>
 
@@ -204,7 +210,7 @@
         <h3>提示</h3>
         <div class="muted" style="line-height:1.9">
           · <b>黑名单优先级最高</b>：在黑名单里的 QQ 一律不处理（连命令也不响应）。<br>
-          · <b>白名单非空即启用</b>：用户白名单只填一个人，就只有那个人能用（私聊和群聊都算）。<br>
+          · <b>白名单非空即启用</b>：用户白名单限制普通聊天，指令按各自权限判定；管理员可使用授权指令。<br>
           · <b>群白名单</b>只影响群聊，私聊不受影响。<br>
           · 开启「仅管理员」前请先填管理员 QQ，否则没人能用这些命令 —— 面板会拦下这种配置。<br>
           · 提示词注入无法 100% 杜绝，最有效的还是<b>控制机器人进哪些群</b>。
@@ -368,7 +374,18 @@
       </div>
     </div>
     <div class="field">
-      <label>System Prompt（人格设定，越具体越稳定）</label>
+      <label>身份</label><textarea id="pf_identity" placeholder="名字、身份和稳定背景"></textarea>
+    </div><div class="field"><label>语言风格</label><textarea id="pf_speakingStyle" placeholder="句子长度、口吻和表达习惯"></textarea>
+    </div><div class="field"><label>互动习惯</label><textarea id="pf_interactionStyle" placeholder="如何称呼对方、如何回应玩笑"></textarea>
+    </div><div class="field"><label>回答原则</label><textarea id="pf_answerPrinciples" placeholder="认真问题如何回答、不知道时怎么办"></textarea>
+    </div><div class="field"><label>情绪回应原则</label><textarea id="pf_emotionalStyle" placeholder="安慰、庆祝、冲突时的一般原则"></textarea>
+    </div><div class="field">
+      <label>感兴趣的话题（可选，每行一个）</label>
+      <textarea id="pf_proactiveTopics" placeholder="编程|写代码|coding&#10;摄影|拍照"></textarea>
+      <div class="muted">用于主动插话的相关性判断；用 | 分隔同一话题的同义表达。不会强制回复，留空仍可使用记忆判断。</div>
+    </div><div class="field">
+      <label>原始设定（兼容现有人格，可留空）</label>
+      <div class="muted">原始设定与结构化字段会一起生效。迁移时请移除重复或矛盾的内容；不会自动改写原设定。</div>
       <textarea id="pf_prompt" style="min-height:160px" placeholder="你是一个……&#10;&#10;说话风格：……"></textarea>
     </div>
     <div class="field">
@@ -402,8 +419,18 @@
 <script>
 const $ = (id) => document.getElementById(id);
 
+async function panelFetch(p, opt = {}, retry = true) {
+  const headers=new Headers(opt.headers || {}); const token=sessionStorage.getItem('panelToken');
+  if(token) headers.set('Authorization','Bearer '+token);
+  const response=await fetch(p,{...opt,headers});
+  if(response.status===401 && retry) {
+    const value=prompt('请输入管理面板 token（仅保存在本窗口会话）');
+    if(value) {sessionStorage.setItem('panelToken',value);return panelFetch(p,opt,false);}
+  }
+  return response;
+}
 async function api(p, opt) {
-  const r = await fetch(p, opt);
+  const r = await panelFetch(p, opt);
   if (!r.ok) {
     let msg = 'HTTP ' + r.status;
     try { const j = await r.json(); msg = j.error || msg; } catch (e) {}
@@ -460,7 +487,7 @@ async function loadOverview() {
     const d = await api('/api/overview');
     const rt = d.runtime;
     $('statusGrid').innerHTML = [
-      '<div class="stat"><div class="k">NapCat 连接</div><div class="v" style="color:' + (rt.napcatConnected ? 'var(--ok)' : 'var(--err)') + ';font-size:16px">' + (rt.napcatConnected ? '● 已连接' : '● 未连接') + '</div></div>',
+      '<div class="stat"><div class="k">' + esc((rt.onebot && rt.onebot.implementation.name) || 'OneBot') + ' ' + esc((rt.onebot && rt.onebot.implementation.version) || '') + ' 连接</div><div class="v" style="color:' + (rt.napcatConnected ? 'var(--ok)' : 'var(--err)') + ';font-size:16px">' + (rt.napcatConnected ? '● 已连接' : '● 未连接') + '</div></div>',
       '<div class="stat"><div class="k">机器人账号</div><div class="v" style="font-size:15px">' + esc(rt.nickname || '-') + '<div class="muted mono">' + (rt.selfId || '-') + '</div></div></div>',
       '<div class="stat"><div class="k">运行时长</div><div class="v" style="font-size:16px">' + fmtDuration(rt.uptimeMs) + '</div></div>',
       '<div class="stat"><div class="k">启动时间</div><div class="v" style="font-size:13px">' + fmtTime(rt.startedAt) + '</div></div>'
@@ -682,21 +709,22 @@ async function loadPersonas() {
     const s = await api('/api/personas/scope');
     $('sessionList').innerHTML = s.sessions.length === 0 ? '<div class="empty">还没有会话记录。收到消息后这里会列出所有会话，可单独设置人格。</div>' :
       '<table><tr><th>会话</th><th>类型</th><th>消息数</th><th>最后活跃</th><th>人格</th></tr>' +
-      s.sessions.map((x) => '<tr><td class="mono">' + esc(x.scope) + '<div class="muted">' + esc(x.title || '') + '</div></td>' +
+      s.sessions.map((x, index) => '<tr><td class="mono">' + esc(x.scope) + '<div class="muted">' + esc(x.title || '') + '</div></td>' +
         '<td>' + (x.scopeType === 'group' ? '群聊' : '私聊') + '</td><td>' + x.messageCount + '</td>' +
         '<td class="muted">' + fmtAgo(x.lastActive) + '</td>' +
-        '<td><select onchange="setScopePersona(\'' + esc(x.scope) + '\', this.value)" style="padding:4px;font-size:12px">' +
+        '<td><select id="scopepersona_' + index + '" style="padding:4px;font-size:12px">' +
         '<option value="">（用默认）</option>' +
         d.personas.map((p) => '<option value="' + esc(p.id) + '"' + (x.personaId === p.id ? ' selected' : '') + '>' + esc(p.emoji) + ' ' + esc(p.name) + '</option>').join('') +
-        '</select></td></tr>').join('') + '</table>';
+        '</select><select id="scopehistory_' + index + '"><option value="keep">保留历史（旧回复作为资料）</option><option value="new">新开话题（旧话题保留）</option></select><button class="sm" onclick="setScopePersona(\'' + esc(x.scope) + '\',$(\'scopepersona_' + index + '\').value,$(\'scopehistory_' + index + '\').value)">切换</button></td></tr>').join('') + '</table>';
   } catch (e) { toast('加载人格失败: ' + e.message, 'err'); }
 }
 
-window.setScopePersona = async (scope, personaId) => {
+window.setScopePersona = async (scope, personaId, history = 'keep') => {
   if (!personaId) return toast('请选择一个人格', 'info');
   try {
-    const d = await post('/api/personas/scope', { scope: scope, personaId: personaId });
-    toast(d.ok ? '已切换该会话人格' : d.error, d.ok ? 'ok' : 'err');
+    const d = await post('/api/personas/scope', { scope: scope, personaId: personaId, history: history });
+    toast(d.ok ? (history === 'new' ? '已切换人格并新开话题' : '已切换人格，历史保留') : d.error, d.ok ? 'ok' : 'err');
+    if (d.ok) await loadPersonas();
   } catch (e) { toast(e.message, 'err'); }
 };
 
@@ -720,7 +748,7 @@ window.reloadPersonas = async () => {
 window.removePersona = async (id) => {
   if (!confirm('确定删除人格「' + id + '」？\n对应的 config/personas/' + id + '.yaml 会被删除。')) return;
   try {
-    const r = await fetch('/api/personas/' + encodeURIComponent(id), { method: 'DELETE' });
+    const r = await panelFetch('/api/personas/' + encodeURIComponent(id), { method: 'DELETE' });
     const d = await r.json().catch(() => ({}));
     toast(d.ok ? d.message : (d.error || '删除失败'), d.ok ? 'ok' : 'err');
     if (d.ok) loadPersonas();
@@ -740,6 +768,7 @@ window.openPersonaEditor = (id) => {
   $('pf_temp').value = p && p.temperature != null ? p.temperature : '';
   $('pf_maxTokens').value = p && p.maxTokens != null ? p.maxTokens : '';
   $('pf_prompt').value = p ? p.systemPrompt : '';
+  $('pf_proactiveTopics').value = (p?.proactiveTopics || []).join('\n');
   $('pf_keywords').value = p && p.triggers ? (p.triggers.keywords || []).join(', ') : '';
   $('pf_errmsg').value = p ? (p.errorMessage || '') : '';
   $('pf_pokereplies').value = p && p.pokeReplies ? p.pokeReplies.join('\n') : '';
@@ -749,6 +778,7 @@ window.openPersonaEditor = (id) => {
   $('pf_emotion').value = p && p.emotionModulation
     ? Object.entries(p.emotionModulation).map(([k, v]) => k + '=' + v).join('\n')
     : '';
+  for (const key of ['identity','speakingStyle','interactionStyle','answerPrinciples','emotionalStyle']) $('pf_'+key).value = p?.structured?.[key] || '';
   $('pf_error').innerHTML = '';
   $('personaModal').classList.add('open');
 };
@@ -798,7 +828,9 @@ window.savePersona = async () => {  const originalId = $('pf_originalId').value;
   if (!id) errs.push('请填写人格 ID');
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(id)) errs.push('人格 ID 只能用小写字母、数字、下划线和短横线');
   if (!name) errs.push('请填写显示名称');
-  if (!systemPrompt.trim()) errs.push('请填写 System Prompt');
+  const structured={};
+  for(const key of ['identity','speakingStyle','interactionStyle','answerPrinciples','emotionalStyle']) structured[key]=$('pf_'+key).value.trim();
+  if (!systemPrompt.trim() && !Object.values(structured).some(Boolean)) errs.push('请填写原始设定或至少一项结构化设定');
   if (errs.length) {
     $('pf_error').innerHTML = '<div class="msg err">' + errs.map(esc).join('<br>') + '</div>';
     return;
@@ -813,6 +845,8 @@ window.savePersona = async () => {  const originalId = $('pf_originalId').value;
     emoji: $('pf_emoji').value.trim() || '🤖',
     description: $('pf_desc').value.trim(),
     systemPrompt: systemPrompt,
+    structured: structured,
+    proactiveTopics: $('pf_proactiveTopics').value.split('\n').map(s=>s.trim()).filter(Boolean),
     emotionModulation: parseEmotionModulation($('pf_emotion').value),
     triggers: {
       keywords: $('pf_keywords').value.split(',').map((s) => s.trim()).filter(Boolean),
@@ -1068,6 +1102,7 @@ async function loadAccess() {
         '<div class="muted" style="margin-top:4px">' + esc(l.desc) + '</div></div>';
     }).join('');
 
+    $('commandPermissions').innerHTML = d.commands.map(c => '<div class="field"><label>' + esc(c.aliases.join(' / ')) + ' — ' + esc(c.name) + '</label><select id="cmdperm_' + c.id + '">' + [['admin','管理员'],['all','全部'],['whitelist','白名单和管理员']].map(o => '<option value="' + o[0] + '"' + (c.value === o[0] ? ' selected' : '') + '>' + o[1] + '</option>').join('') + '</select><div class="muted">' + esc(c.description) + '</div></div>').join('');
     $('accessFlags').innerHTML = d.flags.map((f) => {
       const inputId = 'accf_' + f.id;
       return '<div class="toggle-row" style="margin-bottom:10px">' +
@@ -1080,6 +1115,20 @@ async function loadAccess() {
     $('accessLists').innerHTML = '<div class="msg err">加载失败: ' + esc(e.message) + '</div>';
   }
 }
+
+window.saveCommandPermissions = async () => {
+  if (!window._access) return;
+  const commands = {};
+  for (const c of window._access.commands) commands[c.id] = $('cmdperm_' + c.id).value;
+  $('commandPermissionsSave').disabled = true;
+  try {
+    const r = await post('/api/access', { commands });
+    if (!r.ok) throw new Error(r.error || '保存失败');
+    toast(r.message || '已保存', 'ok');
+    await loadAccess();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { $('commandPermissionsSave').disabled = false; }
+};
 
 window.saveAccess = async () => {
   const d = window._access;
@@ -1272,30 +1321,47 @@ async function fillRoleModels(role) {
   const meta = (window._roles || []).find((x) => x.role === role);
   const current = meta ? meta.overrideModel : '';
 
-  sel.innerHTML = '<option value="">（自动/默认）</option>';
-  if (!providerKey) return;
+  // 「已保存的值」永远要显示出来。
+  // 早先供应商为空时会直接 return，导致只设了模型（供应商留空继承默认）的人
+  // 打开面板看到的是"（自动/默认）"，以为自己的选择被重置了。
+  const base = '<option value="">（自动/默认）</option>';
+  const keep = current
+    ? '<option value="' + esc(current) + '" selected>' + esc(current) + '</option>'
+    : '';
+
+  if (!providerKey) {
+    sel.innerHTML = base + keep;
+    return;
+  }
+
+  // 先无条件把已保存值放进去，保证网络慢/失败时也不会"看起来被重置"
+  sel.innerHTML = base + keep;
 
   try {
     const d = await api('/api/providers/' + encodeURIComponent(providerKey) + '/models');
     const models = d.models || [];
-    sel.innerHTML = '<option value="">（自动/默认）</option>' +
+    const inList = models.some((m) => m.id === current);
+    sel.innerHTML = base +
+      // 不在列表里就单独留一条，并注明原因（通常是该供应商没暴露 embedding 模型）
+      (current && !inList
+        ? '<option value="' + esc(current) + '" selected>' + esc(current) + '（已保存，未在该供应商模型列表中）</option>'
+        : '') +
       models.map((m) => '<option value="' + esc(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' +
-        esc(m.id) + '</option>').join('') +
-      (current && !models.some((m) => m.id === current)
-        ? '<option value="' + esc(current) + '" selected>' + esc(current) + '（当前，未在列表）</option>'
-        : '');
+        esc(m.id) + '</option>').join('');
   } catch (e) {
-    // 发现失败时至少保留当前值，允许手填
-    sel.innerHTML = '<option value="">（自动/默认）</option>' +
-      (current ? '<option value="' + esc(current) + '" selected>' + esc(current) + '</option>' : '');
+    // 发现失败：保留 base + keep，允许手填
   }
 }
 
 window.onRoleProviderChange = async (role) => {
   const pSel = $('rp_' + role);
   const providerKey = pSel ? pSel.value : '';
-  // 先写 provider，再刷新模型列表
-  await applyRole(role, { provider: providerKey, model: '' });
+  // 只改供应商，**不要顺手把模型清空**。
+  // 早先这里发的是 model: ''，于是"换个供应商"会把已选模型一起抹掉，
+  // 用户再打开就只看到"（自动/默认）"，像是设置不生效。
+  // 现在模型保持不动；若它不属于新供应商，下拉里会标成"（已保存，未在该供应商模型列表中）"，
+  // 由用户自己决定要不要换。
+  await applyRole(role, { provider: providerKey });
   await fillRoleModels(role);
 };
 
@@ -1450,8 +1516,8 @@ window.showUser = async (id) => {
       d.facts.map((f) => '<tr><td><span class="tag">' + esc(f.factTypeCn) + '</span></td><td>' + esc(f.content) + '</td>' +
         '<td>' + (f.confidence*100).toFixed(0) + '%</td>' +
         '<td>' + (f.shareable ? '<span class="tag ok">共享</span>' : '<span class="tag">本会话</span>') + '</td>' +
-        '<td class="mono muted">' + esc(f.scope) + '</td><td>' + f.hitCount + '</td>' +
-        '<td><button class="sm danger" onclick="delFact(' + f.id + ',' + id + ')">删除</button></td></tr>').join('') + '</table>';
+        '<td class="mono muted">' + esc(f.scope) + '<br>消息 ' + esc(f.sourceMessageId || '-') + (f.private ? ' 私密' : '') + '</td><td>' + f.hitCount + '</td>' +
+        '<td><button class="sm" onclick="editFact(' + f.id + ',' + id + ')">修正</button><button class="sm danger" onclick="delFact(' + f.id + ',' + id + ')">删除</button></td></tr>').join('') + '</table>';
 
     const sessions = d.sessions.length === 0 ? '' :
       '<h3 style="margin:16px 0 8px">参与的会话</h3><table><tr><th>会话</th><th>消息数</th><th>最后活跃</th><th>当前情绪</th></tr>' +
@@ -1470,6 +1536,11 @@ window.showUser = async (id) => {
   } catch (e) { toast('加载用户详情失败: ' + e.message, 'err'); }
 };
 
+window.editFact = async (fid, uid) => {
+  const content=prompt('修正后的完整事实（取消则不修改）'); if(content===null || !content.trim()) return;
+  const privateFlag=confirm('标记为私密，只在来源会话使用？');
+  try { await api('/api/facts/'+fid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,private:privateFlag})}); showUser(uid); } catch(e) {toast(e.message,'err');}
+};
 window.delFact = async (fid, uid) => {
   if (!confirm('确定删除这条记忆？')) return;
   try {

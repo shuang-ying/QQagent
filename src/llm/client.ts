@@ -16,6 +16,7 @@ import { getAdapter } from './protocol.js';
 import { normalizeBaseUrl } from '../config/loader.js';
 
 export interface ChatOptions {
+  purpose?: string;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -26,6 +27,8 @@ export interface ChatOptions {
   stream?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  maxRetries?: number;
+  retryDelayMs?: number;
 }
 
 export class LlmError extends Error {
@@ -33,6 +36,7 @@ export class LlmError extends Error {
     message: string,
     public readonly status?: number,
     public readonly retriable = false,
+    public readonly cancelled = false,
   ) {
     super(message);
     this.name = 'LlmError';
@@ -85,6 +89,7 @@ function buildRequestBody(
 
   if (protocol === 'ollama') {
     const body: Record<string, unknown> = {
+      model,
       // Ollama 把图片放在独立的 images 数组里，content 仍然是纯文本
       messages: messages.map((m) => {
         const imgs = imagesOf(m.content);
@@ -165,13 +170,28 @@ function buildUrl(protocol: Exclude<Protocol, 'auto'>, root: string, model: stri
   return adapter.chatEndpoint(root);
 }
 
-/** 从各协议的流式数据块中提取文本增量 */
+/** 从各协议的流式数据块或完整响应中提取文本与统计 */
 function extractDelta(
   protocol: Exclude<Protocol, 'auto'>,
   json: Record<string, unknown>,
 ): { text: string; usage?: LlmUsage; finish?: string; reasoning?: string } {
   if (protocol === 'anthropic') {
     const type = json['type'];
+    if (type === 'message') {
+      const blocks = Array.isArray(json['content']) ? json['content'] : [];
+      const text = blocks
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text as string)
+        .join('');
+      const rawUsage = json['usage'] as Record<string, unknown> | undefined;
+      const promptTokens = (rawUsage?.['input_tokens'] as number) ?? 0;
+      const completionTokens = (rawUsage?.['output_tokens'] as number) ?? 0;
+      return {
+        text,
+        usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
+        finish: String(json['stop_reason'] ?? ''),
+      };
+    }
     if (type === 'content_block_delta') {
       const delta = json['delta'] as Record<string, unknown> | undefined;
       return { text: String(delta?.['text'] ?? '') };
@@ -196,20 +216,19 @@ function extractDelta(
 
   if (protocol === 'gemini') {
     const cands = json['candidates'] as Array<Record<string, unknown>> | undefined;
+    const um = json['usageMetadata'] as Record<string, unknown> | undefined;
+    const promptTokens = (um?.['promptTokenCount'] as number) ?? 0;
+    const completionTokens = ((um?.['candidatesTokenCount'] as number) ?? 0) + ((um?.['thoughtsTokenCount'] as number) ?? 0);
+    const usage = um ? { promptTokens, completionTokens,
+      totalTokens: (um['totalTokenCount'] as number) ?? promptTokens + completionTokens } : undefined;
     if (!cands?.length) {
-      const um = json['usageMetadata'] as Record<string, unknown> | undefined;
-      if (um) {
-        const p = (um['promptTokenCount'] as number) ?? 0;
-        const c = (um['candidatesTokenCount'] as number) ?? 0;
-        return { text: '', usage: { promptTokens: p, completionTokens: c, totalTokens: p + c } };
-      }
-      return { text: '' };
+      return { text: '', usage };
     }
     const cand = cands[0]!;
     const parts = (cand['content'] as Record<string, unknown>)?.['parts'] as Array<Record<string, unknown>> | undefined;
     const text = (parts ?? []).map((p) => String(p['text'] ?? '')).join('');
     const finish = String(cand['finishReason'] ?? '');
-    return { text, finish };
+    return { text, finish, usage };
   }
 
   if (protocol === 'ollama') {
@@ -263,6 +282,16 @@ async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncGenerator<str
   const reader = stream.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
+  let data: string[] = [];
+  const lineEvent = (line: string): string | undefined => {
+    if (!line) {
+      const event = data.length ? data.join('\n') : undefined;
+      data = [];
+      return event;
+    }
+    if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    return undefined;
+  };
 
   try {
     while (true) {
@@ -270,29 +299,20 @@ async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncGenerator<str
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      // SSE 事件以空行分隔
+      // 按行处理，支持 CRLF 和多行 data；跨读取边界保留完整行。
       let idx: number;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const chunk = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        for (const line of chunk.split('\n')) {
-          const trimmed = line.trimStart();
-          if (!trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trim();
-          if (data) yield data;
-        }
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const event = lineEvent(buffer.slice(0, idx).replace(/\r$/, ''));
+        buffer = buffer.slice(idx + 1);
+        if (event !== undefined) yield event;
       }
     }
-    // 处理结尾残余
-    if (buffer.trim()) {
-      for (const line of buffer.split('\n')) {
-        const trimmed = line.trimStart();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        if (data) yield data;
-      }
-    }
+    buffer += decoder.decode();
+    if (buffer) lineEvent(buffer.replace(/\r$/, ''));
+    const last = lineEvent('');
+    if (last !== undefined) yield last;
   } finally {
+    await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }
@@ -316,12 +336,13 @@ async function* parseNdjson(stream: ReadableStream<Uint8Array>): AsyncGenerator<
     }
     if (buffer.trim()) yield buffer.trim();
   } finally {
+    await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }
 
 export class LlmClient {
-  constructor(private readonly log: Logger) {}
+  constructor(_log: Logger) {}
 
   /**
    * 流式对话：返回增量文本的异步迭代器。
@@ -343,11 +364,13 @@ export class LlmClient {
     // 外部 signal 也要能中断
     const onAbort = () => ctrl.abort();
     opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) ctrl.abort();
 
     let full = '';
     let reasoningFull = '';
     let usage: LlmUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     let finishReason = '';
+    let ended = false;
 
     try {
       const res = await fetch(url, {
@@ -376,7 +399,7 @@ export class LlmClient {
       const events = isNdjson ? parseNdjson(res.body) : parseSse(res.body);
 
       for await (const raw of events) {
-        if (raw === '[DONE]') break;
+        if (raw === '[DONE]') { ended = true; break; }
         let json: Record<string, unknown>;
         try {
           json = JSON.parse(raw) as Record<string, unknown>;
@@ -384,9 +407,14 @@ export class LlmClient {
           continue; // 心跳等非 JSON 行
         }
         if (json['error']) {
-          throw new LlmError(`模型返回错误: ${JSON.stringify(json['error']).slice(0, 300)}`, undefined, true);
+          const errorText = JSON.stringify(json['error']).slice(0, 300);
+          const error = json['error'] as Record<string, unknown>;
+          const status = Number(error['status'] ?? error['status_code']);
+          const transient = status === 429 || status >= 500 || /overloaded|rate_limit|temporar|server_error|timeout/i.test(errorText);
+          throw new LlmError(`模型返回错误: ${errorText}`, Number.isFinite(status) ? status : undefined, transient);
         }
         const d = extractDelta(opts.protocol, json);
+        if (json['type'] === 'message_stop' || json['done'] === true || d.finish) ended = true;
         if (d.reasoning) reasoningFull += d.reasoning;
         if (d.text) {
           full += d.text;
@@ -401,6 +429,10 @@ export class LlmClient {
         }
         if (d.finish) finishReason = d.finish;
       }
+
+      if (ctrl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (!ended) throw new LlmError('模型流在结束标记前断开，丢弃不完整回复', undefined, true);
+      usage.totalTokens = Math.max(usage.totalTokens, usage.promptTokens + usage.completionTokens);
 
       // 流式响应常常不带 usage，用字符数粗估，供成本统计参考
       if (usage.completionTokens === 0 && full.length) {
@@ -419,16 +451,7 @@ export class LlmClient {
       };
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        // 超时或主动取消：已收到的内容仍然有效
-        this.log.warn({ model: opts.model, received: full.length }, '流式请求被中断（超时或取消）');
-        return {
-          content: full,
-          model: opts.model,
-          provider: '',
-          usage,
-          finishReason: 'aborted',
-          latencyMs: Date.now() - start,
-        };
+        throw new LlmError(opts.signal?.aborted ? '请求已取消' : `请求超时(${timeoutMs}ms)`, undefined, false, !!opts.signal?.aborted);
       }
       throw e;
     } finally {
@@ -450,6 +473,7 @@ export class LlmClient {
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     const onAbort = () => ctrl.abort();
     opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) ctrl.abort();
 
     try {
       const res = await fetch(url, {
@@ -464,6 +488,7 @@ export class LlmClient {
       });
 
       const text = await res.text();
+      if (ctrl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       if (!res.ok) {
         throw new LlmError(
           `模型调用失败 HTTP ${res.status}: ${text.slice(0, 300)}`,
@@ -487,7 +512,7 @@ export class LlmClient {
       };
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        throw new LlmError(`请求超时(${timeoutMs}ms)`, undefined, true);
+        throw new LlmError(opts.signal?.aborted ? '请求已取消' : `请求超时(${timeoutMs}ms)`, undefined, false, !!opts.signal?.aborted);
       }
       throw e;
     } finally {

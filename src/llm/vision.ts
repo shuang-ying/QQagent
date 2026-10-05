@@ -11,28 +11,21 @@
  * NapCat 给的 url 常常是内网地址或临时文件，模型侧的服务器根本访问不到。
  * 本地取回来再以 base64 发送，可靠性高得多。
  */
-import fs from 'node:fs';
-import path from 'node:path';
+import { loadMedia, type MediaOptions } from './media.js';
+
 import type { ContentPart, ObMessageSegment } from '../core/types.js';
 
 /** 单张图上限（base64 前的原始字节） */
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
 /** 单条消息最多处理几张图 */
 export const MAX_IMAGES_PER_MESSAGE = 3;
 
 /** 常见图片扩展名 → MIME */
-const EXT_MIME: Record<string, string> = {
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.bmp': 'image/bmp',
-};
+
 
 /** 按魔数猜 MIME（比扩展名可靠） */
 export function sniffMime(buf: Buffer): string {
-  if (buf.length < 12) return 'image/jpeg';
+  if (buf.length < 12) return '';
   if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
   if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
@@ -40,26 +33,11 @@ export function sniffMime(buf: Buffer): string {
     return 'image/webp';
   }
   if (buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
-  return 'image/jpeg';
-}
-
-function mimeFromName(name: string): string | undefined {
-  return EXT_MIME[path.extname(name).toLowerCase()];
-}
-
-/** 判断是不是"看起来像 URL" */
-function isHttp(u: string): boolean {
-  return /^https?:\/\//i.test(u);
-}
-
-async function fetchBytes(url: string, timeoutMs: number): Promise<Buffer> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const ab = await res.arrayBuffer();
-  return Buffer.from(ab);
+  return '';
 }
 
 export interface CollectedImage {
+  hash?: string; bytes?: number; width?: number; height?: number; frames?: number;
   part: ContentPart & { type: 'image' };
   /** 来源描述，便于日志排查 */
   source: string;
@@ -77,81 +55,16 @@ export interface CollectResult {
  * 解析优先级：base64:// > http(s) url > 本地文件路径。
  * 失败不抛异常，记在 errors 里，主流程照常走（退化成 [图片] 占位符）。
  */
-export async function collectImages(
-  segments: ObMessageSegment[],
-  opts: { timeoutMs?: number; maxImages?: number } = {},
-): Promise<CollectResult> {
-  const timeoutMs = opts.timeoutMs ?? 15000;
-  const maxImages = opts.maxImages ?? MAX_IMAGES_PER_MESSAGE;
-
-  const images: CollectedImage[] = [];
-  const errors: string[] = [];
-
-  const segs = segments.filter(isImageSegment).slice(0, maxImages);
-
-  for (const seg of segs) {
-    const d = seg.data ?? {};
-    const file = String(d['file'] ?? '');
-    const url = String(d['url'] ?? '');
-    const summary = String(d['summary'] ?? '');
-    void summary;
-
+export async function collectImages(segments: ObMessageSegment[], opts: MediaOptions = {}): Promise<CollectResult> {
+  const images: CollectedImage[] = []; const errors: string[] = [];
+  const segs = segments.filter(isImageSegment).slice(0, opts.maxImages ?? MAX_IMAGES_PER_MESSAGE);
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i]!;
     try {
-      let buf: Buffer | null = null;
-      let source = '';
-
-      // 1) base64:// 直接内嵌
-      if (file.startsWith('base64://')) {
-        buf = Buffer.from(file.slice('base64://'.length), 'base64');
-        source = 'inline-base64';
-      }
-
-      // 2) 明确的 http(s) 地址
-      if (!buf && isHttp(url)) {
-        buf = await fetchBytes(url, timeoutMs);
-        source = `url:${url.slice(0, 60)}`;
-      }
-      if (!buf && isHttp(file)) {
-        buf = await fetchBytes(file, timeoutMs);
-        source = `file-url:${file.slice(0, 60)}`;
-      }
-
-      // 3) 本地路径
-      if (!buf && file && !file.startsWith('base64://')) {
-        const p = path.isAbsolute(file) ? file : path.resolve(file);
-        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
-          buf = fs.readFileSync(p);
-          source = `path:${p}`;
-        }
-      }
-
-      if (!buf) {
-        errors.push(file || url ? '无法读取图片（既不是有效 URL 也不是可读文件）' : '图片段缺少 file/url');
-        continue;
-      }
-
-      // 有些实现会给 base64 字符串，但没加前缀 —— 兜底识别
-      if (buf.length < 32 && /^[A-Za-z0-9+/=]{32,}$/.test(buf.toString('utf8'))) {
-        buf = Buffer.from(buf.toString('utf8'), 'base64');
-        source = 'raw-base64';
-      }
-
-      if (buf.length > MAX_IMAGE_BYTES) {
-        errors.push(`图片过大（${(buf.length / 1024 / 1024).toFixed(1)}MB > 8MB）`);
-        continue;
-      }
-      if (buf.length === 0) {
-        errors.push('图片内容为空');
-        continue;
-      }
-
-      const mimeType = sniffMime(buf) || mimeFromName(file) || 'image/jpeg';
-      images.push({ part: { type: 'image', mimeType, data: buf.toString('base64') }, source });
-    } catch (e) {
-      errors.push(`读取图片失败：${(e as Error).message}`);
-    }
+      const image = await loadMedia(String(seg.data['file'] ?? ''), String(seg.data['url'] ?? ''), opts);
+      images.push(image); opts.onImage?.(image, i);
+    } catch (error) { errors.push('读取图片失败：' + (error as Error).message); }
   }
-
   return { images, errors };
 }
 
@@ -178,6 +91,7 @@ export function hasImages(segments: ObMessageSegment[]): boolean {
 
 /** 历史图片的来源 */
 export interface HistoricalImageSource {
+  rowId?: number; userId?: number; messageId?: number;
   /** messages.raw_segments 原文 */
   rawSegments: string | null;
   senderName: string;
@@ -185,6 +99,7 @@ export interface HistoricalImageSource {
 }
 
 export interface HistoryImageResult {
+  sourceRowIds?: number[];
   images: Array<ContentPart & { type: 'image' }>;
   /** 与 images 一一对应的来源说明 */
   notes: string[];
@@ -204,13 +119,14 @@ export interface HistoryImageResult {
 export async function collectImagesFromHistory(
   sources: HistoricalImageSource[],
   maxImages: number,
-  opts: { timeoutMs?: number } = {},
+  opts: MediaOptions & { onSourceImage?: (image: CollectedImage, index: number, source: HistoricalImageSource) => void } = {},
 ): Promise<HistoryImageResult> {
   const images: Array<ContentPart & { type: 'image' }> = [];
   const notes: string[] = [];
+  const sourceRowIds: number[] = [];
   const errors: string[] = [];
 
-  if (maxImages <= 0) return { images, notes, errors };
+  if (maxImages <= 0) return { images, notes, errors, sourceRowIds };
 
   for (let i = sources.length - 1; i >= 0 && images.length < maxImages; i--) {
     const src = sources[i]!;
@@ -224,19 +140,16 @@ export async function collectImagesFromHistory(
 
     // 单条消息内也限量，避免一条里的 9 张图把预算吃光
     const room = maxImages - images.length;
-    const got = await collectImages(segments, { maxImages: room, ...opts });
-    if (got.errors.length > 0) errors.push(...got.errors);
+    const got = await collectImages(segments, { ...opts, maxImages: room, onImage: (image, index) => opts.onSourceImage?.(image, index, src) });
+    if (got.errors.length > 0) errors.push(...got.errors.map(error => `${src.senderName || '某人'}（QQ ${src.userId ?? '-'}；msg ${src.messageId ?? '-'}）：${error}`));
     if (got.images.length === 0) continue;
 
-    for (const img of got.images) {
-      images.push(img.part);
-      notes.push(`${src.senderName || '某人'} 发的图（${relativeTime(src.createdAt)}）`);
-    }
+    images.unshift(...got.images.map(img => img.part));
+    sourceRowIds.unshift(...got.images.map(() => src.rowId ?? 0));
+    notes.unshift(...got.images.map(() => `${src.senderName || '某人'}${src.userId ? `（QQ ${src.userId}）` : ''} 发的图（msg ${src.messageId ?? '-'}；${relativeTime(src.createdAt)}）`));
   }
 
   // 刚才是从新到旧，翻回正序
-  images.reverse();
-  notes.reverse();
   return { images, notes, errors };
 }
 

@@ -6,6 +6,7 @@
  * 这里按 protocol 分派到对应端点，未支持的形式给出明确中文错误。
  */
 import type { Protocol } from '../core/types.js';
+import { getAdapter } from './protocol.js';
 
 export interface EmbedResult {
   ok: boolean;
@@ -31,9 +32,21 @@ function authHeaders(p: Ep, apiKey: string): Record<string, string> {
 function parseVectors(p: Ep, json: unknown): number[][] {
   const j = json as Record<string, unknown>;
 
+  // Gemini 与 Ollama 共用 embeddings 字段，必须先按协议区分元素形状。
+  if (p === 'gemini' && Array.isArray(j?.embeddings)) {
+    return (j.embeddings as Array<Record<string, unknown>>)
+      .map((d) => (Array.isArray(d?.values) ? (d.values as number[]) : null))
+      .filter((v): v is number[] => Array.isArray(v));
+  }
+
   // OpenAI 兼容：{ data: [{ embedding: [...] }] }
   if (Array.isArray(j?.data)) {
-    return (j.data as Array<Record<string, unknown>>)
+    const data = j.data as Array<Record<string, unknown>>;
+    if (data.some(d => d.index !== undefined)) {
+      if (!data.every(d => Number.isInteger(d.index)) || new Set(data.map(d => d.index)).size !== data.length || data.some(d => Number(d.index) < 0 || Number(d.index) >= data.length)) throw new Error('embedding 输入顺序索引无效');
+      data.sort((a, b) => Number(a.index) - Number(b.index));
+    }
+    return data
       .map((d) => (Array.isArray(d?.embedding) ? (d.embedding as number[]) : null))
       .filter((v): v is number[] => Array.isArray(v));
   }
@@ -43,13 +56,6 @@ function parseVectors(p: Ep, json: unknown): number[][] {
     return (j.embeddings as unknown[]).filter((v): v is number[] => Array.isArray(v));
   }
   if (Array.isArray(j?.embedding)) return [j.embedding as number[]];
-
-  // Gemini batch：{ embeddings: [{ values: [...] }] }
-  if (Array.isArray(j?.embeddings)) {
-    return (j.embeddings as Array<Record<string, unknown>>)
-      .map((d) => (Array.isArray(d?.values) ? (d.values as number[]) : null))
-      .filter((v): v is number[] => Array.isArray(v));
-  }
 
   throw new Error('无法解析 embedding 响应（结构不认识）');
 }
@@ -65,6 +71,7 @@ export async function embedTexts(params: {
   texts: string[];
   timeoutMs?: number;
   headers?: Record<string, string>;
+  signal?: AbortSignal;
 }): Promise<EmbedResult> {
   const { baseURL, apiKey, protocol, model, texts } = params;
   const timeoutMs = params.timeoutMs ?? 30000;
@@ -85,10 +92,11 @@ export async function embedTexts(params: {
     url = `${root}/api/embed`;
     body = { model, input: texts };
   } else if (protocol === 'gemini') {
-    url = `${root}/models/${encodeURIComponent(model)}:batchEmbedContents`;
+    const modelId = model.replace(/^models\//, '');
+    url = `${getAdapter('gemini').chatEndpoint(root)}/${encodeURIComponent(modelId)}:batchEmbedContents`;
     body = {
       requests: texts.map((t) => ({
-        model: `models/${model}`,
+        model: `models/${modelId}`,
         content: { parts: [{ text: t }] },
       })),
     };
@@ -103,7 +111,7 @@ export async function embedTexts(params: {
       method: 'POST',
       headers: { ...authHeaders(protocol, apiKey), ...(params.headers ?? {}) },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: params.signal ? AbortSignal.any([params.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     });
 
     const text = await res.text();
@@ -150,6 +158,8 @@ export async function embedTexts(params: {
       };
     }
 
+    validateVectors(vectors);
+    validateVectors(vectors);
     return { ok: true, vectors, latencyMs: Date.now() - start };
   } catch (e) {
     const msg = (e as Error).message;
@@ -180,6 +190,7 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 
 /** number[] -> Float32Array 的 BLOB（用于 SQLite 存储） */
 export function vectorToBlob(vec: number[]): Buffer {
+  validateVectors([vec]);
   const f = new Float32Array(vec);
   return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
 }
@@ -187,6 +198,12 @@ export function vectorToBlob(vec: number[]): Buffer {
 /** BLOB -> number[] */
 export function blobToVector(buf: Buffer | Uint8Array): number[] {
   const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  if (b.length === 0 || b.length % 4 !== 0) throw new Error('损坏的向量 BLOB');
   const f = new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
-  return Array.from(f);
+  const result = Array.from(f); validateVectors([result]); return result;
+}
+
+export function validateVectors(vectors: number[][]): void {
+  const dim = vectors[0]?.length;
+  if (!dim || dim > 65536 || vectors.some(v => v.length !== dim || v.some(x => !Number.isFinite(x) || !Number.isFinite(Math.fround(x))) || !v.some(x => Math.fround(x) !== 0))) throw new Error('向量维度、数值或范数无效');
 }

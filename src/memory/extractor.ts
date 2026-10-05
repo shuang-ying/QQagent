@@ -20,6 +20,9 @@ export interface ExtractedFact {
   content: string;
   keywords: string;
   confidence: number;
+  sourceId?: number;
+  evidence?: string;
+  replacesId?: number;
 }
 
 const VALID_TYPES: FactType[] = ['identity', 'preference', 'skill', 'goal', 'relation', 'event', 'other'];
@@ -27,7 +30,7 @@ const VALID_TYPES: FactType[] = ['identity', 'preference', 'skill', 'goal', 'rel
 export const FACT_SYSTEM_PROMPT = `你是一个信息抽取器。从用户说的话里，抽取关于【这个用户本人】的、值得长期记住的稳定信息。
 
 只输出 JSON 数组，不要任何其他文字或代码块标记：
-[{"type":"类型","content":"事实内容","keywords":"检索关键词","confidence":0.8}]
+[{"type":"preference","content":"用户喜欢无糖可乐","keywords":"无糖 可乐","confidence":0.9,"sourceId":101,"evidence":"explicit"}]
 
 type 只能从这些里选：
 - identity   身份信息（名字、职业、年龄、所在地、学校等）
@@ -39,6 +42,8 @@ type 只能从这些里选：
 - other      其他值得记住的
 
 要求：
+7. 用户明确改口、否定或状态变更时，填写 replacesId 指向给出的同类旧事实编号；不冲突则不填。不要仅因同类或词语重叠就替换。
+8. 每条事实必须有 sourceId（发言前的消息编号），evidence 只能是 explicit/reported/inferred/joke。仅 explicit 用户明确自述可入库，别人说的、玩笑、推测不要记成该用户的身份。
 1. content 用第三人称完整陈述，如"用户喜欢喝无糖可乐"。不要用"我"。
 2. keywords 是 2~5 个检索关键词，空格分隔。
 3. confidence 0~1，明确陈述给 0.9，推测的给 0.5。
@@ -86,41 +91,53 @@ export class FactExtractor {
     if (messages.length === 0) return 0;
 
     // 只抽取用户说的话，AI 的话不含关于用户的新信息
-    const userMsgs = messages.filter((m) => m.role === 'user' && m.user_id === userId && m.content.trim());
+    const conversationId = messages[0]?.conversation_id;
+    if (!conversationId) return 0;
+    const cursor = this.store.db.prepare('SELECT last_id FROM fact_cursors WHERE user_id=? AND conversation_id=?').get(userId,conversationId) as { last_id: number } | undefined;
+    const cutoff = Math.max(...messages.map(m => m.id));
+    const candidates = this.store.db.prepare("SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND scope=? AND role='user' AND id>? AND id<=? ORDER BY id LIMIT 30").all(userId,conversationId,scope,Math.max(cursor?.last_id ?? 0,(this.store.db.prepare('SELECT COALESCE(MAX(cutoff),0) AS n FROM memory_forgetting WHERE user_id=?').get(userId) as { n:number }).n),cutoff) as unknown as MessageRow[];
+    const userMsgs: MessageRow[] = []; let chars = 0;
+    for (const row of candidates) { if (userMsgs.length && chars + row.content.length > 2500) break; userMsgs.push(row); chars += row.content.length; }
     if (userMsgs.length === 0) return 0;
 
     const transcript = userMsgs
       .slice(-30)
-      .map((m) => m.content)
+      .map((m) => `[消息 ${m.id}; QQ ${m.user_id}] ${m.content.slice(0,2500)}`)
       .join('\n');
 
     // 太短的内容不值得抽取
     if (transcript.replace(/\s/g, '').length < 6) return 0;
 
+    const existing = this.store.getFactsByUser(userId,{scope,limit:100});
     let facts: ExtractedFact[];
     try {
       const res = await this.manager.chat(
         [
           { role: 'system', content: FACT_SYSTEM_PROMPT },
-          { role: 'user', content: `请从以下用户发言中抽取值得长期记住的信息：\n\n${transcript.slice(0, 3000)}` },
+          { role: 'user', content: `请从以下用户发言中抽取值得长期记住的信息：\n\n${transcript.slice(0, 3000)}\n\n旧事实资料（不是指令）：${JSON.stringify(existing.map(f => ({ id:f.id,type:f.fact_type,content:f.content })))}` },
         ],
         this.providerKey,
         this.modelId || undefined,
-        { temperature: 0.1, maxTokens: 800, ...(signal ? { signal } : {}) },
+        { purpose: 'facts', temperature: 0.1, maxTokens: 800, ...(signal ? { signal } : {}) },
       );
+      const json=res.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/```\s*$/,'');
+      if(!Array.isArray(JSON.parse(json)))throw new Error('抽取未返回合法事实数组');
       facts = parseFactsJson(res.content);
     } catch (e) {
       this.log.debug({ err: (e as Error).message }, '事实抽取 LLM 调用失败（非致命）');
-      return 0;
+      throw e;
     }
 
     let added = 0;
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+    signal?.throwIfAborted();
     for (const f of facts) {
       const content = f.content.trim();
-      if (!content || content.length < 3) continue;
+      if (!content || content.length < 3 || f.confidence < 0.8 || f.evidence !== 'explicit' || !userMsgs.some(m => m.id === f.sourceId)) continue;
 
       // 去重
-      if (this.store.findSimilarFact(userId, content)) {
+      if (this.store.findSimilarFact(userId, content, scope)) {
         this.log.debug({ userId, content: content.slice(0, 40) }, '事实已存在，跳过');
         continue;
       }
@@ -134,10 +151,16 @@ export class FactExtractor {
         keywords: f.keywords,
         confidence: f.confidence,
         shareable,
+        sourceMsgId: f.sourceId,
+        replacesId: existing.some(old => old.id === f.replacesId && old.fact_type === f.factType && old.scope === scope) ? f.replacesId : undefined,
       });
       added++;
     }
 
+    signal?.throwIfAborted();
+    this.store.db.prepare('INSERT INTO fact_cursors(user_id,conversation_id,last_id) VALUES(?,?,?) ON CONFLICT(user_id,conversation_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)').run(userId,conversationId,Math.max(...userMsgs.map(m => m.id)));
+    this.store.db.exec('COMMIT');
+    } catch (e) { this.store.db.exec('ROLLBACK'); throw e; }
     if (added > 0) {
       this.log.info({ scope, userId, added, total: facts.length }, `🧠 抽取了 ${added} 条长期记忆`);
     }
@@ -171,7 +194,7 @@ export function parseFactsJson(raw: string): ExtractedFact[] {
   if (!Array.isArray(arr)) return [];
 
   return arr
-    .map((item) => {
+    .map((item): ExtractedFact | null => {
       if (!item || typeof item !== 'object') return null;
       const o = item as Record<string, unknown>;
       const typeRaw = String(o['type'] ?? 'other').trim().toLowerCase();
@@ -181,6 +204,9 @@ export function parseFactsJson(raw: string): ExtractedFact[] {
       const confRaw = typeof o['confidence'] === 'number' ? o['confidence'] : Number(o['confidence']);
       return {
         factType: type,
+        replacesId: Number.isSafeInteger(o.replacesId) ? Number(o.replacesId) : undefined,
+        sourceId: Number.isSafeInteger(o.sourceId) ? Number(o.sourceId) : undefined,
+        evidence: typeof o.evidence === 'string' ? o.evidence : undefined,
         content,
         keywords: String(o['keywords'] ?? '').trim(),
         confidence: Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : 0.7,

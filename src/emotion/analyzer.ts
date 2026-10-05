@@ -213,7 +213,7 @@ export function classify(valence: number, arousal: number, dominance: number, in
 // LLM 情绪分析
 // ============================================================
 
-const EMOTION_PROMPT = `你是一个情绪分析器。分析用户消息中体现的情绪。
+export const EMOTION_PROMPT = `你是一个情绪分析器。分析用户消息中体现的情绪。
 
 只输出一个 JSON 对象，不要任何其他文字、不要代码块标记：
 {"label":"情绪标签","valence":效价,"arousal":唤醒度,"dominance":支配度,"intensity":强度,"confidence":置信度}
@@ -284,7 +284,7 @@ export class EmotionAnalyzer {
         ],
         this.providerKey,
         this.modelId || undefined,
-        { temperature: 0, maxTokens: 200, ...(signal ? { signal } : {}) },
+        { purpose: 'emotion', temperature: 0, maxTokens: 200, ...(signal ? { signal } : {}) },
       );
       const parsed = parseEmotionJson(res.content);
       if (parsed) {
@@ -304,6 +304,10 @@ export class EmotionAnalyzer {
    */
   analyzeBatch(texts: string[]): EmotionScore[] {
     return texts.map((t) => stripMatched(analyzeByRule(t)));
+  }
+
+  snapshot(mode: 'rule' | 'llm' | 'hybrid', providerKey: string, modelId: string): EmotionAnalyzer {
+    return new EmotionAnalyzer(mode, this.manager, providerKey, modelId, this.log);
   }
 }
 

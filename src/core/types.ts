@@ -21,8 +21,11 @@ export const StorageSchema = z.object({
 });
 
 export const NapCatSchema = z.object({
+  extensions: z.record(z.string(), z.boolean()).prefault({}),
+  maxPending: z.number().int().positive().default(128),
+  maxBufferedBytes: z.number().int().positive().default(1048576),
   enabled: z.boolean().default(true),
-  mode: z.enum(['reverse-ws-client', 'ws-server']).default('reverse-ws-client'),
+  mode: z.enum(['forward-ws', 'reverse-ws-client', 'ws-server']).default('forward-ws'),
   url: z.string().default('ws://127.0.0.1:3001'),
   accessToken: z.string().default(''),
   selfId: z.number().int().nonnegative().default(0),
@@ -41,6 +44,17 @@ export const NapCatSchema = z.object({
     .prefault({}),
 });
 
+export const COMMAND_IDS = ['help', 'persona', 'personas', 'memory', 'forget', 'emotion', 'new', 'topics', 'stats'] as const;
+export type CommandId = typeof COMMAND_IDS[number];
+export const CommandPermissionSchema = z.enum(['admin', 'all', 'whitelist']);
+export type CommandPermission = z.infer<typeof CommandPermissionSchema>;
+export const CommandPermissionsSchema = z.object({
+  help: CommandPermissionSchema.optional(), persona: CommandPermissionSchema.optional(),
+  personas: CommandPermissionSchema.optional(), memory: CommandPermissionSchema.optional(),
+  forget: CommandPermissionSchema.optional(), emotion: CommandPermissionSchema.optional(),
+  new: CommandPermissionSchema.optional(), topics: CommandPermissionSchema.optional(), stats: CommandPermissionSchema.optional(),
+}).strict();
+
 export const TriggerSchema = z.object({
   private: z.enum(['always', 'keyword', 'prefix']).default('always'),
   privateKeywords: z.array(z.string()).default([]),
@@ -54,7 +68,7 @@ export const TriggerSchema = z.object({
       ignoreSelf: z.boolean().default(true),
       /** 群白名单：非空时只有这些群里的消息才会被处理 */
       enabledGroups: z.array(z.number().int()).default([]),
-      /** 记录群内所有人的发言作为上下文 */
+      /** 旧配置兼容；允许接收的普通消息始终记录，用于完整回复窗口。 */
       recordAllMessages: z.boolean().default(true),
     })
     .prefault({}),
@@ -66,6 +80,8 @@ export const TriggerSchema = z.object({
   admins: z.array(z.number().int()).default([]),
   /** true = 只有管理员能用全部命令 */
   commandAdminOnly: z.boolean().default(false),
+  /** 每条指令的权限；未单独配置时继承旧开关。 */
+  commandPermissions: CommandPermissionsSchema.prefault({}),
   /** true = 只有管理员能通过命令切换人格（查看不受限） */
   personaAdminOnly: z.boolean().default(false),
 });
@@ -190,7 +206,7 @@ export const LlmSchema = z.object({
   defaultProvider: z.string().default(''),
   /** 默认模型 ID（为空时用该 provider 发现到的第一个模型） */
   defaultModel: z.string().default(''),
-  fallback: z.array(z.string()).default([]),
+  fallback: z.array(z.union([z.string(), z.object({ provider: z.string().min(1), model: z.string().default('') })])).default([]),
   /** 各用途的模型覆盖；留空继承 default* */
   roles: LlmRolesSchema.prefault({}),
   /**
@@ -248,6 +264,7 @@ export const MemorySchema = z.object({
       semantic: z.boolean().default(false),
       /** 语义召回的最低余弦相似度 */
       semanticMinScore: z.number().min(0).max(1).default(0.35),
+      timeoutMs: z.number().int().positive().default(2000),
       /** identity-facts = 只跨群共享身份类事实；full = 全部；none = 不共享 */
       crossScopeSharing: z.enum(['identity-facts', 'full', 'none']).default('identity-facts'),
       shareableFactTypes: z.array(z.string()).default(['identity', 'preference', 'skill', 'goal']),
@@ -264,6 +281,7 @@ export const MemorySchema = z.object({
 });
 
 export const EmotionSchema = z.object({
+  timeoutMs: z.number().int().positive().default(2000),
   enabled: z.boolean().default(true),
   mode: z.enum(['rule', 'llm', 'hybrid']).default('hybrid'),
   model: z.string().default(''),
@@ -320,17 +338,7 @@ export const ReplyBehaviorSchema = z.object({
       onEmotions: z.array(z.string()).default(['joy']),
     })
     .prefault({}),
-  /**
-   * 回复时回看几张历史图片。
-   *
-   * 场景：对方先发了一张图，紧接着又发一条「@机器人 这啥」——
-   * 这条消息本身没带图，只看它的话机器人会答"我看不到图"。
-   *
-   * 回看范围是**机器人上次说话之后**新出现的图片，所以：
-   *   - 刚发完图再来问 → 看得到 ✅
-   *   - 已经回过的图不会重复塞（省 token，也避免它反复念叨同一张图）✅
-   * 0 = 关闭。
-   */
+  /** 旧配置兼容；统一回复窗口不再按固定数量回看，改按模型预算纳入图片。 */
   recentImages: z.number().int().min(0).max(5).default(2),
 });
 export type ReplyBehavior = z.infer<typeof ReplyBehaviorSchema>;
@@ -428,7 +436,7 @@ export const ServerSchema = z.object({  enabled: z.boolean().default(true),
   authToken: z.string().default(''),
 });
 
-export const AppConfigSchema = z.object({
+const BaseAppConfigSchema = z.object({
   app: z
     .object({
       name: z.string().default('qq-agent'),
@@ -439,6 +447,12 @@ export const AppConfigSchema = z.object({
   storage: StorageSchema.prefault({}),
   napcat: NapCatSchema.prefault({}),
   trigger: TriggerSchema.prefault({}),
+  scheduling: z.object({
+    shortMessageMergeMs: z.number().int().min(0).max(5000).default(800),
+    maxPendingPerScope: z.number().int().positive().default(16),
+    maxPendingTotal: z.number().int().positive().default(128),
+    maxActiveScopes: z.number().int().positive().default(4),
+  }).prefault({}),
   proactive: ProactiveSchema.prefault({}),
   persona: PersonaConfigSchema.prefault({}),
   llm: LlmSchema.prefault({}),
@@ -446,10 +460,25 @@ export const AppConfigSchema = z.object({
   emotion: EmotionSchema.prefault({}),
   context: ContextSchema.prefault({}),
   reply: ReplyBehaviorSchema.prefault({}),
+  media: z.object({
+    visionPipeline: z.boolean().default(true),
+    maxBytes: z.number().int().positive().default(8 * 1024 * 1024),
+    maxPixels: z.number().int().positive().default(40000000),
+    maxDimension: z.number().int().positive().default(2048),
+    timeoutMs: z.number().int().positive().default(15000),
+    allowedDirs: z.array(z.string()).default(['runtime/media', 'config/stickers']),
+  }).prefault({}),
   sticker: StickerSchema.prefault({}),
   server: ServerSchema.prefault({}),
 });
 
+export const AppConfigSchema = z.preprocess((input) => {
+  if (!input || typeof input !== 'object') return input;
+  const value = input as Record<string, unknown>;
+  if (!value['onebot']) return value;
+  return { ...value, napcat: { ...(value['napcat'] as object ?? {}), ...(value['onebot'] as object) } };
+}, BaseAppConfigSchema);
+export const OneBotSchema = NapCatSchema;
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
 // ============================================================
@@ -505,7 +534,13 @@ export const PersonaSchema = z.object({
   description: z.string().default(''),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().positive().optional(),
-  systemPrompt: z.string(),
+  systemPrompt: z.string().default(''),
+  /** One topic per entry; explicit aliases separated by |. */
+  proactiveTopics: z.array(z.string().trim().min(2).max(100)).max(32).default([]),
+  structured: z.object({
+    identity: z.string().default(''), speakingStyle: z.string().default(''),
+    interactionStyle: z.string().default(''), answerPrinciples: z.string().default(''), emotionalStyle: z.string().default(''),
+  }).prefault({}),
   /**
    * 预设对话（few-shot 示例）。
    * 会作为真实对话轮次插在 system 之后发给模型 —— 比写在 systemPrompt
@@ -607,6 +642,8 @@ export interface PokeEvent {
 
 /** 归一化后的入站消息 */
 export interface InboundMessage {
+  /** 已核实引用本话题机器人消息 */
+  repliesToBot?: boolean;
   /** 会话唯一键：private:123 或 group:456 */
   scope: string;
   scopeType: 'private' | 'group';
@@ -667,7 +704,7 @@ export interface EmotionScore {
  */
 export type ContentPart =
   | { type: 'text'; text: string }
-  | { type: 'image'; mimeType: string; data: string };
+  | { type: 'image'; mimeType: string; data: string; width?: number; height?: number };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';

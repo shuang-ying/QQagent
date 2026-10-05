@@ -13,10 +13,11 @@ REM NOTE: `call "npm.cmd"` (bare name, quoted) breaks npm's own
 REM %~dp0 self-resolution and fails with MODULE_NOT_FOUND.
 set "NPMPATH="
 for /f "delims=" %%i in ('where npm.cmd 2^>nul') do if not defined NPMPATH set "NPMPATH=%%i"
+if not defined NPMPATH if exist "D:\NodeJs\npm.cmd" set "NPMPATH=D:\NodeJs\npm.cmd"
 
 if not defined NPMPATH (
   echo.
-  echo [X] npm not found. Please install Node.js v22.5 or newer.
+  echo [X] npm not found. Please install Node.js v22.16 or newer.
   pause
   exit /b 1
 )
@@ -28,7 +29,7 @@ if not exist "node_modules" (
   call "%NPMPATH%" install --no-fund --no-audit
   if errorlevel 1 (
     echo.
-    echo [X] Install failed. Check your network and Node.js version ^(need v22.5+^).
+    echo [X] Install failed. Check your network and Node.js version ^(need v22.16+^).
     pause
     exit /b 1
   )

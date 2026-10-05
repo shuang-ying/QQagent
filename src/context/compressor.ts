@@ -10,12 +10,22 @@
  */
 import type { Logger } from '../core/logger.js';
 import type { AppConfig, ChatMessage } from '../core/types.js';
-import { contentToText } from '../core/types.js';
 import type { MemoryStore, MessageRow, SummaryRow } from '../memory/store.js';
 import { estimateTokens } from '../memory/store.js';
-import type { ProviderManager } from '../llm/manager.js';
+import { inputTokens, messageTokens } from './tokens.js';
+import {messageLinks} from '../pipeline/window.js';
 
 export interface BuildContextParams {
+  replyWindowStartId?: number;
+  replyWindowRows?: MessageRow[];
+  currentMessageContext?: string;
+  requestedOutputTokens?: number;
+  reduceSystemPrompt?: (maxTokens: number) => string;
+  ambientMessageRowIds?: number[];
+  excludeMessageRowIds?: number[];
+  conversationId?: string;
+  historyCutoffId?: number;
+  triggerMessageRowId?: number;
   scope: string;
   /** 用户 QQ */
   userId: number;
@@ -36,6 +46,7 @@ export interface BuildContextParams {
    * 它们只存在于本次请求，不落库。
    */
   personaExamples?: Array<{ user: string; assistant: string }>;
+  currentPersona?: {id:string;fingerprint:string};
   /**
    * 本轮随消息一起发来的图片。
    * 会挂到本轮用户消息上，变成多模态 content；
@@ -48,15 +59,8 @@ export interface BuildContextParams {
   images?: Array<{ type: 'image'; mimeType: string; data: string; note?: string }>;
 }
 
-/**
- * 单张图片的 token 估算。
- *
- * DeepSeek 官方文档《图像理解》给出的上限是**每张图最多 1024 token**
- * （图片会被缩放，2000×2000 与 5000×5000 消耗相同）。
- * 这里按 1024 估算 —— 对 DeepSeek 是精确值，对其他厂商是偏保守的估计，
- * 宁可少放一点历史，也不要因为图片导致请求超限被拒。
- */
-export const IMAGE_TOKEN_ESTIMATE = 1024;
+/** 图片输入保守估算，真实用量随供应商变化；当前默认缩放上限为 2048 像素。 */
+export const IMAGE_TOKEN_ESTIMATE = 4096;
 
 export interface BuildContextResult {
   messages: ChatMessage[];
@@ -79,6 +83,9 @@ export interface BuildContextResult {
 }
 
 export class ContextBuilder {
+  snapshot(config: AppConfig['context'], memory: AppConfig['memory']): ContextBuilder {
+    return new ContextBuilder(config, memory, this.store, this.log);
+  }
   constructor(
     private readonly cfg: AppConfig['context'],
     private readonly memCfg: AppConfig['memory'],
@@ -87,144 +94,64 @@ export class ContextBuilder {
   ) {}
 
   /** 计算某模型的 token 预算 */
-  budget(contextWindow: number): number {
+  budget(contextWindow: number, outputTokens = this.cfg.reserveForReply): number {
     const usable = Math.min(contextWindow, this.cfg.modelContextWindow || contextWindow);
-    return Math.max(512, Math.floor(usable * this.cfg.maxTokensRatio) - this.cfg.reserveForReply);
+    const output = Math.min(outputTokens, Math.max(1, Math.floor(usable / 2)));
+    return Math.max(0, Math.floor(usable * this.cfg.maxTokensRatio) - output);
   }
 
-  /**
-   * 构建送给模型的完整消息列表
-   */
   build(params: BuildContextParams): BuildContextResult {
-    const budget = this.budget(params.contextWindow);
-    const systemTokens = estimateTokens(params.systemPrompt);
-    const userTokens = estimateTokens(params.userMessage);
-    const ambientTokens = params.ambientContext ? estimateTokens(params.ambientContext) : 0;
-
-    // ---- 人格预设对话（few-shot）----
-    // 用预算换人格稳定性：示例也计入 token 开销，太贵就自动截断条数。
-    const exampleMsgs: ChatMessage[] = [];
-    if (params.personaExamples && params.personaExamples.length > 0) {
-      const maxExamples = 4; // 最多 4 轮，避免示例把上下文挤满
-      for (const ex of params.personaExamples.slice(0, maxExamples)) {
-        if (!ex?.user || !ex?.assistant) continue;
-        exampleMsgs.push({ role: 'user', content: ex.user });
-        exampleMsgs.push({ role: 'assistant', content: ex.assistant });
-      }
-    }
-    const exampleTokens = exampleMsgs.reduce((a, m) => a + estimateTokens(contentToText(m.content)), 0);
-
-    // 留给历史的额度（示例与图片优先于历史：宁可少放历史也要保住风格与图片）
-    const imageTokens = (params.images?.length ?? 0) * IMAGE_TOKEN_ESTIMATE;
-    let historyBudget = budget - systemTokens - userTokens - ambientTokens - exampleTokens - imageTokens;
-
-    const messages: ChatMessage[] = [{ role: 'system', content: params.systemPrompt }];
-
-    // 群聊环境上下文（其他人最近说的话）作为一条 system 补充
+    const budget = this.budget(params.contextWindow, params.requestedOutputTokens);
+    const notes = params.images?.map((im, i) => im.note ? (i + 1) + '. ' + im.note : '').filter(Boolean) ?? [];
+    const userText = (params.currentMessageContext ? params.currentMessageContext + '\n' : '') + params.userMessage + (notes.length ? '\n【图片来源，按顺序】\n' + notes.join('\n') : '');
+    const current: ChatMessage = { role: 'user', content: params.images?.length
+      ? [{ type: 'text', text: userText }, ...params.images.map(({ note: _note, ...im }) => im)] : userText };
+    let systemPrompt = params.systemPrompt;
+    const available = budget - inputTokens([current]) - 4;
+    if (estimateTokens(systemPrompt) > available && params.reduceSystemPrompt) systemPrompt = params.reduceSystemPrompt(available);
+    const system: ChatMessage = { role: 'system', content: systemPrompt };
+    if (inputTokens([system, current]) > budget) throw new Error('人格和本轮输入超过上下文预算，无法安全裁剪');
+    const messages: ChatMessage[] = [system];
+    let ambientTokens = 0;
     if (params.ambientContext) {
-      messages.push({ role: 'system', content: params.ambientContext });
+      const ambient: ChatMessage = { role: 'system', content: params.ambientContext };
+      if (inputTokens([...messages, ambient, current]) <= budget) { messages.push(ambient); ambientTokens = messageTokens(ambient); }
     }
-
-    // 预设对话紧跟 system，作为最早的真实轮次
-    messages.push(...exampleMsgs);
-
-    // ---- 历史消息 ----
-    // 多取一些候选，再按预算从新到旧纳入
-    const recentLimit = Math.max(this.memCfg.recentTurns * 2, 30);
-    const candidates = this.store
-      .getRecentMessages(params.scope, recentLimit)
-      .filter((m) => !(m.role === 'user' && m.content === params.userMessage && m.id === this.lastUserMsgId(params.scope)));
-
-    const included: MessageRow[] = [];
-    let used = 0;
+    const windowReserve = (params.replyWindowRows ?? []).filter(row => row.id !== params.triggerMessageRowId && !params.excludeMessageRowIds?.includes(row.id))
+      .reduce((sum,row)=>sum+estimateTokens(row.content)+96,0);
+    for (const example of (params.personaExamples ?? []).slice(0, 4)) {
+      const pair: ChatMessage[] = [{ role: 'user', content: example.user }, { role: 'assistant', content: example.assistant }];
+      if (inputTokens([...messages, ...pair, current]) + windowReserve <= budget) messages.push(...pair);
+    }
+    const older = this.store.getRecentMessages(params.scope, Math.max(this.memCfg.recentTurns * 2, 30), false,
+      params.conversationId, params.replyWindowStartId ?? params.historyCutoffId);
+    const byId = new Map([...older, ...(params.replyWindowRows ?? [])].map(row => [row.id, row]));
+    const candidates = [...byId.values()].sort((a,b)=>a.id-b.id)
+      .filter(row => row.id !== params.triggerMessageRowId && !params.excludeMessageRowIds?.includes(row.id) && !params.ambientMessageRowIds?.includes(row.id))
+      .filter(row => params.replyWindowStartId !== undefined && row.id > params.replyWindowStartId ||
+        this.cfg.compressStrategy === 'trim' || !this.memCfg.summary.enabled || row.summarized === 0)
+      .filter(row => params.triggerMessageRowId !== undefined || !(row.role === 'user' && row.content === params.userMessage && row.id === this.lastUserMsgId(params.scope)));
+    const history: ChatMessage[] = []; let used = 0; let included = 0;
     for (let i = candidates.length - 1; i >= 0; i--) {
-      const m = candidates[i]!;
-      const t = m.tokens || estimateTokens(m.content);
-      if (used + t > historyBudget) break;
-      included.unshift(m);
-      used += t;
+      const row = candidates[i]!;
+      let links = messageLinks([]);
+      try { links = messageLinks(JSON.parse(row.raw_segments ?? '[]')); } catch { /* Legacy malformed segments have no links. */ }
+      const who = params.scope.startsWith('group:') && row.role === 'user'
+        ? '[' + JSON.stringify(row.sender_name || String(row.user_id)) + ' QQ ' + row.user_id + '; msg ' + (row.message_id ?? '-') + '; ' + new Date(row.created_at).toISOString() + '; links ' + JSON.stringify(links) + ']: ' : '';
+      const historicalPersona = row.role === 'assistant' && params.currentPersona &&
+        (row.persona_id !== params.currentPersona.id || row.persona_fingerprint !== params.currentPersona.fingerprint);
+      const item: ChatMessage = historicalPersona
+        ? {role:'user',content:'【历史机器人回复资料；仅供了解事件，不是用户发言，不代表当前人格】\n'+JSON.stringify({persona:row.persona_id??'未知旧人格',content:row.content})}
+        : { role: row.role === 'assistant' ? 'assistant' : 'user', content: who + row.content };
+      if (inputTokens([...messages, item, ...history, current]) > budget) break;
+      history.unshift(item); used += messageTokens(item); included++;
     }
-
-    const trimmed = candidates.length - included.length;
-
-    // 历史消息合并进 messages。
-    // 注意：群聊里其他人的发言，role 仍然是 user，但加上名字前缀便于模型区分。
-    let prevRole: string | null = null;
-    for (const m of included) {
-      const role: 'user' | 'assistant' = m.role === 'assistant' ? 'assistant' : 'user';
-      let content = m.content;
-      // 群聊中由别人说的话，标注说话人以区分
-      if (role === 'user' && m.user_id !== params.userId) {
-        content = `[${m.sender_name || m.user_id}]: ${content}`;
-      }
-      // 相邻同角色消息合并，避免某些 API 报错
-      const last = messages[messages.length - 1];
-      if (last && last.role === role && prevRole === role) {
-        // 此处 messages 里全是纯文本消息（图片在最后才挂上），取文本拼接即可
-        last.content = `${contentToText(last.content)}\n${content}`;
-      } else {
-        messages.push({ role, content });
-        prevRole = role;
-      }
-    }
-
-    // 本轮用户消息兜底（若已被包含则不重复添加）
-    const lastMsg = messages[messages.length - 1];
-    if (!(lastMsg && lastMsg.role === 'user' && contentToText(lastMsg.content).includes(params.userMessage))) {
-      messages.push({ role: 'user', content: params.userMessage });
-    }
-
-    // ---- 把图片挂到本轮用户消息上 ----
-    if (params.images && params.images.length > 0) {
-      const target = messages[messages.length - 1];
-      if (target && target.role === 'user') {
-        let text = typeof target.content === 'string' ? target.content : contentToText(target.content);
-
-        // 有来源标注时先列一份清单，让模型知道每张图分别是谁发的、按什么顺序。
-        // 不回填的话，多张历史图片全挤在最后一条消息上，模型会以为都是同一人发的。
-        const notes = params.images.map((im, i) => (im.note ? `${i + 1}. ${im.note}` : '')).filter(Boolean);
-        if (notes.length > 0) {
-          text += `\n\n【随这条消息一起附上的图片，按顺序】\n${notes.join('\n')}`;
-        }
-
-        const parts = params.images.map((im) => {
-          const part: { type: 'image'; mimeType: string; data: string } = {
-            type: 'image',
-            mimeType: im.mimeType,
-            data: im.data,
-          };
-          return part;
-        });
-        target.content = [{ type: 'text', text }, ...parts];
-      }
-    }
-
-    // 记录摘要使用情况
-    const summaries = this.store.getSummaries(params.scope, undefined, 20);
-
-    const totalTokens = messages.reduce((acc, m) => acc + estimateTokens(contentToText(m.content)), 0);
-
-    if (trimmed > 0) {
-      this.log.debug(
-        { scope: params.scope, trimmed, included: included.length, budget },
-        '上下文已裁剪',
-      );
-    }
-
-    return {
-      messages,
-      stats: {
-        systemTokens,
-        historyTokens: used,
-        ambientTokens,
-        totalTokens,
-        budget,
-        includedMessages: included.length,
-        trimmedMessages: trimmed,
-        usedSummaries: summaries.length,
-        compressionTriggered: trimmed > 0,
-      },
-    };
+    messages.push(...history, current);
+    const trimmed = candidates.length - included;
+    return { messages, stats: { systemTokens: messageTokens(system), historyTokens: used, ambientTokens,
+      totalTokens: inputTokens(messages), budget, includedMessages: included, trimmedMessages: trimmed,
+      usedSummaries: this.store.getSummaries(params.scope, undefined, 20, params.conversationId).length,
+      compressionTriggered: trimmed > 0 } };
   }
 
   private lastUserMsgId(scope: string): number {
@@ -235,9 +162,15 @@ export class ContextBuilder {
   /**
    * 是否需要压缩：未摘要消息数超过阈值
    */
-  shouldCompress(scope: string): boolean {
-    if (!this.memCfg.summary.enabled) return false;
-    return this.store.countUnsummarized(scope) >= this.memCfg.summary.triggerMessages;
+  shouldCompress(scope: string, conversationId?: string, tokenPressure = false): boolean {
+    if (!this.memCfg.summary.enabled || this.cfg.compressStrategy === 'trim') return false;
+    return tokenPressure || this.store.countUnsummarized(scope, conversationId) >= this.memCfg.summary.triggerMessages
+      || this.cfg.compressStrategy === 'layered' && this.hasMergeWork(scope, conversationId);
+  }
+
+  private hasMergeWork(scope: string, conversationId?: string): boolean {
+    for (let level = 1; level < this.memCfg.summary.maxLevel; level++) if (this.store.countSummaries(scope, level, conversationId) >= 8) return true;
+    return false;
   }
 
   /**
@@ -249,26 +182,35 @@ export class ContextBuilder {
   async compress(
     scope: string,
     summarize: (messages: MessageRow[]) => Promise<string>,
+    conversationId = this.store.currentConversationId(scope),
+    cutoffId = Number.MAX_SAFE_INTEGER,
   ): Promise<{ ok: boolean; summarized: number; summaryId?: number; error?: string }> {
-    const all = this.store.getUnsummarizedMessages(scope, 400);
+    if (this.cfg.compressStrategy === 'trim' || !this.memCfg.summary.enabled) return { ok: false, summarized: 0, error: '压缩策略不生成摘要' };
+    const all = this.store.getUnsummarizedMessages(scope, 400, conversationId, cutoffId);
     const keep = this.memCfg.summary.keepRecentTurns * 2;
-
-    // 保留最近 keep 条不压缩
-    const toCompress = all.slice(0, Math.max(0, all.length - keep));
+    const recent = this.store.getRecentMessages(scope, Math.min(2000, keep * 4 + 40), false, conversationId, cutoffId);
+    const starts = recent.flatMap((row, i) => row.role === 'user' && (i === 0 || recent[i - 1]?.role === 'assistant') ? [row.id] : []);
+    const recentBoundary = starts.length > 1 ? starts[Math.max(0, starts.length - this.memCfg.summary.keepRecentTurns)]!
+      : recent[Math.max(0, recent.length - keep)]?.id ?? Number.MAX_SAFE_INTEGER;
+    const toCompress = all.filter(row => row.id < recentBoundary);
     if (toCompress.length < 4) {
+      if (this.cfg.compressStrategy === 'layered' && this.hasMergeWork(scope, conversationId)) {
+        try { await this.mergeSummaries(scope, summarize, conversationId); return { ok: true, summarized: 0 }; }
+        catch (error) { return { ok: false, summarized: 0, error: (error as Error).message }; }
+      }
       return { ok: false, summarized: 0, error: '待压缩消息过少' };
     }
 
     try {
-      const summaryText = await summarize(toCompress);
+      const previous = this.cfg.compressStrategy === 'summary' ? this.store.getSummaries(scope, undefined, 50, conversationId) : [];
+      const pseudo = previous.map(row => ({ ...toCompress[0]!, id: row.id, user_id: 0, role: 'user' as const, sender_name: '已有摘要', content: row.content }));
+      const summaryText = await summarize([...pseudo, ...toCompress]);
       if (!summaryText.trim()) {
         return { ok: false, summarized: 0, error: '摘要生成结果为空' };
       }
 
-      const fromId = toCompress[0]!.id;
-      const toId = toCompress[toCompress.length - 1]!.id;
-      const summaryId = this.store.addSummary(scope, 1, summaryText.trim(), fromId, toId, toCompress.length);
-      this.store.markSummarized(toCompress.map((m) => m.id));
+      if (!this.store.getConversation(conversationId)) return { ok: false, summarized: 0, error: '话题已删除' };
+      const summaryId = this.store.commitSummary(scope, conversationId, 1, summaryText.trim(), toCompress.map(row => row.id), previous.map(row => row.id));
 
       this.log.info(
         { scope, count: toCompress.length, summaryTokens: estimateTokens(summaryText), summaryId },
@@ -276,7 +218,7 @@ export class ContextBuilder {
       );
 
       // 尝试把过多的 L1 摘要进一步压成 L2
-      void this.mergeSummaries(scope, summarize);
+      if (this.cfg.compressStrategy === 'layered') await this.mergeSummaries(scope, summarize, conversationId);
 
       return { ok: true, summarized: toCompress.length, summaryId };
     } catch (e) {
@@ -291,12 +233,14 @@ export class ContextBuilder {
   private async mergeSummaries(
     scope: string,
     summarize: (messages: MessageRow[]) => Promise<string>,
+    conversationId: string,
   ): Promise<void> {
     for (let level = 1; level < this.memCfg.summary.maxLevel; level++) {
-      const count = this.store.countSummaries(scope, level);
-      if (count < 8) return;
+      if (!this.store.getConversation(conversationId)) return;
+      const count = this.store.countSummaries(scope, level, conversationId);
+      if (count < 8) continue;
 
-      const list = this.store.getSummaries(scope, level, 8);
+      const list = this.store.getSummaries(scope, level, 8, conversationId);
       if (list.length < 2) return;
 
       // 把旧摘要伪造成 MessageRow 以便复用 summarize
@@ -325,11 +269,12 @@ export class ContextBuilder {
       try {
         const merged = await summarize(pseudo);
         if (!merged.trim()) return;
-        this.store.addSummary(scope, level + 1, merged.trim(), null, null, list.length);
+        if (!this.store.getConversation(conversationId)) return;
+        this.store.commitSummary(scope, conversationId, level + 1, merged.trim(), [], list.map(row => row.id));
         this.log.info({ scope, level: level + 1, mergedFrom: list.length }, '摘要已递归压缩到更高层级');
       } catch (e) {
         this.log.debug({ err: (e as Error).message }, '摘要递归压缩失败（非致命）');
-        return;
+        throw e;
       }
     }
   }
@@ -340,11 +285,8 @@ export class ContextBuilder {
     const list = this.store.getSummaries(scope, undefined, 20);
     // 高层级摘要优先（信息密度更高）
     const sorted = list.slice().sort((a, b) => b.level - a.level || a.created_at - b.created_at);
-    const seenLevels = new Set<number>();
     for (const s of sorted) {
       if (out.length >= maxLevels) break;
-      if (seenLevels.has(s.level)) continue;
-      seenLevels.add(s.level);
       out.push(s.content);
     }
     return out;
@@ -361,12 +303,13 @@ export const SUMMARY_SYSTEM_PROMPT = `你是一个对话摘要器。把给定的
 2. 保留说话人的身份对应关系（谁说了什么）。
 3. 省略寒暄、重复内容和无信息量的对话。
 4. 用第三人称陈述，不要写成对话形式。
-5. 控制在 200 字以内，用短句分条，每条一行，以「- 」开头。
-6. 直接输出摘要，不要任何前言或解释。`;
+5. 根据输入量保留约定、目标、人物和未完成事项；通常用 400~1200 字，简短输入可以更短。不要为压到固定字数而删除关键约定。用短句分条，每条一行，以「- 」开头。
+6. 机器人自称、角色设定和表演不能记录成用户事实，也不能作为以后人格的设定；必要时明确注明是历史机器人所说。
+7. 直接输出摘要，不要任何前言或解释。`;
 
 export function buildSummaryUserPrompt(messages: MessageRow[]): string {
   const lines = messages.map((m) => {
-    const who = m.role === 'assistant' ? 'AI' : m.sender_name || String(m.user_id);
+    const who = m.role === 'assistant' ? 'AI（历史人格：'+(m.persona_id??'未知')+'）' : m.sender_name || String(m.user_id);
     const emo = m.emotion_label && m.emotion_label !== 'neutral' ? `（情绪:${m.emotion_label}）` : '';
     return `${who}: ${m.content}${emo}`;
   });

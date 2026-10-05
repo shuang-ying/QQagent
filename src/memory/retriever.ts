@@ -64,6 +64,7 @@ export function extractQueryTerms(text: string): string {
 }
 
 export class MemoryRetriever {
+  snapshot(config: AppConfig['memory']): MemoryRetriever { return new MemoryRetriever(this.store, config, this.log, this.semantic); }
   constructor(
     private readonly store: MemoryStore,
     private readonly cfg: AppConfig['memory'],
@@ -76,7 +77,7 @@ export class MemoryRetriever {
    * 检索与当前消息相关的记忆（同步、纯关键词）。
    * 需要语义检索时用 retrieveMerged()。
    */
-  retrieve(scope: string, userId: number, query: string): RetrievalResult {
+  retrieve(scope: string, userId: number, query: string, conversationId?: string): RetrievalResult {
     const queryTerms = extractQueryTerms(query);
     const limit = this.cfg.retrieval.limit;
     const mode = this.cfg.retrieval.crossScopeSharing;
@@ -87,36 +88,8 @@ export class MemoryRetriever {
     let sharedCount = 0;
 
     if (queryTerms) {
-      // 1) 本会话的相关事实
-      const localFacts = this.store.searchFacts(userId, queryTerms, {
-        scope,
-        limit: Math.ceil(limit / 2),
-        halfLifeDays: this.cfg.retrieval.timeDecayHalfLifeDays,
-      });
-      for (const f of localFacts) {
-        factTexts.push(f.content);
-        hitIds.push(f.id);
-        localCount++;
-      }
-
-      // 2) 跨会话共享的事实（按策略过滤）
-      if (mode !== 'none') {
-        const shared = this.store.searchFacts(userId, queryTerms, {
-          shareableOnly: true,
-          limit: Math.ceil(limit / 2),
-          halfLifeDays: this.cfg.retrieval.timeDecayHalfLifeDays,
-        });
-        for (const f of shared) {
-          if (f.scope === scope) continue; // 已包含
-          if (mode === 'identity-facts' && f.shareable !== 1) continue;
-          // 避免与本地事实重复
-          if (factTexts.includes(f.content)) continue;
-          // 加来源提示，让模型知道这是别处学到的（但不暴露具体群名）
-          factTexts.push(f.content);
-          hitIds.push(f.id);
-          sharedCount++;
-        }
-      }
+      const selected = this.store.searchFacts(userId,queryTerms,{scope,sharing:mode,shareableOnly:mode==='identity-facts',limit,halfLifeDays:this.cfg.retrieval.timeDecayHalfLifeDays});
+      for (const f of selected) { factTexts.push(f.content); hitIds.push(f.id); if (f.scope===scope) localCount++; else sharedCount++; }
     }
 
     // 3) 无查询词时，取置信度最高的长期事实兜底
@@ -124,10 +97,11 @@ export class MemoryRetriever {
       const top = this.store.getFactsByUser(userId, {
         scope,
         shareableOnly: mode === 'identity-facts',
+        sharing: mode,
         limit: 8,
       });
       for (const f of top) {
-        if (mode === 'identity-facts' && f.scope !== scope && f.shareable !== 1) continue;
+
         factTexts.push(f.content);
         hitIds.push(f.id);
       }
@@ -136,7 +110,7 @@ export class MemoryRetriever {
 
     // 4) 摘要
     const summaries = this.store
-      .getSummaries(scope, undefined, 20)
+      .getSummaries(scope, undefined, 20, conversationId)
       .slice()
       .sort((a, b) => b.level - a.level || a.created_at - b.created_at)
       .slice(0, 3)
@@ -165,15 +139,16 @@ export class MemoryRetriever {
    * 语义检索是可选的：未配置 embedding 模型、或调用失败时，
    * 行为与 retrieve() 完全一致（不会报错，也不会变慢太多）。
    */
-  async retrieveMerged(scope: string, userId: number, query: string): Promise<RetrievalResult> {
-    const base = this.retrieve(scope, userId, query);
+  async retrieveMerged(scope: string, userId: number, query: string, conversationId?: string, config?: AppConfig['memory']): Promise<RetrievalResult> {
+    if (config) return new MemoryRetriever(this.store, config, this.log, this.semantic).retrieveMerged(scope, userId, query, conversationId);
+    const base = this.retrieve(scope, userId, query, conversationId);
 
     if (!this.semantic || !this.cfg.retrieval.semantic) return base;
     if (!this.semantic.isConfigured()) return base;
 
     try {
       // 顺带把还没算向量的事实补上（有上限，best-effort）
-      await this.semantic.backfill(userId);
+      this.semantic.requestBackfill(userId);
 
       const mode = this.cfg.retrieval.crossScopeSharing;
       const limit = this.cfg.retrieval.limit;
@@ -186,30 +161,13 @@ export class MemoryRetriever {
 
       if (hits.length === 0) return base;
 
-      const facts = [...base.facts];
-      const hitIds = [...base.hitIds];
-      let added = 0;
-
-      for (const h of hits) {
-        if (facts.includes(h.content)) continue;
-        if (facts.length >= limit) break;
-        facts.push(h.content);
-        hitIds.push(h.id);
-        added++;
-      }
-
-      if (added === 0) return base;
-
-      this.log.debug({ scope, semanticHits: hits.length, added }, '语义检索补充了记忆');
-
-      if (hitIds.length > 0) this.store.markFactsHit(hitIds);
-
-      return {
-        ...base,
-        facts,
-        hitIds,
-        stats: { ...base.stats, semanticHits: added } as RetrievalResult['stats'],
-      };
+      const ranks = new Map<number, { content: string; score: number }>();
+      base.hitIds.forEach((id, rank) => { const row = this.store.db.prepare('SELECT content FROM memory_facts WHERE id=?').get(id) as { content: string } | undefined; if (row) ranks.set(id, { content: row.content, score: 1 / (60 + rank + 1) }); });
+      hits.forEach((hit, rank) => { const existing = ranks.get(hit.id); ranks.set(hit.id, { content: hit.content, score: (existing?.score ?? 0) + 1 / (60 + rank + 1) }); });
+      const selected = [...ranks].sort((a,b) => b[1].score-a[1].score || a[0]-b[0]).slice(0,limit);
+      const hitIds = selected.map(([id]) => id);
+      this.store.markFactsHit(hitIds.filter(id => !base.hitIds.includes(id)));
+      return { ...base, facts: dedupe(selected.map(([,row]) => row.content)), hitIds, stats: { ...base.stats, semanticHits: hitIds.filter(id => !base.hitIds.includes(id)).length } };
     } catch (e) {
       this.log.debug({ err: (e as Error).message }, '语义检索失败，使用关键词结果');
       return base;
@@ -220,7 +178,7 @@ export class MemoryRetriever {
    * 用户档案：身份类事实的稳定汇总，用于让 AI"认识"这个人
    */
   buildUserProfile(userId: number, scope: string): string {
-    const facts = this.store.getFactsByUser(userId, { scope, shareableOnly: true, limit: 30 });
+    const facts = this.store.getFactsByUser(userId, { scope, shareableOnly: this.cfg.retrieval.crossScopeSharing === 'identity-facts', sharing: this.cfg.retrieval.crossScopeSharing, limit: 30 });
     const byType = new Map<string, FactRow[]>();
     for (const f of facts) {
       const list = byType.get(f.fact_type) ?? [];

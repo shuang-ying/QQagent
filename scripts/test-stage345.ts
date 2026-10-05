@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer } from 'ws';
 import { loadConfig, resolveApiKey, migrateLegacyAppConfig, type LoadedConfig } from '../src/config/loader.js';
 import { getLogger } from '../src/core/logger.js';
 import { MemoryStore, estimateTokens } from '../src/memory/store.js';
@@ -360,7 +360,7 @@ function testMemory(store: MemoryStore): void {
 
   // 长期事实 + 跨会话共享策略
   const f1 = store.addFact({ userId: uid, scope: scopeA, factType: 'identity', content: '用户是后端工程师', keywords: '后端 工程师 职业', shareable: true });
-  const f2 = store.addFact({ userId: uid, scope: scopeA, factType: 'preference', content: '用户喜欢喝无糖可乐', keywords: '无糖 可乐 喜欢', shareable: true });
+  store.addFact({ userId: uid, scope: scopeA, factType: 'preference', content: '用户喜欢喝无糖可乐', keywords: '无糖 可乐 喜欢', shareable: true });
   const f3 = store.addFact({ userId: uid, scope: scopeA, factType: 'event', content: '用户在A群说了个秘密', keywords: '秘密', shareable: false });
 
   check('事实落库', store.getFactsByUser(uid).length === 3);

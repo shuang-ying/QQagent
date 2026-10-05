@@ -22,7 +22,7 @@ export class TriggerPolicy {
 
   constructor(
     private readonly cfg: AppConfig['trigger'],
-    private readonly log: Logger,
+    _log: Logger,
   ) {}
 
   private getState(scope: string): CooldownState {
@@ -64,17 +64,24 @@ export class TriggerPolicy {
    * 命令是在管线之前处理的，如果只在这里拦住普通消息，
    * 被拉黑的人仍然可以用 /forget、/persona 等命令操作。
    */
-  checkUser(userId: number): { allowed: boolean; reason?: string } {
+  checkUser(userId: number, command = false): { allowed: boolean; reason?: string } {
     if (this.cfg.denyUsers.includes(userId)) {
       return { allowed: false, reason: '用户在黑名单中' };
     }
-    if (this.cfg.allowUsers.length > 0 && !this.cfg.allowUsers.includes(userId)) {
+    if (!command && this.cfg.allowUsers.length > 0 && !this.cfg.allowUsers.includes(userId)) {
       return { allowed: false, reason: '用户不在白名单中' };
     }
     return { allowed: true };
   }
 
   /** 群级准入检查（群白名单非空时生效） */
+  checkMessage(msg: InboundMessage, command = false): { allowed: boolean; reason?: string } {
+    const user = this.checkUser(msg.userId, command);
+    if (!user.allowed) return user;
+    if (this.cfg.group.ignoreSelf && msg.userId === msg.selfId) return { allowed: false, reason: '机器人自身消息' };
+    return msg.scopeType === 'group' ? this.checkGroup(msg.groupId) : { allowed: true };
+  }
+
   checkGroup(groupId: number | undefined): { allowed: boolean; reason?: string } {
     const list = this.cfg.group.enabledGroups;
     if (list.length === 0) return { allowed: true };
@@ -135,7 +142,7 @@ export class TriggerPolicy {
     return this.decideGroup(msg, text);
   }
 
-  private decidePrivate(msg: InboundMessage, text: string): TriggerDecision {
+  private decidePrivate(_msg: InboundMessage, text: string): TriggerDecision {
     const mode = this.cfg.private;
     if (mode === 'always') {
       return { reply: true, reason: '私聊默认回复', text, direct: true };
@@ -161,18 +168,21 @@ export class TriggerPolicy {
       return { reply: false, reason: '群不在白名单中' };
     }
 
-    // 冷却中的话，只记录不回复
+    if (msg.mentionsBot || msg.repliesToBot) {
+      return { reply: true, reason: msg.repliesToBot ? '引用了机器人' : '@了机器人', text: stripMention(text), direct: true };
+    }
+    // 直接提问优先；冷却只限制非直接参与。
     if (this.isCoolingDown(msg.scope)) {
       return { reply: false, reason: '会话冷却中' };
     }
-    if (this.inFlight(msg.scope) >= g.maxConcurrent) {
-      return { reply: false, reason: '该会话并发生成已达上限' };
-    }
+    // 会话串行与入队预约由 SessionScheduler 统一约束，避免在队外检查产生竞态。
 
     // @机器人 一定回复
     if (msg.mentionsBot) {
       return { reply: true, reason: '@了机器人', text: stripMention(text), direct: true };
     }
+
+    if (g.requireAt) return { reply: false, reason: '群聊要求明确@机器人' };
 
     // 关键词触发
     const kw = g.keywords.find((k) => k && text.includes(k));

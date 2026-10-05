@@ -8,9 +8,10 @@
  *  - memory_facts 长期事实，带 scope 与共享标记（决定是否跨群可见）
  *  - summaries 分层摘要，支持 L1/L2/L3 递归压缩
  */
+import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -175,6 +176,15 @@ CREATE TABLE IF NOT EXISTS summaries (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sum_scope_level ON summaries(scope, level, created_at DESC);
+CREATE TABLE IF NOT EXISTS summary_sources (
+  summary_id INTEGER NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  PRIMARY KEY(summary_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS summary_coverage (
+  child_id INTEGER PRIMARY KEY REFERENCES summaries(id) ON DELETE CASCADE,
+  parent_id INTEGER NOT NULL REFERENCES summaries(id) ON DELETE CASCADE
+);
 
 -- ============================================================
 -- 用户情绪状态：EMA 平滑后的当前情绪
@@ -239,6 +249,27 @@ CREATE INDEX IF NOT EXISTS idx_proactive ON proactive_log(scope, created_at DESC
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- 独立投递记录，不进入聊天上下文；加表兼容旧库，无破坏性迁移。
+CREATE TABLE IF NOT EXISTS media_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL, conversation_id TEXT NOT NULL,
+  source_row_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, message_id INTEGER,
+  image_index INTEGER NOT NULL, metadata TEXT NOT NULL, created_at INTEGER NOT NULL,
+  UNIQUE(conversation_id, source_row_id, image_index)
+);
+CREATE TABLE IF NOT EXISTS sticker_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, file TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sticker_usage ON sticker_usage(scope,created_at DESC);
+CREATE TABLE IF NOT EXISTS reply_deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pieces TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 `;
 
@@ -370,23 +401,26 @@ function migrateToConversations(db: DatabaseSync): void {
 /** 初始化数据库并返回连接 */
 export function initDatabase(dbPath: string): DatabaseSync {
   const db = new DatabaseSync(dbPath);
-  db.exec(SCHEMA_SQL);
-
-  // 老库升级（新库也会跑一遍，但不会有副作用）
   try {
-    migrateToConversations(db);
-  } catch (e) {
-    // 迁移失败不应该让程序起不来：记录后继续，功能退化为"单话题"
-    console.error('[memory] 会话/对话迁移失败（将退化为单话题模式）:', (e as Error).message);
-  }
-
-  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as
-    | { value: string }
-    | undefined;
-  if (!row) {
-    db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
-  } else if (row.value !== String(SCHEMA_VERSION)) {
-    db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(String(SCHEMA_VERSION), 'schema_version');
-  }
-  return db;
+    const hasMeta=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'").get();
+    const previous=hasMeta ? db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as {value:string}|undefined : undefined;
+    if (previous && Number(previous.value)>SCHEMA_VERSION) throw new Error('数据库版本高于当前程序，拒绝降级启动');
+    if (dbPath!==':memory:' && fs.existsSync(dbPath) && fs.statSync(dbPath).size>0 && Number(previous?.value??0)<SCHEMA_VERSION) db.prepare('VACUUM INTO ?').run(dbPath+'.pre-v'+SCHEMA_VERSION+'.'+Date.now()+'.bak');
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE');
+    try {
+      db.exec(SCHEMA_SQL.replace(/PRAGMA[^;]+;/g,''));
+      addColumnIfMissing(db,'messages','persona_id','TEXT');
+      addColumnIfMissing(db,'messages','persona_fingerprint','TEXT');
+      addColumnIfMissing(db,'memory_facts','active','INTEGER NOT NULL DEFAULT 1');
+      addColumnIfMissing(db,'memory_facts','replaces_id','INTEGER');
+      addColumnIfMissing(db,'memory_facts','private','INTEGER NOT NULL DEFAULT 0');
+      addColumnIfMissing(db,'fact_embeddings','source_content',"TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db,'fact_embeddings','content_hash',"TEXT NOT NULL DEFAULT ''");
+      db.exec('CREATE TABLE IF NOT EXISTS fact_cursors (user_id INTEGER NOT NULL, conversation_id TEXT NOT NULL, last_id INTEGER NOT NULL, PRIMARY KEY(user_id,conversation_id)); CREATE TABLE IF NOT EXISTS memory_forgetting (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, source_msg_id INTEGER, cutoff INTEGER NOT NULL, created_at INTEGER NOT NULL)');
+      migrateToConversations(db);
+      db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('schema_version',String(SCHEMA_VERSION));
+      db.exec('COMMIT');
+    } catch(e) {db.exec('ROLLBACK');throw e;}
+    return db;
+  } catch(e) {db.close();throw e;}
 }

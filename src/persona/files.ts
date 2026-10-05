@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { PersonaSchema, type Persona } from '../core/types.js';
+import {atomicWrite} from '../config/atomic.js';
 
 /** 人格 id 只允许安全字符，避免路径穿越 */
 const SAFE_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -85,7 +86,7 @@ export function writePersona(root: string, persona: Persona): string {
   ].join('\n');
 
   const file = personaFile(root, persona.id);
-  fs.writeFileSync(file, header + body, 'utf8');
+  atomicWrite(file, header + body);
   return file;
 }
 

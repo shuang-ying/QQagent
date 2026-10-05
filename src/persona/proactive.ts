@@ -20,6 +20,9 @@
  * 靠每 5 分钟轮询一次根本数不准，而且最多要等 5 分钟才反应。
  */
 import type { Logger } from '../core/logger.js';
+import type { Persona } from '../core/types.js';
+import {assessRelevance} from './relevance.js';
+import type {RelevanceResult} from './relevance.js';
 import type { AppConfig } from '../core/types.js';
 import type { MemoryStore } from '../memory/store.js';
 import { isQuietHour } from '../persona/trigger.js';
@@ -50,6 +53,10 @@ export class ProactiveSpeaker {
     private readonly cfg: AppConfig['proactive'],
     private readonly store: MemoryStore,
     private readonly log: Logger,
+    private readonly context?: {
+      resolvePersona: (scope: string, userId: number) => Persona;
+      sharing: () => AppConfig['memory']['retrieval']['crossScopeSharing'];
+    },
   ) {}
 
   /**
@@ -173,13 +180,10 @@ export class ProactiveSpeaker {
    * 把「收集 recentMessages / 算相关度 / 取计数 / 决定」这一整套收在一个方法里，
    * 调用方（index.ts）只需要传 scope 和 targetId，避免调度逻辑散进消息处理里。
    *
-   * 关于并发：本方法**全程同步**，JS 单线程模型保证它不会被打断，
-   * 所以不需要额外的重入锁。而 index.ts 里的调用点在 `await pipeline.handle()`
-   * 之后，微任务会在下一条 WS 消息事件之前跑完 ——
-   * 也就是说每条消息对应的计数（5、6、7…）都会被逐个观察到，
-   * 不会跳过 `messagesSinceBot % N === 0` 的判定点。
+   * 评估全程同步且不发起模型调用；实际发送仍由会话调度和过时检查保护。
    */
   evaluate(scope: string, targetId: number, addressed: boolean): ProactiveDecision {
+    if (!this.cfg.enabled || this.cfg.mode === 'off') return {speak: false, reason: '主动发言已关闭'};
     const recent = this.store.getRecentMessages(scope, 10);
     const userMsgs = recent.filter((m) => m.role === 'user');
     if (userMsgs.length === 0) {
@@ -191,8 +195,9 @@ export class ProactiveSpeaker {
     const messagesSinceBot = this.store.countUserMessagesSinceLastAssistant(scope);
 
     const userIds = [...new Set(userMsgs.map((m) => m.user_id))];
-    const recentText = userMsgs.slice(-6).map((m) => m.content).join(' ');
-    const relevance = this.computeRelevance(scope, userIds, recentText);
+    const persona = this.context?.resolvePersona(scope, userMsgs.at(-1)!.user_id);
+    const evidence = assessRelevance(userMsgs, persona, this.relevanceFacts(scope, userIds));
+    const relevance = evidence.score;
 
     const decision = this.decide({
       scope,
@@ -208,9 +213,9 @@ export class ProactiveSpeaker {
       messagesSinceBot,
     });
 
-    if (!decision.speak) {
-      this.log.debug({ scope, targetId, messagesSinceBot, relevance: Number(relevance.toFixed(2)), reason: decision.reason }, '不主动发言');
-    }
+    this.log.debug({scope, targetId, messagesSinceBot, relevance: Number(relevance.toFixed(2)),
+      source: evidence.source, inherited: evidence.inherited, factIds: evidence.factIds,
+      personaId: persona?.id, speak: decision.speak, reason: decision.reason}, '主动相关性判定');
     return decision;
   }
 
@@ -220,33 +225,22 @@ export class ProactiveSpeaker {
     this.log.info({ scope, reason, preview: content.slice(0, 40) }, '💬 主动发言');
   }
 
-  /**
-   * 计算话题与记忆/人格的相关度
-   *
-   * 简化实现：用用户长期事实的关键词与群聊内容做重合度计算。
-   * 相关度高说明"大家在聊机器人知道/关心的事"，适合插话。
-   */
+  /** Pure compatibility entry point; production uses timestamped current-topic messages. */
   computeRelevance(scope: string, userIds: number[], recentText: string): number {
-    if (!recentText.trim()) return 0;
+    return this.relevanceDetails(scope, userIds, recentText).score;
+  }
 
-    // 收集这些用户的长期记忆关键词
-    const keywords = new Set<string>();
-    for (const uid of userIds.slice(0, 10)) {
-      const facts = this.store.getFactsByUser(uid, { scope, shareableOnly: true, limit: 20 });
-      for (const f of facts) {
-        for (const k of f.keywords.split(/\s+/)) {
-          if (k.length >= 2) keywords.add(k.toLowerCase());
-        }
-      }
-    }
-    if (keywords.size === 0) return 0;
+  relevanceDetails(scope: string, userIds: number[], text: string): RelevanceResult {
+    const persona = this.context?.resolvePersona(scope, userIds.at(-1) ?? 0);
+    return assessRelevance([{content: text, created_at: Date.now()}], persona, this.relevanceFacts(scope, userIds));
+  }
 
-    const text = recentText.toLowerCase();
-    let hit = 0;
-    for (const k of keywords) {
-      if (text.includes(k)) hit++;
-    }
-    // 命中比例，并做归一化（命中 3 个以上算高分）
-    return Math.min(1, hit / Math.max(3, Math.min(keywords.size, 10)));
+  private relevanceFacts(scope: string, userIds: number[]) {
+    const sharing = this.context?.sharing() ?? 'identity-facts';
+    return [...new Set(userIds)].slice(0, 10).flatMap(uid =>
+      this.store.getFactsByUser(uid, {scope, shareableOnly: sharing === 'identity-facts', sharing, limit: 20})
+        .filter(f => f.active && !f.private && f.confidence >= 0.6 &&
+          (f.scope === scope || sharing === 'full' || (sharing === 'identity-facts' && f.shareable === 1)))
+    );
   }
 }
