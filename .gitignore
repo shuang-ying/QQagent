@@ -4,7 +4,11 @@ data/
 runtime/
 logs/
 *.log
-docs/
+docs/*
+!docs/release-notes.md
+!docs/forward-messages.md
+!docs/voice-and-scheduled-tasks.md
+!docs/links-and-cards.md
 
 # 本地私密配置：含 API key，绝不外传
 config/providers.local.yaml

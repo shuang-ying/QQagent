@@ -5,6 +5,7 @@
  *   配置 -> 日志 -> 存储 -> LLM -> 人格 -> 情绪 -> 上下文 -> 管线 -> OneBot
  */
 import path from 'node:path';
+import { APP_VERSION } from './core/version.js';
 import { loadConfig, PROJECT_ROOT } from './config/loader.js';
 import { initLogger, getLogger, flushLogger } from './core/logger.js';
 import { OneBotClient } from './onebot/client.js';
@@ -27,6 +28,8 @@ import { analyzeStickers } from './persona/stickerAnalyze.js';
 import { CommandHandler } from './pipeline/commands.js';
 import { stripMention } from './persona/trigger.js';
 import { parseCommand } from './pipeline/command-permissions.js';
+import {SpeechService} from './llm/speech.js';
+import {ScheduledTasks,naturalReminder} from './tasks/scheduled.js';
 import { createServer } from './server/api.js';
 import { SemanticIndex } from './memory/semantic.js';
 import {atomicWrite,atomicWriteMany} from './config/atomic.js';
@@ -57,7 +60,7 @@ async function main(): Promise<void> {
   });
 
   log.info('========================================');
-  log.info('  🐱 QQ Agent 启动中');
+  log.info(`  🐱 QQ Agent v${APP_VERSION} 启动中`);
   log.info('========================================');
 
   // ==================== 3. 存储 ====================
@@ -204,10 +207,12 @@ async function main(): Promise<void> {
     getLogger('pipeline'),
   );
   semantic.attachQueue(pipeline.background);
-  const commands = new CommandHandler(app, store, personaMgr, getLogger('cmd'));
 
   // ==================== 9. OneBot ====================
   const napcat = new OneBotClient(app.napcat, getLogger('napcat'));
+  const speech=new SpeechService(app,providersMgr,getLogger('speech'));pipeline.attachSpeech(speech);
+  const tasks=new ScheduledTasks(app,store,providersMgr,napcat.api,trigger,getLogger('tasks'),()=>napcat.apiReady);
+  const commands = new CommandHandler(app, store, personaMgr, getLogger('cmd'),tasks);tasks.start();
   const admission = new InboundAdmission(trigger);
   const pokeEvents = new EventDeduper(1024, 2000);
 
@@ -265,18 +270,21 @@ async function main(): Promise<void> {
         // ---- 准入检查（黑白名单）----
         // 命令是在管线之前处理的，所以必须在这里也拦一次，
         // 否则被拉黑/不在白名单的人仍能用 /forget、/persona 等命令。
-        const gate = admission.admit(msg, parseCommand(msg.text) !== null);
+        const commandText=stripMention(msg.text).trim();
+        const natural=naturalReminder(commandText);
+        const commandInput=natural&&(msg.scopeType==='private'||msg.mentionsBot)?'/remind '+natural:commandText;
+        const gate = admission.admit(msg, parseCommand(commandInput) !== null);
         if (!gate.allowed) {
           log.debug({ userId: msg.userId, scope: msg.scope, reason: gate.reason }, '忽略该用户的消息');
           return;
         }
 
         // ---- 命令优先 ----
-        if (msg.text.trim().startsWith('/')) {
+        if (parseCommand(commandInput)) {
           const cmdGate = trigger.canUseCommands(msg.userId);
           const personaGate = trigger.canSwitchPersona(msg.userId);
           pipeline.flushPending(msg.scope);
-          const cmdResult = await commands.tryHandle(msg.text, {
+          const cmdResult = await commands.tryHandle(commandInput, {
             scope: msg.scope,
             scopeType: msg.scopeType,
             userId: msg.userId,
@@ -348,6 +356,8 @@ async function main(): Promise<void> {
   // ==================== 9.5 管理面板 ====================
   const startedAt = Date.now();
   const server = createServer({
+    tasks,
+    speechStatus:()=>speech.status(),
     cfg: app,
     store,
     providers: providersMgr,
@@ -616,8 +626,9 @@ async function main(): Promise<void> {
     log.info({ signal }, '正在关闭 ...');
     const panelClosed=server.stop();
     const panelReady=new Promise<boolean>(resolve=>{const timer=setTimeout(()=>resolve(false),15000);panelClosed.then(()=>{clearTimeout(timer);resolve(true);},()=>{clearTimeout(timer);resolve(false);});});
+    const tasksClosed=tasks.stop();
     napcat.removeAllListeners('message');napcat.removeAllListeners('notice');napcat.stop();
-    const [pipelineDrained,panelDrained]=await Promise.all([pipeline.shutdown(),panelReady]);
+    const [pipelineDrained,panelDrained]=await Promise.all([pipeline.shutdown(),panelReady,tasksClosed]);
     const drained=pipelineDrained && panelDrained;
     if(drained)store.close();else log.error('退出超时：任务尚未结束，保留后台恢复状态，不关闭仍可能被访问的数据库');
     await flushLogger();process.exit(drained?0:1);

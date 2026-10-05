@@ -14,9 +14,11 @@
  *  10. 异步后处理：事实抽取、上下文压缩
  */
 import type { Logger } from '../core/logger.js';
-import type { AppConfig, InboundMessage } from '../core/types.js';
+import type { AppConfig, InboundMessage, ObMessageSegment } from '../core/types.js';
+import {LinkReader} from '../llm/links.js';
+import {extractUrls,isCardSegment} from '../onebot/cards.js';
 import { contentToText } from '../core/types.js';
-import type { MemoryStore } from '../memory/store.js';
+import type { MemoryStore, MessageRow } from '../memory/store.js';
 import { estimateTokens } from '../memory/store.js';
 import type { ProviderManager } from '../llm/manager.js';
 import type { PersonaManager } from '../persona/manager.js';
@@ -46,6 +48,9 @@ import { auxiliary, modulatedEmotion } from './auxiliary.js';
 import { resolveImages, fitImagesToBudget } from './images.js';
 import {captureReplyWindow, messageLinks} from './window.js';
 import { describeImages } from '../llm/vision-describe.js';
+import {expandForwardMessage,hasForwardSegments} from '../onebot/forward.js';
+import {segmentsToText} from '../onebot/normalize.js';
+import type {SpeechService} from '../llm/speech.js';
 
 export interface ReplyContext {
   msg: InboundMessage;
@@ -93,6 +98,50 @@ export class ReplyPipeline {
   }
   private coalescer = new ShortMessageBuffer();
   private proactiveTurns = new Map<string, AbortController>();
+  private forwardPending = new Map<number, Promise<void>>();
+  private speech?:SpeechService;
+  private links=new LinkReader();
+  attachLinks(service:LinkReader):void{this.links=service;}
+  private async hydrateLinkRows(rows:MessageRow[],turn:TurnContext):Promise<void>{
+    const settings=turn.config.links,budget=this.links.budget(settings);
+    const signal=AbortSignal.any([turn.signal,AbortSignal.timeout(settings.timeoutMs)]);
+    for(const row of rows.slice(-20).reverse()){
+      this.assertTurn(turn);let segments:ObMessageSegment[];
+      try{segments=JSON.parse(row.raw_segments??'[]');}catch{continue;}
+      if(!Array.isArray(segments)||!segments.some(s=>isCardSegment(s)||['text','forward_content'].includes(s.type)&&extractUrls(String(s.data.text??'')).length))continue;
+      if(segments.some(s=>s.type==='link_content')&&!segments.some(isCardSegment))continue;
+      const result=await this.links.enrich(segments,row.scope,settings,signal,budget);
+      this.assertTurn(turn);
+      this.store.db.prepare('UPDATE messages SET content=?,raw_segments=?,tokens=? WHERE id=? AND conversation_id=?')
+        .run(result.text,JSON.stringify(result.segments),estimateTokens(result.text),row.id,turn.conversationId);
+      Object.assign(row,{content:result.text,raw_segments:JSON.stringify(result.segments),tokens:estimateTokens(result.text)});
+    }
+  }
+  attachSpeech(service:SpeechService):void{this.speech=service;}
+
+  /** Enrich recorded rows, preserving the real sender and outer trigger/command decision. */
+  private async hydrateForwardRows(rows: MessageRow[], api: OneBotAction, selfId: number): Promise<void> {
+    const deadline=AbortSignal.timeout(8000);
+    for(const row of rows.slice(-20)){
+      const conversationId=row.conversation_id;if(!conversationId||this.stopping)continue;
+      let segments;
+      try{segments=JSON.parse(row.raw_segments??'[]');}catch{continue;}
+      if(!Array.isArray(segments)||!hasForwardSegments(segments))continue;
+      if(!this.forwardPending.has(row.id)){
+        const pending=(async()=>{
+          const result=await expandForwardMessage(segments,api,selfId,deadline);
+          if(this.stopping||!this.store.getConversation(conversationId))return;
+          this.store.db.prepare('UPDATE messages SET content=?,raw_segments=?,tokens=? WHERE id=? AND conversation_id=?')
+            .run(result.text,JSON.stringify(result.segments),estimateTokens(result.text),row.id,conversationId);
+        })();
+        this.forwardPending.set(row.id,pending);
+      }
+      try{await this.forwardPending.get(row.id);}finally{this.forwardPending.delete(row.id);}
+      if(this.stopping)continue;
+      const latest=this.store.db.prepare('SELECT * FROM messages WHERE id=? AND conversation_id=?').get(row.id,conversationId) as unknown as MessageRow|undefined;
+      if(latest)Object.assign(row,latest);
+    }
+  }
   flushPending(scope: string): void { this.coalescer.flush(scope); }
 
   constructor(
@@ -118,6 +167,7 @@ export class ReplyPipeline {
       await this.postProcess(data.scope, data.userId, data.assistantMsgId, { ...data.turn, signal });
     });
     store.onClose(() => this.background.stop());
+    store.onClose(() => {this.stopping=true;});
     store.onClose(() => this.coalescer.stop());
     store.onClose(() => { for (const controllers of this.turns.values()) for (const ctrl of controllers) ctrl.abort(); });
     store.onConversationChange(scope => {
@@ -168,14 +218,23 @@ export class ReplyPipeline {
         .get(msg.scope, this.store.currentConversationId(msg.scope), replyId);
       msg = { ...msg, repliesToBot: !!referenced };
     }
-    const decision = this.trigger.decide(msg, msg.selfId);
+    let decision = this.trigger.decide(msg, msg.selfId);
 
     // ---- 先落库（无论是否回复，消息都要记录，用于上下文理解）----
     // Every admitted normal message contributes to the next reply window.
     const rowId = this.recordInbound(msg);
+    if(this.speech&&this.cfg.speech.asr.enabled&&msg.segments.some(s=>s.type==='record')&&(decision.reply||msg.scopeType==='private'||this.cfg.speech.asr.groupAll)){
+      const early=this.captureTurn(msg,rowId);
+      try{msg=await this.speech.transcribeInbound(msg,api,early.turn.signal);this.assertTurn(early.turn);
+        this.store.db.prepare('UPDATE messages SET content=?,raw_segments=?,tokens=? WHERE id=?').run(msg.text,JSON.stringify(msg.segments),estimateTokens(msg.text),rowId);
+        decision=this.trigger.decide(msg,msg.selfId);
+      }catch{early.release();return {replied:false,reason:'语音识别期间话题切换或请求取消'};}finally{early.release();}
+    }
 
     if (!decision.reply) {
       this.coalescer.flush(msg.scope);
+      const row=this.store.db.prepare('SELECT * FROM messages WHERE id=?').get(rowId) as unknown as MessageRow|undefined;
+      if(row)await this.hydrateForwardRows([row],api,msg.selfId);
       this.log.debug({ scope: msg.scope, reason: decision.reason }, '不回复，仅记录');
       return { replied: false, reason: decision.reason, debug: { triggerReason: decision.reason, memoryFacts: 0, memorySummaries: 0, contextMessages: 0, trimmed: 0, compressionTriggered: false } };
     }
@@ -297,13 +356,37 @@ export class ReplyPipeline {
       await dispatcher.thinkDelay(turn.signal);
       this.assertTurn(turn);
       const replyWindow = captureReplyWindow(this.store, turn);
+      const currentIds=turn.mergedMessageRowIds??[turn.triggerMessageRowId];
+      const currentRows=currentIds.map(id=>this.store.db.prepare('SELECT * FROM messages WHERE id=? AND conversation_id=?')
+        .get(id,turn.conversationId) as unknown as MessageRow|undefined).filter((row):row is MessageRow=>!!row);
+      const quotedRows=msg.segments.filter(seg=>seg.type==='reply').slice(0,8).map(seg=>{
+        const id=Number(seg.data.id);if(!Number.isSafeInteger(id)||!id)return undefined;
+        return this.store.db.prepare('SELECT * FROM messages WHERE conversation_id=? AND message_id=? AND id<=? ORDER BY id DESC LIMIT 1')
+          .get(turn.conversationId,id,turn.historyCutoffId) as unknown as MessageRow|undefined;
+      }).filter((row):row is MessageRow=>!!row);
+      const forwardedRows=[...new Map([...replyWindow.rows,...quotedRows,...currentRows].map(row=>[row.id,row])).values()];
+      await this.hydrateForwardRows(forwardedRows,api,msg.selfId);
+      this.assertTurn(turn);
+      try{await this.hydrateLinkRows(forwardedRows,turn);}catch(e){this.assertTurn(turn);this.log.debug({reason:(e as Error).message},'链接读取达到时限，保留已读取资料');}
+      // Refresh frozen rows after enrichment, without widening the arrival cutoff.
+      for(const row of replyWindow.rows){const enriched=forwardedRows.find(item=>item.id===row.id);if(enriched)Object.assign(row,enriched);}
+      let originalText=text;
+      const forwardedText=currentRows.flatMap(row=>{
+        try{return JSON.parse(row.raw_segments??'[]').filter((seg: {type:string})=>['forward_content','card_content','link_content'].includes(seg.type)).map((seg: {data:{text:string}})=>seg.data.text);}catch{return [];}
+      }).join('\n');
+      if(forwardedText&&!proactive)text+='\n'+forwardedText;
+      if(forwardedText&&proactive)originalText=currentRows.map(row=>{
+        try{return segmentsToText(JSON.parse(row.raw_segments??'[]').filter((seg:{type:string;data:Record<string,unknown>})=>!['forward_content','card_content','link_content'].includes(seg.type)&&!seg.data.qqAgentForwardSource));}catch{return '';}
+      }).join('\n');
+      const current=currentRows.find(row=>row.id===turn.triggerMessageRowId);
+      if(current?.raw_segments)msg={...msg,segments:JSON.parse(current.raw_segments)};
       // ---- 1. 情绪分析 ----
       let emotion = null as Awaited<ReturnType<EmotionAnalyzer['analyze']>> | null;
       const emotionRole = this.providers.resolveRole('emotion', turn.config.llm);
       const retriever = this.retriever.snapshot?.(turn.config.memory) ?? this.retriever;
-      const emotionRequest = turn.config.emotion.enabled && text.trim()
-        ? auxiliary(signal => this.emotion.snapshot(turn.config.emotion.mode, emotionRole.provider, emotionRole.model).analyze(text, signal),
-          () => analyzeByRule(text), turn.config.emotion.timeoutMs, turn.signal)
+      const emotionRequest = turn.config.emotion.enabled && originalText.trim()
+        ? auxiliary(signal => this.emotion.snapshot(turn.config.emotion.mode, emotionRole.provider, emotionRole.model).analyze(originalText, signal),
+          () => analyzeByRule(originalText), turn.config.emotion.timeoutMs, turn.signal)
         : Promise.resolve(null);
       const memoryRequest = auxiliary(() => retriever.retrieveMerged(scope, userId, text, turn.conversationId, turn.config.memory),
         () => retriever.retrieve(scope, userId, text, turn.conversationId), turn.config.memory.retrieval.timeoutMs, turn.signal);
@@ -492,6 +575,15 @@ export class ReplyPipeline {
           : {}),
       };
       let systemPrompt = this.personas.buildSystemPrompt(promptParams);
+      if(forwardedText){
+        const available=Math.max(0,contextBuilder.budget(resolved.contextWindow,persona.maxTokens??turn.config.llm.generation.maxTokens)
+          -estimateTokens(systemPrompt)-estimateTokens(originalText)-600);
+        let end=forwardedText.length;
+        if(estimateTokens(forwardedText)>available){
+          let low=0,high=end;while(low<high){const mid=Math.ceil((low+high)/2);if(estimateTokens(forwardedText.slice(0,mid))<=available)low=mid;else high=mid-1;}end=low;
+        }
+        text=originalText+'\n'+forwardedText.slice(0,end)+(end<forwardedText.length?'\n【转发上下文限制：本轮只纳入部分正文，其余未提供给模型，不能推测其内容】':'');
+      }
       if (resolvedImages.images.length > 0) {
         const remaining = contextBuilder.budget(resolved.contextWindow, persona.maxTokens ?? turn.config.llm.generation.maxTokens)
           - estimateTokens(systemPrompt) - estimateTokens(text) - 1000;
@@ -813,6 +905,10 @@ export class ReplyPipeline {
         },
         '✅ 已回复',
       );
+      if(replied&&deliveryState==='success'&&!turn.signal.aborted&&this.speech){
+        const wasAudio=msg.segments.some(segment=>segment.type==='record'||segment.type==='speech_text')||currentRows.some(row=>{try{return (JSON.parse(row.raw_segments||'[]') as ObMessageSegment[]).some(segment=>segment.type==='record'||segment.type==='speech_text');}catch{return false;}});
+        await this.speech.replyVoice(api,msg,content,persona,turn.signal,turn.config,wasAudio);
+      }
 
       // ---- 10. 异步后处理（不阻塞回复）----
       if (!turn.signal.aborted && assistantMsgId && (turn.config.memory.factExtraction || turn.config.memory.summary.enabled)) {

@@ -24,7 +24,7 @@ export interface SettingDef {
   path: string;
   label: string;
   desc: string;
-  type: 'boolean' | 'enum' | 'number' | 'string[]';
+  type: 'boolean' | 'enum' | 'number' | 'string[]' | 'string' | 'json';
   options?: SettingOption[];
   /** number 类型的建议范围（仅用于面板提示，不阻断保存） */
   min?: number;
@@ -305,6 +305,23 @@ export const SETTING_DEFS: SettingDef[] = [
   },
 ];
 
+SETTING_DEFS.push(...([{"path":"speech.asr.enabled","label":"启用语音理解","type":"boolean","desc":"在模型用途配置ASR供应商与模型；转写不会自动执行指令","group":"语音"},{"path":"speech.asr.groupAll","label":"识别允许群内所有语音","type":"boolean","desc":"关闭时只识别需要回复的语音，减少调用量","group":"语音"},{"path":"speech.tts.enabled","label":"启用人格语音回复","type":"boolean","desc":"文字回复保留，语音失败不影响文字","group":"语音"},{"path":"speech.tts.mode","label":"语音回复场景","type":"enum","desc":"","group":"语音","options":[{"value":"on-audio","label":"仅回复语音消息"},{"value":"always","label":"每次回复"}]},{"path":"speech.tts.voice","label":"默认音色","type":"string","desc":"填服务商音色ID，如alloy或CosyVoice模型:音色；人格可以覆盖","group":"语音"},{"path":"speech.tts.format","label":"合成音频格式","type":"enum","desc":"","group":"语音","options":[{"value":"mp3","label":"mp3"},{"value":"wav","label":"wav"},{"value":"opus","label":"opus"}]},{"path":"speech.tts.instructions","label":"默认朗读风格","type":"string","desc":"仅在接口支持instructions时生效","group":"语音"},{"path":"speech.tts.maxChars","label":"最大朗读字数","type":"number","desc":"超出时只发文字，不截断朗读","group":"语音"},{"path":"speech.timeoutMs","label":"语音调用超时（毫秒）","type":"number","desc":"","group":"语音"},{"path":"speech.maxBytes","label":"音频大小上限（字节）","type":"number","desc":"","group":"语音"},{"path":"speech.allowedDirs","label":"允许读取语音的本地目录","type":"string[]","desc":"需包含OneBot转换后WAV文件所在的可信缓存目录","group":"语音"},{"path":"speech.asr.protocol","label":"ASR接口协议","type":"enum","desc":"供应商与模型在模型用途选择","group":"语音","options":[{"value":"auto","label":"auto"},{"value":"openai","label":"openai"},{"value":"gemini","label":"gemini"},{"value":"custom","label":"custom"}]},{"path":"speech.asr.path","label":"ASR端点路径","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.responsePath","label":"ASR响应字段路径","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.modelField","label":"ASR模型字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.fileField","label":"ASR文件字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.textField","label":"ASR输入文字字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.voiceField","label":"ASR音色字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.asr.extra","label":"ASR额外请求JSON","type":"json","desc":"服务商额外参数；不要在此填写API Key","group":"语音"},{"path":"speech.tts.protocol","label":"TTS接口协议","type":"enum","desc":"供应商与模型在模型用途选择","group":"语音","options":[{"value":"auto","label":"auto"},{"value":"openai","label":"openai"},{"value":"gemini","label":"gemini"},{"value":"custom","label":"custom"}]},{"path":"speech.tts.path","label":"TTS端点路径","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.responsePath","label":"TTS响应字段路径","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.modelField","label":"TTS模型字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.fileField","label":"TTS文件字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.textField","label":"TTS输入文字字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.voiceField","label":"TTS音色字段","type":"string","desc":"高级适配；响应字段支持点路径如data.text","group":"语音"},{"path":"speech.tts.extra","label":"TTS额外请求JSON","type":"json","desc":"服务商额外参数；不要在此填写API Key","group":"语音"},{"path":"speech.asr.encoding","label":"自定义ASR音频编码","type":"enum","desc":"","group":"语音","options":[{"value":"multipart","label":"multipart"},{"value":"base64-json","label":"base64-json"}]},{"path":"speech.tts.responseType","label":"TTS响应形式","type":"enum","desc":"","group":"语音","options":[{"value":"binary","label":"binary"},{"value":"base64","label":"base64"},{"value":"url","label":"url"}]},{"path":"tasks.remindersEnabled","label":"启用定时提醒","type":"boolean","desc":"用/remind或在私聊说10分钟后提醒我喝水","group":"定时任务"},{"path":"tasks.dailyEnabled","label":"启用群聊日报","type":"boolean","desc":"仅总结目标群已记录的24小时聊天","group":"定时任务"},{"path":"tasks.maxPerUser","label":"个人待执行任务上限","type":"number","desc":"","group":"定时任务"},{"path":"tasks.overdueGraceMs","label":"过期补发宽限（毫秒）","type":"number","desc":"","group":"定时任务"}] as SettingDef[]));
+
+SETTING_DEFS.push(...([{"path":"speech.asr.speedField","label":"ASR speedField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"},{"path":"speech.asr.instructionsField","label":"ASR instructionsField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"},{"path":"speech.asr.formatField","label":"ASR formatField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"},{"path":"speech.tts.speedField","label":"TTS speedField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"},{"path":"speech.tts.instructionsField","label":"TTS instructionsField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"},{"path":"speech.tts.formatField","label":"TTS formatField","desc":"自定义字段；留空则不发送此参数","type":"string","group":"语音"}] as SettingDef[]));
+
+
+SETTING_DEFS.push(
+ {path:'links.enabled',label:'读取链接网页正文',type:'boolean',group:'链接与卡片',desc:'只在需要回复时读取；关闭后仍展示卡片已有标题简介'},
+ {path:'links.maxLinksPerReply',label:'每次回复最多读取链接数',type:'number',min:1,max:8,group:'链接与卡片',desc:'当前消息、引用消息及聊天窗口共用上限'},
+ {path:'links.maxBytes',label:'单页最大下载字节',type:'number',min:1024,max:4194304,group:'链接与卡片',desc:'仅读取公开网页文字，不下载视频音频'},
+ {path:'links.maxChars',label:'单页最大正文字数',type:'number',min:200,max:12000,group:'链接与卡片',desc:'截断会在来源资料中标明'},
+ {path:'links.timeoutMs',label:'网页读取总时限（毫秒）',type:'number',min:500,max:15000,group:'链接与卡片',desc:'当前回复所有链接共用时限'},
+ {path:'links.maxRedirects',label:'最多重定向次数',type:'number',min:0,max:5,group:'链接与卡片',desc:'每次跳转重新核验域名与地址'},
+ {path:'links.cacheTtlMs',label:'网页缓存有效期（毫秒）',type:'number',min:0,max:3600000,group:'链接与卡片',desc:'缓存按会话隔离；0表示不缓存'},
+ {path:'links.allowedDomains',label:'允许读取的域名',type:'string[]',group:'链接与卡片',desc:'留空允许公开域名；仅填域名，包含子域名'},
+ {path:'links.denyDomains',label:'禁止读取的域名',type:'string[]',group:'链接与卡片',desc:'含子域名；本机、内网和保留地址始终拒绝'},
+);
+
 const ALLOWED = new Set(SETTING_DEFS.map((d) => d.path));
 
 /** 「模型用途」路径：llm.roles.<role>.provider / .model */
@@ -386,7 +403,9 @@ export function validateSettings(
     const def = SETTING_DEFS.find((d) => d.path === path)!;
     const current = readPath(cfg, path);
 
-    if (def.type === 'boolean') {
+    if(def.type==='string'){if(typeof value!=='string'||value.length>4000)return {ok:false,error:'需要4000字内字符串',entries:[]};}
+    else if(def.type==='json'){if(!value||typeof value!=='object'||Array.isArray(value)||JSON.stringify(value).length>20000)return {ok:false,error:'需要JSON对象（最多20000字符）',entries:[]};}
+    else if (def.type === 'boolean') {
       if (typeof value !== 'boolean') {
         return { ok: false, error: `${def.label} 需要是布尔值`, entries: [] };
       }

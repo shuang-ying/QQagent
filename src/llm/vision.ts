@@ -12,6 +12,7 @@
  * 本地取回来再以 base64 发送，可靠性高得多。
  */
 import { loadMedia, type MediaOptions } from './media.js';
+import {forwardImageNote} from '../onebot/forward.js';
 
 import type { ContentPart, ObMessageSegment } from '../core/types.js';
 
@@ -37,6 +38,7 @@ export function sniffMime(buf: Buffer): string {
 }
 
 export interface CollectedImage {
+  forwardNote?: string;
   hash?: string; bytes?: number; width?: number; height?: number; frames?: number;
   part: ContentPart & { type: 'image' };
   /** 来源描述，便于日志排查 */
@@ -62,6 +64,7 @@ export async function collectImages(segments: ObMessageSegment[], opts: MediaOpt
     const seg = segs[i]!;
     try {
       const image = await loadMedia(String(seg.data['file'] ?? ''), String(seg.data['url'] ?? ''), opts);
+      const forwardNote=forwardImageNote(seg);if(forwardNote)image.forwardNote=forwardNote;
       images.push(image); opts.onImage?.(image, i);
     } catch (error) { errors.push('读取图片失败：' + (error as Error).message); }
   }
@@ -146,7 +149,10 @@ export async function collectImagesFromHistory(
 
     images.unshift(...got.images.map(img => img.part));
     sourceRowIds.unshift(...got.images.map(() => src.rowId ?? 0));
-    notes.unshift(...got.images.map(() => `${src.senderName || '某人'}${src.userId ? `（QQ ${src.userId}）` : ''} 发的图（msg ${src.messageId ?? '-'}；${relativeTime(src.createdAt)}）`));
+    notes.unshift(...got.images.map(image => {
+      const forwarded=image.forwardNote;
+      return `${src.senderName || '某人'}${src.userId ? `（QQ ${src.userId}）` : ''} 发的图（msg ${src.messageId ?? '-'}；${relativeTime(src.createdAt)}）${forwarded?'；'+forwarded:''}`;
+    }));
   }
 
   // 刚才是从新到旧，翻回正序

@@ -44,7 +44,7 @@ export const NapCatSchema = z.object({
     .prefault({}),
 });
 
-export const COMMAND_IDS = ['help', 'persona', 'personas', 'memory', 'forget', 'emotion', 'new', 'topics', 'stats'] as const;
+export const COMMAND_IDS = ['help', 'persona', 'personas', 'memory', 'forget', 'emotion', 'new', 'topics', 'stats', 'remind', 'reminders', 'cancelremind', 'daily'] as const;
 export type CommandId = typeof COMMAND_IDS[number];
 export const CommandPermissionSchema = z.enum(['admin', 'all', 'whitelist']);
 export type CommandPermission = z.infer<typeof CommandPermissionSchema>;
@@ -53,6 +53,7 @@ export const CommandPermissionsSchema = z.object({
   personas: CommandPermissionSchema.optional(), memory: CommandPermissionSchema.optional(),
   forget: CommandPermissionSchema.optional(), emotion: CommandPermissionSchema.optional(),
   new: CommandPermissionSchema.optional(), topics: CommandPermissionSchema.optional(), stats: CommandPermissionSchema.optional(),
+  remind:CommandPermissionSchema.optional(),reminders:CommandPermissionSchema.optional(),cancelremind:CommandPermissionSchema.optional(),daily:CommandPermissionSchema.optional(),
 }).strict();
 
 export const TriggerSchema = z.object({
@@ -184,11 +185,13 @@ export const LlmRolesSchema = z.object({
   facts: LlmRoleSchema.prefault({}),
   embedding: LlmRoleSchema.prefault({}),
   vision: LlmRoleSchema.prefault({}),
+  asr: LlmRoleSchema.prefault({}),
+  tts: LlmRoleSchema.prefault({}),
 });
 export type LlmRoles = z.infer<typeof LlmRolesSchema>;
 
 /** 可配置的用途名列表（面板按此渲染） */
-export const LLM_ROLE_NAMES = ['chat', 'emotion', 'summary', 'facts', 'embedding', 'vision'] as const;
+export const LLM_ROLE_NAMES = ['chat', 'emotion', 'summary', 'facts', 'embedding', 'vision', 'asr', 'tts'] as const;
 export type LlmRoleName = (typeof LLM_ROLE_NAMES)[number];
 
 /** 用途的中文说明，供面板展示 */
@@ -199,6 +202,8 @@ export const LLM_ROLE_LABELS: Record<LlmRoleName, { name: string; desc: string; 
   facts: { name: '记忆抽取', desc: '抽取长期事实', hint: '需要稳定输出 JSON' },
   embedding: { name: '向量化', desc: '语义记忆检索', hint: '需支持 /embeddings 接口，如 text-embedding-3-small、bge-m3' },
   vision: { name: '图片理解', desc: '理解图片消息', hint: '需多模态模型，如 gpt-4o、claude、gemini' },
+  asr: { name: '语音识别', desc: '把用户语音转为文字', hint: '供应商可继承，模型必须明确填写ASR或支持音频输入的模型；协议在语音设置中选择' },
+  tts: { name: '语音合成', desc: '按人格音色朗读回复', hint: '供应商可继承，模型必须明确填写TTS模型；音色与协议在语音设置中选择' },
 };
 
 export const LlmSchema = z.object({
@@ -436,6 +441,23 @@ export const ServerSchema = z.object({  enabled: z.boolean().default(true),
   authToken: z.string().default(''),
 });
 
+export const SpeechEndpointSchema=z.object({
+  protocol:z.enum(['auto','openai','gemini','custom']).default('auto'),
+  path:z.string().max(500).default(''),
+  encoding:z.enum(['multipart','base64-json']).default('multipart'),
+  responseType:z.enum(['binary','base64','url']).default('binary'),
+  responsePath:z.string().max(100).default(''),
+  fileField:z.string().max(100).default('file'),modelField:z.string().max(100).default('model'),
+  textField:z.string().max(100).default('input'),voiceField:z.string().max(100).default('voice'),
+  speedField:z.string().max(100).default('speed'),instructionsField:z.string().max(100).default('instructions'),formatField:z.string().max(100).default('response_format'),
+  extra:z.record(z.string(),z.unknown()).default({}),
+});
+export const SpeechSchema=z.object({
+  asr:SpeechEndpointSchema.extend({enabled:z.boolean().default(false),groupAll:z.boolean().default(false)}).prefault({}),
+  tts:SpeechEndpointSchema.extend({enabled:z.boolean().default(false),mode:z.enum(['always','on-audio']).default('on-audio'),voice:z.string().max(200).default('alloy'),format:z.enum(['mp3','wav','opus']).default('mp3'),instructions:z.string().max(1500).default(''),maxChars:z.number().int().min(50).max(4000).default(1500)}).prefault({}),
+  timeoutMs:z.number().int().min(1000).max(120000).default(30000),maxBytes:z.number().int().min(1024).max(25000000).default(20000000),
+  allowedDirs:z.array(z.string()).default([]),
+});
 const BaseAppConfigSchema = z.object({
   app: z
     .object({
@@ -456,6 +478,14 @@ const BaseAppConfigSchema = z.object({
   proactive: ProactiveSchema.prefault({}),
   persona: PersonaConfigSchema.prefault({}),
   llm: LlmSchema.prefault({}),
+  speech:SpeechSchema.prefault({}),
+  links:z.object({
+    enabled:z.boolean().default(true),maxLinksPerReply:z.number().int().min(1).max(8).default(3),
+    maxBytes:z.number().int().min(1024).max(4194304).default(1048576),maxChars:z.number().int().min(200).max(12000).default(6000),
+    timeoutMs:z.number().int().min(500).max(15000).default(6000),maxRedirects:z.number().int().min(0).max(5).default(3),
+    cacheTtlMs:z.number().int().min(0).max(3600000).default(300000),allowedDomains:z.array(z.string().max(253)).max(100).default([]),denyDomains:z.array(z.string().max(253)).max(100).default([]),
+  }).prefault({}),
+  tasks:z.object({remindersEnabled:z.boolean().default(true),dailyEnabled:z.boolean().default(false),maxPerUser:z.number().int().min(1).max(100).default(20),overdueGraceMs:z.number().int().min(1000).max(604800000).default(86400000)}).prefault({}),
   memory: MemorySchema.prefault({}),
   emotion: EmotionSchema.prefault({}),
   context: ContextSchema.prefault({}),
@@ -532,6 +562,7 @@ export const PersonaSchema = z.object({
   name: z.string(),
   emoji: z.string().default('🤖'),
   description: z.string().default(''),
+  voice:z.object({enabled:z.boolean().default(true),provider:z.string().default(''),model:z.string().default(''),voice:z.string().max(200).default(''),speed:z.number().min(0.25).max(4).default(1),instructions:z.string().max(1500).default('')}).prefault({}),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().positive().optional(),
   systemPrompt: z.string().default(''),

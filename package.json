@@ -1,6 +1,6 @@
 {
   "name": "qq-agent",
-  "version": "0.1.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "可接入任意 AI API 的 QQ 智能体（snowluma / OneBot v11），含人格、分层记忆、情绪提取与上下文压缩",
@@ -45,7 +45,7 @@
     "test:context-budget": "tsx scripts/test-context-budget.ts",
     "test:summary-strategies": "tsx scripts/test-summary-strategies.ts",
     "test:optimizations-next": "npm run test:background && npm run test:reply-strategy && npm run test:addressing && npm run test:auxiliary && npm run test:media && npm run test:vision-description && npm run test:image-history && npm run test:sticker-candidates && npm run test:context-budget && npm run test:summary-strategies",
-    "test:optimizations-final": "tsx scripts/test-memory-index.ts && tsx scripts/test-memory-retrieval.ts && tsx scripts/test-fact-lifecycle.ts && tsx scripts/test-config-atomic.ts && tsx scripts/test-database-maintenance.ts && tsx scripts/test-operations.ts && npm run test:command-permissions && npm run test:persona-context && npm run test:proactive-relevance && npm run test:reply-window && npm run test:launchers",
+    "test:optimizations-final": "tsx scripts/test-memory-index.ts && tsx scripts/test-memory-retrieval.ts && tsx scripts/test-fact-lifecycle.ts && tsx scripts/test-config-atomic.ts && tsx scripts/test-database-maintenance.ts && tsx scripts/test-operations.ts && npm run test:command-permissions && npm run test:persona-context && npm run test:proactive-relevance && npm run test:reply-window && npm run test:launchers && npm run test:forward-messages && npm run test:speech && npm run test:scheduled-tasks && npm run test:links-cards",
     "test:replay": "tsx scripts/test-agent-replay.ts",
     "test:isolated": "npm run test:stage1 && npm run test:panel-isolated",
     "test:panel-isolated": "tsx scripts/test-panel-isolated.ts",
@@ -53,7 +53,11 @@
     "test:persona-context": "tsx scripts/test-persona-context.ts",
     "test:proactive-relevance": "tsx scripts/test-proactive-relevance.ts",
     "test:reply-window": "tsx scripts/test-reply-window.ts",
-    "test:launchers": "tsx scripts/test-launchers.ts"
+    "test:launchers": "tsx scripts/test-launchers.ts",
+    "test:forward-messages": "tsx scripts/test-forward-messages.ts",
+    "test:speech": "tsx scripts/test-speech.ts",
+    "test:scheduled-tasks": "tsx scripts/test-scheduled-tasks.ts",
+    "test:links-cards": "tsx scripts/test-links-cards.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",
@@ -88,6 +92,9 @@
     "start-mock.bat",
     "test.bat",
     "package-lock.json",
-    ".gitattributes"
+    ".gitattributes",
+    "docs/forward-messages.md",
+    "docs/voice-and-scheduled-tasks.md",
+    "docs/links-and-cards.md"
   ]
 }

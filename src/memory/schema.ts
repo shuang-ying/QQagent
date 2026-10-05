@@ -11,9 +11,20 @@
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+ id TEXT PRIMARY KEY,kind TEXT NOT NULL,scope TEXT NOT NULL,owner_id INTEGER NOT NULL,
+ text TEXT NOT NULL DEFAULT '',clock TEXT NOT NULL DEFAULT '',timezone TEXT NOT NULL,
+ due_at INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,error TEXT NOT NULL DEFAULT '',message_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_tasks(state,due_at);
+CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+ task_id TEXT NOT NULL,due_at INTEGER NOT NULL,status TEXT NOT NULL,message_id INTEGER,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,
+ PRIMARY KEY(task_id,due_at)
+);
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;

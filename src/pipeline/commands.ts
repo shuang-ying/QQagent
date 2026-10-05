@@ -17,6 +17,7 @@ import type { PersonaManager } from '../persona/manager.js';
 import { EMOTION_LABELS_CN } from '../emotion/analyzer.js';
 import { FACT_TYPE_CN } from '../memory/extractor.js';
 import { parseCommand, authorizeCommand } from './command-permissions.js';
+import {naturalReminder,parseReminder,type ScheduledTasks} from '../tasks/scheduled.js';
 
 export interface CommandContext {
   scope: string;
@@ -45,13 +46,15 @@ export class CommandHandler {
     private readonly store: MemoryStore,
     private readonly personas: PersonaManager,
     private readonly log: Logger,
+    private readonly tasks?:ScheduledTasks,
   ) {}
 
   /**
    * 尝试把消息当作命令处理
    */
   async tryHandle(text: string, ctx: Omit<CommandContext, 'arg'>): Promise<CommandResult> {
-    const parsed = parseCommand(text);
+    const natural=ctx.scopeType==='private'?naturalReminder(text):null;
+    const parsed = parseCommand(text)??(natural?{id:'remind' as const,arg:natural}:null);
     if (!parsed) return { handled: false };
     const cmd = '/' + parsed.id;
     const full: CommandContext = { ...ctx, arg: parsed.arg };
@@ -59,6 +62,8 @@ export class CommandHandler {
     if (!gate.allowed) return { handled: true, reply: gate.reason + '。' };
 
     switch (cmd) {
+      case '/remind':case '/reminders':case '/cancelremind':case '/daily':
+        try{return {handled:true,reply:await this.taskCommand(cmd,full)};}catch(e){return {handled:true,reply:(e as Error).message};}
       case '/help':
       case '/?':
         return { handled: true, reply: this.help() };
@@ -107,6 +112,9 @@ export class CommandHandler {
       '/topics — 查看/切换本会话的话题',
       '/stats — 查看统计信息',
       '/help — 显示这条帮助',
+      '/remind 10m 喝水 — 创建提醒（也支持明天09:00或日期时间）',
+      '/reminders — 查看本会话自己的提醒；/cancelremind <任务ID> — 取消',
+      '/daily — 本群最近24小时日报；/daily at 21:00 — 每日定时日报',
     ].join('\n');
   }
 
@@ -146,6 +154,16 @@ export class CommandHandler {
 
     const persona = this.personas.get(target)!;
     return `人格已切换为 ${persona.emoji} ${persona.name}\n${persona.description}\n${mode === 'keep' ? '历史保留，旧人格回复仅作资料。' : '已新开话题，旧话题可以用 /topics 切回。'}`;
+  }
+
+  private async taskCommand(cmd:string,ctx:CommandContext):Promise<string>{
+    if(!this.tasks)return '定时任务服务尚未启动';
+    if(cmd==='/remind'){const parsed=parseReminder(ctx.arg,this.cfg.app.timezone),task=this.tasks.createReminder(ctx.scope,ctx.userId,parsed.text,parsed.dueAt);return '⏰ 已创建提醒：'+task.text+'\n时间：'+new Date(task.due_at).toLocaleString('zh-CN',{timeZone:task.timezone,hour12:false})+'（'+task.timezone+'）\nID：'+task.id;}
+    if(cmd==='/reminders'){const tasks=this.tasks.list(ctx.scope,ctx.isAdmin?undefined:ctx.userId).filter(t=>['pending','running','unknown'].includes(t.state));return tasks.length?tasks.map(t=>t.id+' | '+t.kind+' | '+t.state+' | '+new Date(t.due_at).toLocaleString('zh-CN',{timeZone:t.timezone})+' | '+t.text).join('\n'):'没有待执行任务';}
+    if(cmd==='/cancelremind')return this.tasks.cancel(ctx.arg,ctx.scope,ctx.isAdmin?undefined:ctx.userId)?'已取消任务':'任务不存在、无权限或正在执行';
+    if(ctx.scopeType!=='group')return '日报只用于群聊';
+    if(ctx.arg.startsWith('at ')){if(!ctx.isAdmin)return '定时日报配置仅限管理员';const task=this.tasks.createDaily(ctx.scope,ctx.userId,ctx.arg.slice(3).trim());return '每日'+task.clock+'（'+task.timezone+'）发送本群最近24小时日报；ID：'+task.id;}
+    return this.tasks.digest(ctx.scope);
   }
 
   private listPersonas(): string {

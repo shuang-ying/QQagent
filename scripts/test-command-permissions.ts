@@ -64,7 +64,7 @@ test('面板API校验、保存到YAML并重新加载生效，写失败不改变�
  const deps:any={cfg:f.cfg,store:f.store,providers:f.providers,personas:(f.pipeline as any).personas,log:(f.pipeline as any).log,runtime:()=>({}),updateAccess:(entries:Array<[string[],unknown]>)=>{if(fail)throw Error('write rejected');setConfigValues(file,entries);for(const [keys,value]of entries){let obj:any=f.cfg;for(const k of keys.slice(0,-1))obj=obj[k];obj[keys.at(-1)!]=value;}return entries.length;}};
  const {app}=createServer(deps);const post=(commands:unknown)=>app.request('/api/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({commands})});
  try{
-  const initial=await (await app.request('/api/access')).json();assert.equal(initial.commands.length,9);assert.ok(initial.commands.every((c:any)=>c.value==='admin'));
+  const initial=await (await app.request('/api/access')).json();assert.equal(initial.commands.length,13);assert.ok(initial.commands.every((c:any)=>c.value==='admin'));
   assert.equal((await post({help:'all',persona:'whitelist'})).status,200);
   const reloaded=AppConfigSchema.parse(parse(fs.readFileSync(file,'utf8')));assert.equal(reloaded.trigger.commandPermissions.help,'all');assert.equal(reloaded.trigger.commandPermissions.persona,'whitelist');assert.ok(fs.readFileSync(file,'utf8').startsWith('# retained comment'));
   assert.equal(authorizeCommand(f.cfg.trigger,'help',10003).allowed,true);assert.equal(authorizeCommand(f.cfg.trigger,'persona',10003).allowed,false);
@@ -85,5 +85,5 @@ test('Web权限下拉框渲染和保存请求包含每条指令，沿用鉴权�
  const load=/async function loadAccess\(\) \{[\s\S]*?\n\}\n/.exec(script)![0];
  const save=/window.saveCommandPermissions = async \(\) => \{[\s\S]*?\n\};/.exec(script)![0];
  vm.runInContext(load+'\n'+save,ctx);await ctx.loadAccess();assert.match(els.commandPermissions.innerHTML,/管理员/);assert.match(els.commandPermissions.innerHTML,/白名单和管理员/);for(const d of defs)assert.ok(els.commandPermissions.innerHTML.includes('cmdperm_'+d.id));
- await ctx.window.saveCommandPermissions();assert.equal(sent.url,'/api/access');assert.equal(Object.keys(sent.body.commands).length,9);assert.equal(sent.body.commands.help,'all');assert.equal(els.commandPermissionsSave.disabled,false);
+ await ctx.window.saveCommandPermissions();assert.equal(sent.url,'/api/access');assert.equal(Object.keys(sent.body.commands).length,13);assert.equal(sent.body.commands.help,'all');assert.equal(els.commandPermissionsSave.disabled,false);
 });

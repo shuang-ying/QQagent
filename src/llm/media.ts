@@ -31,7 +31,7 @@ async function readUrl(url: string, opts: MediaOptions): Promise<Buffer> {
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   return Buffer.concat(chunks, bytes);
 }
-async function readSource(source: string, opts: MediaOptions): Promise<Buffer> {
+export async function readSource(source: string, opts: MediaOptions): Promise<Buffer> {
   const max = opts.maxBytes ?? 8 * 1024 * 1024;
   if (source.startsWith('base64://')) {
     if (source.length > Math.ceil(max * 4 / 3) + 32) throw new Error('内嵌图片超过字节上限');

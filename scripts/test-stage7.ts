@@ -246,6 +246,7 @@ function testPersonaFiles(): void {
 
   const persona: Persona = {
     id: 'unit-test',
+    voice:{enabled:true,provider:'',model:'',voice:'',speed:1,instructions:''},
     structured: {identity:'',speakingStyle:'',interactionStyle:'',answerPrinciples:'',emotionalStyle:''},
     name: '单元测试人格',
     emoji: '🧪',
@@ -355,7 +356,7 @@ async function testHttp(): Promise<void> {
   // ---- 模型用途 ----
   const roles = await j('/api/llm/roles');
   check('GET /api/llm/roles 返回 200', roles.status === 200);
-  check('含 6 个用途', roles.json?.roles?.length === 6, String(roles.json?.roles?.length));
+  check('含 8 个用途', roles.json?.roles?.length === 8, String(roles.json?.roles?.length));
   check(
     '用途名齐全',
     ['chat', 'emotion', 'summary', 'facts', 'embedding', 'vision'].every((r) =>

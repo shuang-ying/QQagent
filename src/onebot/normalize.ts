@@ -7,6 +7,7 @@
  *  - 需要判断是否 @ 了机器人
  */
 import type { InboundMessage, ObMessageEvent, ObMessageSegment, ObNoticeEvent, PokeEvent } from '../core/types.js';
+import {cardPreview} from './cards.js';
 
 /** CQ 码中的转义字符还原 */
 function unescapeCq(s: string): string {
@@ -52,7 +53,7 @@ export function parseCqCodes(raw: string): ObMessageSegment[] {
         const v = unescapeCq(pair.slice(eq + 1));
         if (!k) continue;
         // qq / user_id 之类的数字字段转成 number，方便比较
-        data[k] = /^(qq|user_id|group_id|id)$/.test(k) && /^-?\d+$/.test(v) ? Number(v) : v;
+        data[k] = /^(qq|user_id|group_id|id)$/.test(k) && !(type === 'forward' && k === 'id') && /^-?\d+$/.test(v) ? Number(v) : v;
       }
     }
     segments.push({ type, data });
@@ -106,6 +107,9 @@ export function segmentsToText(segments: ObMessageSegment[], selfId = 0): string
       case 'record':
         parts.push('[语音]');
         break;
+      case 'speech_text':
+        parts.push('【语音转写】'+String(seg.data['text']??''));
+        break;
       case 'video':
         parts.push('[视频]');
         break;
@@ -116,11 +120,23 @@ export function segmentsToText(segments: ObMessageSegment[], selfId = 0): string
         // 引用回复：忽略引用内容本身，不阻塞语义
         break;
       case 'forward':
+      case 'node':
         parts.push('[合并转发]');
+        break;
+      case 'forward_content':
+        parts.push(String(seg.data['text'] ?? '[合并转发未读取]'));
         break;
       case 'json':
       case 'xml':
-        parts.push('[卡片消息]');
+      case 'share':
+      case 'music':
+      case 'contact':
+      case 'location':
+        parts.push(cardPreview(seg));
+        break;
+      case 'card_content':
+      case 'link_content':
+        parts.push('\n'+String(seg.data.text??'[外部资料未读取]')+'\n');
         break;
       case 'mface':
         parts.push('[表情包]');
@@ -153,7 +169,8 @@ export function detectMention(segments: ObMessageSegment[], selfId: number, rawT
     }
   }
   // 兜底：文本里直接写了 @机器人昵称 或 CQ 码未解析干净
-  if (selfId && (rawText.includes(`[CQ:at,qq=${selfId}]`) || rawText.includes(`@${selfId}`))) return true;
+  const directText=segments.length?segments.filter(seg=>seg.type==='text').map(seg=>String(seg.data['text']??'')).join(''):rawText;
+  if (selfId && (directText.includes(`[CQ:at,qq=${selfId}]`) || directText.includes(`@${selfId}`))) return true;
   return false;
 }
 

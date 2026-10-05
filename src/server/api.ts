@@ -13,6 +13,7 @@ import path from 'node:path';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import type { Logger } from '../core/logger.js';
+import { APP_VERSION } from '../core/version.js';
 import type { AppConfig, LlmRoleName, Persona, ProviderConfig } from '../core/types.js';
 import { LLM_ROLE_LABELS, LLM_ROLE_NAMES } from '../core/types.js';
 import {memoryTerms} from '../memory/store.js';
@@ -43,8 +44,11 @@ import { safeRelPath } from '../persona/stickerAnalyze.js';
 import { sniffMime } from '../llm/vision.js';
 import type { ImportResult } from '../persona/stickerImport.js';
 import type { AnalyzeResult } from '../persona/stickerAnalyze.js';
+import {parseReminder,type ScheduledTasks} from '../tasks/scheduled.js';
 
 export interface ServerDeps {
+  tasks?:ScheduledTasks;
+  speechStatus?:()=>unknown;
   cfg: AppConfig;
   store: MemoryStore;
   providers: ProviderManager;
@@ -145,6 +149,11 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     return next();
   });
   app.get('/api/health', c => c.json({ok:true,runtime:runtime(),diagnostics:deps.diagnostics?.(),embedding:store.embeddingStats()}));
+  app.get('/api/speech/status',c=>c.json({ok:true,status:deps.speechStatus?.()??null}));
+  app.get('/api/tasks',c=>c.json({ok:true,tasks:deps.tasks?.list(c.req.query('scope'))??[],runs:store.db.prepare('SELECT * FROM scheduled_task_runs ORDER BY created_at DESC LIMIT 100').all(),timezone:cfg.app.timezone}));
+  app.post('/api/tasks',async c=>{if(!deps.tasks)return c.json({ok:false,error:'服务未启动'},503);try{const body=await c.req.json();if(!['reminder','digest'].includes(body.kind)||typeof body.scope!=='string'||!Number.isSafeInteger(body.ownerId)||body.ownerId<=0)throw Error('任务参数无效');
+    const task=body.kind==='digest'?deps.tasks.createDaily(body.scope,body.ownerId,String(body.clock??'')):(()=>{const parsed=parseReminder(String(body.when??'')+' '+String(body.text??''),cfg.app.timezone);return deps.tasks!.createReminder(body.scope,body.ownerId,parsed.text,parsed.dueAt);})();return c.json({ok:true,task});}catch(e){return c.json({ok:false,error:(e as Error).message},400);}});
+  app.post('/api/tasks/:id/cancel',c=>deps.tasks?.cancel(c.req.param('id'))?c.json({ok:true}):c.json({ok:false,error:'任务不存在或正在执行'},400));
   app.get('/api/memory/forgetting', c => c.json({ok:true,records:store.db.prepare('SELECT * FROM memory_forgetting ORDER BY id DESC LIMIT 100').all()}));
   app.get('/api/memory/explain', c => {
     const userId=Number(c.req.query('userId')); const scope=c.req.query('scope'); const query=c.req.query('q') ?? '';
@@ -168,7 +177,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     const usage = providers.getUsage();
     return c.json({
       ok: true,
-      app: { name: cfg.app.name, version: '0.1.0', personaDefault: cfg.persona.default },
+      app: { name: cfg.app.name, version: APP_VERSION, personaDefault: cfg.persona.default },
       llm: {
         defaultProvider: cfg.llm.defaultProvider,
         defaultModel: cfg.llm.defaultModel,

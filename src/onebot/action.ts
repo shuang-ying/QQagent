@@ -139,6 +139,13 @@ export class OneBotAction {
 
   // ==================== 信息查询 ====================
 
+  getForwardMsg(id: string, opts?: ActionOptions) {
+    return this.call<unknown>('get_forward_msg', { id }, { ...opts, throwOnError: true });
+  }
+
+  getRecord(file:string,outFormat='wav',opts?:ActionOptions){return this.call<{file?:string;url?:string}>('get_record',{file,out_format:outFormat},{...opts,throwOnError:true});}
+  canSendRecord(opts?:ActionOptions){return this.call<{yes:boolean}>('can_send_record',{}, {...opts,throwOnError:true});}
+
   getImage(file: string, opts?: ActionOptions) {
     return this.call<{ file?: string; url?: string }>('get_image', { file }, { ...opts, throwOnError: true });
   }

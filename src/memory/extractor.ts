@@ -12,6 +12,9 @@
 import type { Logger } from '../core/logger.js';
 import type { ProviderManager } from '../llm/manager.js';
 import type { MemoryStore, MessageRow } from '../memory/store.js';
+import {hasForwardContent} from '../onebot/forward.js';
+import {hasExternalReferences} from '../onebot/cards.js';
+import {segmentsToText} from '../onebot/normalize.js';
 
 export type FactType = 'identity' | 'preference' | 'skill' | 'goal' | 'relation' | 'event' | 'other';
 
@@ -96,9 +99,19 @@ export class FactExtractor {
     const cursor = this.store.db.prepare('SELECT last_id FROM fact_cursors WHERE user_id=? AND conversation_id=?').get(userId,conversationId) as { last_id: number } | undefined;
     const cutoff = Math.max(...messages.map(m => m.id));
     const candidates = this.store.db.prepare("SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND scope=? AND role='user' AND id>? AND id<=? ORDER BY id LIMIT 30").all(userId,conversationId,scope,Math.max(cursor?.last_id ?? 0,(this.store.db.prepare('SELECT COALESCE(MAX(cutoff),0) AS n FROM memory_forgetting WHERE user_id=?').get(userId) as { n:number }).n),cutoff) as unknown as MessageRow[];
-    const userMsgs: MessageRow[] = []; let chars = 0;
-    for (const row of candidates) { if (userMsgs.length && chars + row.content.length > 2500) break; userMsgs.push(row); chars += row.content.length; }
-    if (userMsgs.length === 0) return 0;
+    const userMsgs: MessageRow[] = []; let chars = 0,processedId=cursor?.last_id??0;
+    for (const row of candidates) {
+      let content=row.content;
+      try{const segments=JSON.parse(row.raw_segments??'[]');if(Array.isArray(segments)&&(hasForwardContent(segments)||hasExternalReferences(segments)))content=segmentsToText(segments.filter(s=>s.type==='text'));}catch{ /* Legacy rows retain their original content. */ }
+      if (userMsgs.length && chars + content.length > 2500) break;
+      processedId=row.id;if(!content.trim())continue;
+      userMsgs.push({...row,content});chars+=content.length;
+    }
+    if (userMsgs.length === 0) {
+      signal?.throwIfAborted();
+      if(processedId>(cursor?.last_id??0))this.store.db.prepare('INSERT INTO fact_cursors(user_id,conversation_id,last_id) VALUES(?,?,?) ON CONFLICT(user_id,conversation_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)').run(userId,conversationId,processedId);
+      return 0;
+    }
 
     const transcript = userMsgs
       .slice(-30)
@@ -158,7 +171,7 @@ export class FactExtractor {
     }
 
     signal?.throwIfAborted();
-    this.store.db.prepare('INSERT INTO fact_cursors(user_id,conversation_id,last_id) VALUES(?,?,?) ON CONFLICT(user_id,conversation_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)').run(userId,conversationId,Math.max(...userMsgs.map(m => m.id)));
+    this.store.db.prepare('INSERT INTO fact_cursors(user_id,conversation_id,last_id) VALUES(?,?,?) ON CONFLICT(user_id,conversation_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)').run(userId,conversationId,processedId);
     this.store.db.exec('COMMIT');
     } catch (e) { this.store.db.exec('ROLLBACK'); throw e; }
     if (added > 0) {

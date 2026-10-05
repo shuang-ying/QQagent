@@ -85,6 +85,7 @@ export class ProviderManager {
   private metric(provider:string,model:string,purpose:string,success:boolean,latency:number,retry=0,prompt=0,completion=0):void {
     this.usageDb?.prepare('INSERT INTO llm_calls(purpose,provider,model,success,prompt_tokens,completion_tokens,latency_ms,retry,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(purpose,provider,model,Number(success),prompt,completion,Math.round(latency),retry,Date.now());
   }
+  recordSpeechCall(provider:string,model:string,purpose:'asr'|'tts',success:boolean,latency:number):void{this.metric(provider,model,purpose,success,latency);}
   private cache: CacheFile = { version: 1, entries: {} };
   private cachePath: string;
   private readonly client: LlmClient;
@@ -124,7 +125,7 @@ export class ProviderManager {
 
     const provider = (r?.provider ?? '').trim() || defProvider;
     const explicitModel = (r?.model ?? '').trim();
-    const model = explicitModel || (provider === defProvider ? defModel : '');
+    const model = explicitModel || (role === 'asr' || role === 'tts' ? '' : provider === defProvider ? defModel : '');
 
     return { provider, model };
   }
@@ -155,7 +156,7 @@ export class ProviderManager {
 
   /** 列出所有用途的解析结果（面板用） */
   listRoles(): Array<{ role: LlmRoleName; provider: string; model: string; overridden: boolean }> {
-    const names: LlmRoleName[] = ['chat', 'emotion', 'summary', 'facts', 'embedding', 'vision'];
+    const names: LlmRoleName[] = ['chat', 'emotion', 'summary', 'facts', 'embedding', 'vision', 'asr', 'tts'];
     return names.map((role) => {
       const r = this.llmCfg?.roles?.[role];
       const resolved = this.resolveRole(role);

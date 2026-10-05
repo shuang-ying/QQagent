@@ -19,7 +19,7 @@
   nav a{display:block;padding:9px 20px;color:var(--dim);text-decoration:none;border-left:2px solid transparent;cursor:pointer;font-size:13px}
   nav a:hover{color:var(--text);background:var(--panel2)}
   nav a.active{color:var(--accent);border-left-color:var(--accent);background:var(--panel2)}
-  main{flex:1;padding:24px 28px;max-width:1200px;overflow-x:hidden}
+  main{flex:1;min-width:0;padding:24px 28px;max-width:1200px;overflow-x:hidden}
   .page{display:none}
   .page.active{display:block}
   h2{font-size:19px;margin-bottom:4px}
@@ -92,6 +92,11 @@
   .toggle-row .t{font-size:13px}
   .toggle-row .d{font-size:12px;color:var(--dim);margin-top:2px}
   .toggle-row select{margin-top:7px;font-size:12px;padding:5px 8px}
+  .feature-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+  .setting-field{display:block;min-width:0}
+  .setting-field>input,.setting-field>select{display:block;width:100%;min-width:0;margin-top:8px}
+  .toggle-row .setting-number{flex:0 0 96px;width:96px}
+  .toggle-row .t,.toggle-row .d{overflow-wrap:anywhere}
 
   /* 模态框 */
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:flex-start;justify-content:center;z-index:100;overflow:auto;padding:40px 16px}
@@ -107,12 +112,20 @@
   .role-row select{flex:1 1 150px;min-width:130px;font-size:12px;padding:6px 8px}
   .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:rgba(107,138,253,.15);color:var(--accent)}
   .pill.grey{background:var(--panel);color:var(--dim)}
+  @media(max-width:640px){
+    .layout{flex-direction:column}
+    nav{width:100%;height:auto;position:static;display:flex;flex-wrap:wrap;padding:10px;border-right:0;border-bottom:1px solid var(--border)}
+    nav h1{width:100%;padding:0 10px 8px}
+    nav a{padding:6px 10px;border-left:0;border-radius:6px}
+    main{width:100%;padding:16px}
+    .grid2{grid-template-columns:minmax(0,1fr)}
+  }
 </style>
 </head>
 <body>
 <div class="layout">
   <nav>
-    <h1>🐱 QQ Agent<small>管理面板</small></h1>
+    <h1>🐱 QQ Agent<small id="appVersion">管理面板</small></h1>
     <a data-page="overview" class="active">📊 概览</a>
     <a data-page="providers">🔌 模型接入</a>
     <a data-page="personas">🎭 人格</a>
@@ -121,6 +134,7 @@
     <a data-page="memory">🧠 记忆</a>
     <a data-page="emotion">📈 情绪</a>
     <a data-page="logs">📜 日志</a>
+    <a data-page="tasks">⏰ 提醒与日报</a>
   </nav>
   <main>
     <div id="toast"></div>
@@ -167,7 +181,7 @@
       </div>
 
       <div class="card">
-        <h3>模型用途 <span class="muted" style="font-weight:400">不同环节可以各用各的模型，留空表示继承默认</span></h3>
+        <h3>模型用途 <span class="muted" style="font-weight:400">不同环节可分别选模型；语音识别与合成须明确指定模型</span></h3>
         <div class="muted" id="roleDefaultInfo" style="margin-bottom:12px"></div>
         <div id="roleList"></div>
         <div id="embeddingStats" style="margin-top:12px"></div>
@@ -335,6 +349,17 @@
         <div class="log" id="logBox">加载中…</div>
       </div>
     </div>
+
+    <div class="page" id="page-tasks">
+      <h2>提醒与群聊日报</h2><div class="sub">任务存入数据库，按应用时区执行；结果未知的投递不会自动重发。功能开关在概览中设置。</div>
+      <div class="card"><h3>创建任务</h3><div class="grid c2">
+        <div><label>类型</label><select id="task_kind"><option value="reminder">定时提醒</option><option value="digest">每日群聊日报</option></select></div>
+        <div><label>目标会话</label><input id="task_scope" placeholder="private:QQ号 或 group:群号"></div>
+        <div><label>任务所有者QQ</label><input id="task_owner" type="number" min="1"></div>
+        <div><label>提醒时间或日报时刻</label><input id="task_when" placeholder="10m / 明天09:00 / 日期 时间；日报填21:00"></div>
+      </div><label>提醒内容</label><textarea id="task_text" maxlength="1000"></textarea><button onclick="createTask()">创建任务</button><span id="task_timezone" class="muted"></span></div>
+      <div class="card"><h3>任务与投递记录 <button class="sm ghost" onclick="loadTasks()">刷新</button></h3><div id="task_list" class="scroll"></div><div id="task_runs" class="scroll"></div></div>
+    </div>
   </main>
 </div>
 
@@ -382,6 +407,14 @@
     </div><div class="field">
       <label>感兴趣的话题（可选，每行一个）</label>
       <textarea id="pf_proactiveTopics" placeholder="编程|写代码|coding&#10;摄影|拍照"></textarea>
+      <details><summary>人格语音（全局TTS开启后生效）</summary>
+        <label><input type="checkbox" id="pf_voice_enabled" checked> 此人格允许语音回复</label>
+        <label>覆盖供应商标识（留空继承TTS用途）</label><input id="pf_voice_provider">
+        <label>覆盖TTS模型（留空继承）</label><input id="pf_voice_model">
+        <label>音色ID（留空用默认音色）</label><input id="pf_voice_voice">
+        <label>语速（0.25到4，接口需要支持speed）</label><input id="pf_voice_speed" type="number" value="1" min="0.25" max="4" step="0.1">
+        <label>朗读风格（接口需要支持instructions）</label><textarea id="pf_voice_instructions" maxlength="1500"></textarea>
+      </details>
       <div class="muted">用于主动插话的相关性判断；用 | 分隔同一话题的同义表达。不会强制回复，留空仍可使用记忆判断。</div>
     </div><div class="field">
       <label>原始设定（兼容现有人格，可留空）</label>
@@ -478,6 +511,7 @@ document.querySelectorAll('nav a').forEach((a) => {
     if (a.dataset.page === 'memory') { loadUsers(); loadConvScopes(); }
     if (a.dataset.page === 'emotion') loadEmoUsers();
     if (a.dataset.page === 'logs') loadLogs();
+    if (a.dataset.page === 'tasks') loadTasks();
     if (a.dataset.page === 'overview') loadFeatures();
   };
 });
@@ -485,6 +519,7 @@ document.querySelectorAll('nav a').forEach((a) => {
 async function loadOverview() {
   try {
     const d = await api('/api/overview');
+    $('appVersion').textContent = '管理面板 · v' + d.app.version;
     const rt = d.runtime;
     $('statusGrid').innerHTML = [
       '<div class="stat"><div class="k">' + esc((rt.onebot && rt.onebot.implementation.name) || 'OneBot') + ' ' + esc((rt.onebot && rt.onebot.implementation.version) || '') + ' 连接</div><div class="v" style="color:' + (rt.napcatConnected ? 'var(--ok)' : 'var(--err)') + ';font-size:16px">' + (rt.napcatConnected ? '● 已连接' : '● 未连接') + '</div></div>',
@@ -769,6 +804,9 @@ window.openPersonaEditor = (id) => {
   $('pf_maxTokens').value = p && p.maxTokens != null ? p.maxTokens : '';
   $('pf_prompt').value = p ? p.systemPrompt : '';
   $('pf_proactiveTopics').value = (p?.proactiveTopics || []).join('\n');
+  $('pf_voice_enabled').checked = p?.voice?.enabled !== false;
+  for(const key of ['provider','model','voice','instructions']) $('pf_voice_'+key).value=p?.voice?.[key]||'';
+  $('pf_voice_speed').value=p?.voice?.speed||1;
   $('pf_keywords').value = p && p.triggers ? (p.triggers.keywords || []).join(', ') : '';
   $('pf_errmsg').value = p ? (p.errorMessage || '') : '';
   $('pf_pokereplies').value = p && p.pokeReplies ? p.pokeReplies.join('\n') : '';
@@ -847,6 +885,7 @@ window.savePersona = async () => {  const originalId = $('pf_originalId').value;
     systemPrompt: systemPrompt,
     structured: structured,
     proactiveTopics: $('pf_proactiveTopics').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    voice:{enabled:$('pf_voice_enabled')?.checked!==false,provider:$('pf_voice_provider')?.value?.trim()||'',model:$('pf_voice_model')?.value?.trim()||'',voice:$('pf_voice_voice')?.value?.trim()||'',speed:Number($('pf_voice_speed')?.value||1),instructions:$('pf_voice_instructions')?.value?.trim()||''},
     emotionModulation: parseEmotionModulation($('pf_emotion').value),
     triggers: {
       keywords: $('pf_keywords').value.split(',').map((s) => s.trim()).filter(Boolean),
@@ -1183,7 +1222,7 @@ async function loadFeatures() {
     box.innerHTML = Object.keys(groups).map((g) =>
       '<div style="margin-bottom:16px">' +
         '<div class="muted" style="margin-bottom:8px;font-weight:600">' + esc(g) + '</div>' +
-        '<div class="grid c2">' + groups[g].map((s) => renderToggle(s)).join('') + '</div>' +
+        '<div class="grid feature-grid">' + groups[g].map((s) => renderToggle(s)).join('') + '</div>' +
       '</div>').join('');
   } catch (e) {
     box.innerHTML = '<div class="msg err">加载设置失败: ' + esc(e.message) + '</div>';
@@ -1192,6 +1231,10 @@ async function loadFeatures() {
 
 function renderToggle(s) {
   const inputId = 'set_' + s.path.replace(/\./g, '_');
+  if(s.type==='string'||s.type==='json'){
+    const value=s.type==='json'?JSON.stringify(s.value||{}):s.value||'';
+    return '<div class="toggle-row setting-field"><div class="txt"><div class="t">'+esc(s.label)+'</div><div class="d">'+esc(s.desc)+'</div></div><input id="'+inputId+'" value="'+esc(value)+'" onchange="applyTextSetting(\''+s.path+'\',this.value,\''+s.type+'\',this)"></div>';
+  }
   if (s.type === 'boolean') {
     return '<div class="toggle-row">' +
       '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '</div></div>' +
@@ -1204,27 +1247,26 @@ function renderToggle(s) {
       ? '（' + (s.min !== undefined ? s.min : '') + ' ~ ' + (s.max !== undefined ? s.max : '') + '）' : '';
     return '<div class="toggle-row">' +
       '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div></div>' +
-      '<input type="number" id="' + inputId + '" style="width:96px" value="' + esc(s.value) + '"' +
+      '<input type="number" id="' + inputId + '" class="setting-number" value="' + esc(s.value) + '"' +
         (s.min !== undefined ? ' min="' + s.min + '"' : '') + (s.max !== undefined ? ' max="' + s.max + '"' : '') +
         ' step="any" onchange="applySetting(\'' + s.path + '\', Number(this.value), this)">' +
     '</div>';
   }
   if (s.type === 'string[]') {
     const v = Array.isArray(s.value) ? s.value.join(', ') : (s.value || '');
-    return '<div class="toggle-row">' +
+    return '<div class="toggle-row setting-field">' +
       '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '（逗号分隔）</div></div>' +
-      '<input id="' + inputId + '" style="width:200px" value="' + esc(v) + '"' +
+      '<input id="' + inputId + '" value="' + esc(v) + '"' +
         ' onchange="applySetting(\'' + s.path + '\', this.value, this)">' +
     '</div>';
   }
   // enum
-  return '<div class="toggle-row">' +
-    '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '</div>' +
-      '<select onchange="applySetting(\'' + s.path + '\', this.value, this)">' +
+  return '<div class="toggle-row setting-field">' +
+    '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + '</div></div>' +
+      '<select id="' + inputId + '" onchange="applySetting(\'' + s.path + '\', this.value, this)">' +
         (s.options || []).map((o) => '<option value="' + esc(o.value) + '"' +
           (String(s.value) === String(o.value) ? ' selected' : '') + '>' + esc(o.label) + '</option>').join('') +
       '</select>' +
-    '</div>' +
   '</div>';
 }
 
@@ -1247,6 +1289,12 @@ window.applySetting = async (path, value, el) => {
     if (el) el.disabled = false;
   }
 };
+
+
+window.applyTextSetting = async (path,value,type,el) => {try{await window.applySetting(path,type==='json'?JSON.parse(value):value,el);}catch(e){toast('JSON无效：'+e.message,'err');}};
+async function loadTasks(){try{const d=await api('/api/tasks');$('task_timezone').textContent=' 时区：'+d.timezone;$('task_list').innerHTML='<table><tr><th>ID</th><th>目标</th><th>类型与所有者</th><th>时间</th><th>状态</th><th>内容/错误</th><th></th></tr>'+d.tasks.map(t=>'<tr><td>'+esc(t.id)+'</td><td>'+esc(t.scope)+'</td><td>'+esc(t.kind)+' / '+esc(t.owner_id)+'</td><td>'+esc(new Date(t.due_at).toLocaleString('zh-CN',{timeZone:t.timezone,hour12:false}))+' / '+esc(t.timezone)+'</td><td>'+esc(t.state)+'</td><td>'+esc(t.text||t.error)+'</td><td><button onclick="cancelTask(\''+esc(t.id)+'\')">取消</button></td></tr>').join('')+'</table>';$('task_runs').innerHTML='<h3>最近投递</h3>'+d.runs.map(r=>'<div class="kv">'+esc(r.task_id)+' / '+esc(r.status)+' / '+esc(fmtTime(r.created_at))+' / '+esc(r.error)+'</div>').join('');}catch(e){$('task_list').textContent=e.message;}}
+window.cancelTask=async id=>{try{await post('/api/tasks/'+encodeURIComponent(id)+'/cancel',{});await loadTasks();}catch(e){toast(e.message,'err');}};
+window.createTask=async()=>{try{const kind=$('task_kind').value;await post('/api/tasks',{kind,scope:$('task_scope').value.trim(),ownerId:Number($('task_owner').value),when:$('task_when').value.trim(),clock:$('task_when').value.trim(),text:$('task_text').value});toast('任务已创建','ok');await loadTasks();}catch(e){toast(e.message,'err');}};
 
 // ============ 模型用途 ============
 async function loadRoles() {
@@ -1288,13 +1336,14 @@ async function loadRoles() {
             ((r.overrideProvider || '') === p.key ? ' selected' : '') + '>' + esc(p.displayName) + '</option>').join('') +
         '</select>' +
         '<select id="' + mid + '" onchange="onRoleModelChange(\'' + r.role + '\')">' +
-          '<option value="">（自动/默认）</option>' +
+          '<option value="">' + (['asr','tts'].includes(r.role) ? '（请选择语音模型）' : '（自动/默认）') + '</option>' +
         '</select>' +
+        (['asr','tts'].includes(r.role) ? '<input id="rmanual_' + r.role + '" placeholder="手填语音模型ID" value="' + esc(r.overrideModel || '') + '"><button class="sm" onclick="setManualRoleModel(\'' + r.role + '\')">保存模型</button>' : '') +
         (r.role === 'embedding'
           ? '<button class="sm ghost" onclick="testEmbedding()">测试向量化</button>'
           : '') +
         '<span class="muted" style="flex:1 1 100%;font-size:12px">当前生效：' +
-          esc(r.provider || '未配置') + ' / ' + esc(r.model || '自动') + '</span>' +
+          esc(r.provider || '未配置') + ' / ' + esc(r.model || (['asr','tts'].includes(r.role) ? '未配置语音模型' : '自动')) + '</span>' +
       '</div>';
     }).join('');
 
@@ -1324,7 +1373,7 @@ async function fillRoleModels(role) {
   // 「已保存的值」永远要显示出来。
   // 早先供应商为空时会直接 return，导致只设了模型（供应商留空继承默认）的人
   // 打开面板看到的是"（自动/默认）"，以为自己的选择被重置了。
-  const base = '<option value="">（自动/默认）</option>';
+  const base = '<option value="">' + (['asr','tts'].includes(role) ? '（请选择语音模型）' : '（自动/默认）') + '</option>';
   const keep = current
     ? '<option value="' + esc(current) + '" selected>' + esc(current) + '</option>'
     : '';
@@ -1363,6 +1412,12 @@ window.onRoleProviderChange = async (role) => {
   // 由用户自己决定要不要换。
   await applyRole(role, { provider: providerKey });
   await fillRoleModels(role);
+};
+
+window.setManualRoleModel = async (role) => {
+  const model = $('rmanual_' + role).value.trim();
+  if (!model) return toast('请填写语音模型ID', 'err');
+  await applyRole(role, { model });
 };
 
 window.onRoleModelChange = async (role) => {

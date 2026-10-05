@@ -1,6 +1,6 @@
 # QQ Agent
 
-一个通过 **snowluma / 标准 OneBot v11** 接入 QQ 的 LLM 回复机器人，提供 Web 管理面板、可切换人格、图片理解、上下文压缩与长期记忆。
+一个通过 **snowluma / 标准 OneBot v11** 接入 QQ 的 LLM 回复机器人，提供 Web 管理面板、人格、图片/语音理解、提醒与日报、链接卡片阅读及分层记忆。当前发行版本：**2.2.0**。
 
 项目由作者提出需求、进行测试反馈，并在 AI 辅助下开发。此发行版不预置 API Key、个人 QQ 号或模型供应商；安装后请先完成模型和权限配置。
 
@@ -11,6 +11,10 @@
 - **完整回复窗口**：主动、被动回复都纳入上次确认回复之后、到本次生成开始前的聊天记录，包含排队期间的消息及图片来源。
 - **人格系统**：7 个预设人格，支持结构化设定、示例对话、群/私聊独立人格，以及保留历史或新开话题的切换方式。
 - **图片理解**：合并窗口图片、当前图片与明确引用的旧图，区分发送者；可用独立视觉模型识别资料，再由聊天模型回答。
+- **合并转发**：读取节点作者、时间、文字与图片，支持嵌套及旧消息引用。
+- **链接与卡片**：解析JSON/XML、小程序、音乐等卡片，并读取公开静态网页文字；主动、被动及引用问答共享资料。
+- **语音理解与人格语音**：独立ASR/TTS模型，支持OpenAI兼容、Gemini原生和自定义HTTP；人格可设置音色、语速和朗读风格。
+- **提醒与日报**：提醒持久化并在重启后恢复；日报只总结目标群已记录的最近24小时聊天，支持手动和每天定时发送。
 - **分层记忆**：以 QQ 为用户身份，支持长期事实、关键词检索、可选向量检索、摘要压缩、纠错和遗忘。
 - **指令权限**：每条指令可在后台设置为管理员、全部用户、用户白名单和管理员。
 - **可靠投递**：会话串行、直接请求优先、消息去重、连接与账号就绪检查、过时主动任务取消及发送结果记录。
@@ -59,8 +63,10 @@ npm start
 | 记忆抽取 | 提取可保存的长期事实 |
 | 向量化 | 为记忆建立向量并进行语义召回 |
 | 图片理解 | 提取图片画面、文字和表情资料 |
+| 语音识别（ASR） | 将录音转写成聊天文字 |
+| 语音合成（TTS） | 按人格音色朗读回复 |
 
-情绪、摘要和事实用途可继承默认聊天配置。向量化需要适配 `/embeddings` 等接口的 embedding 模型，不能把普通聊天模型当作向量模型。图片用途必须支持视觉输入；没有合适模型时机器人会说明无法读取图片。
+情绪、摘要和事实用途可继承默认聊天配置。向量化需要适配 `/embeddings` 等接口的 embedding 模型，不能把普通聊天模型当作向量模型。图片用途必须支持视觉输入；没有合适模型时机器人会说明无法读取图片。**ASR/TTS模型须明确指定，不能继承聊天模型。**供应商可以共用现有地址和Key，但必须提供对应语音接口；模型列表没有暴露语音模型时可手填ID。
 
 也可以使用交互式配置向导：
 
@@ -83,9 +89,9 @@ npm run init
 
 “仅用户白名单和管理员”是两者的并集：管理员不必重复添加到用户白名单；该模式下用户白名单为空时，仅管理员能使用该指令。黑名单和群限制继续生效。普通聊天的用户白名单与指令权限分别检查。
 
-### 4. 连接 Snowluma / Napcat / OneBot
+### 4. 连接 snowluma / OneBot v11
 
-snowluma 或者 Napcat都可以，后者容易被踢下线，前者是注入方式
+以snowluma为例，也可使用提供标准OneBot v11接口的实现。
 
 在 snowluma 的适用运行环境中，**只对机器人登录的 QQ 进行注入**。管理员使用另一个 QQ 向机器人发送消息，不需要一起注入。
 
@@ -117,6 +123,10 @@ napcat:
 | 私聊回复 | 开启，正常消息会触发 |
 | 群聊 | 要求 @机器人；引用当前话题中已记录的机器人消息也可触发 |
 | 主动插话 | **关闭** |
+| 语音识别 / 人格语音回复 | **关闭**，先配置独立语音模型 |
+| 定时提醒 | 开启，指令沿用权限限制 |
+| 群聊日报 | **关闭**，后台启用后可使用 |
+| 链接网页正文 | 开启，每轮默认最多3个公开链接 |
 | 表情包发送 / 情绪自动补图 | 关闭 |
 | 拟人分条发送 / 消息表情回应 | 关闭 |
 | 普通回复引用开关 | 关闭；群内直接 @/引用机器人时仍明确引用触发消息 |
@@ -191,6 +201,10 @@ napcat:
 | `/new [标题]` | `/新话题` | 新开话题，旧话题保留 |
 | `/topics [序号]` | `/话题` | 列出或切换当前会话话题 |
 | `/stats` | `/统计` | 查看机器人统计 |
+| `/remind 10m 喝水` | `/提醒` | 创建定时提醒，也支持日期时间 |
+| `/reminders` | `/提醒列表` | 查看当前会话待执行任务 |
+| `/cancelremind <任务ID>` | `/取消提醒` | 取消自己的任务，管理员可取消本会话他人的任务 |
+| `/daily`、`/daily at 21:00` | `/日报` | 本群最近24小时日报；定时日报仅管理员可设置 |
 
 每条指令的权限均在后台「权限」设置，中文和英文别名共用权限。`/reset` 没有实现为可用管理指令，请使用 `/new` 管理新话题。
 
@@ -199,6 +213,164 @@ napcat:
 原始聊天、长期事实和摘要存于本机 `data/brain.db`。私聊/群聊和话题按范围组织，跨会话共享受 `memory.retrieval.crossScopeSharing` 控制。后台可检查、纠正事实，设置私密标记或删除记忆。主动相关性判断不会使用私密、失效或低置信度事实。
 
 `/forget` 删除匹配的长期事实与相关索引，不等于清空原始聊天、摘要或日志。需要完整清理记录时，使用后台对应的数据管理功能，并核对保留范围。
+
+## 阅读转发、链接和卡片
+
+私聊可直接发送转发、链接或卡片并提问；群内可先分享，再@机器人问“总结刚才的内容”，也可引用旧消息。网页和卡片作为引用资料，里面的指令不执行、作者自述不记成分享者事实。网页仅读取公开静态文字；视频卡片提供标题、简介和链接。后台概览的“链接与卡片”组可调整读取开关、域名和资源上限。
+
+详见[合并转发](docs/forward-messages.md)、[链接与卡片](docs/links-and-cards.md)。
+
+## 语音、提醒与群聊日报
+
+先在模型用途选择ASR/TTS供应商和模型，再在概览语音设置中选择协议、开启功能。QQ录音可能需要OneBot的`get_record`转换；返回本地WAV时需将转换缓存目录加入可信语音目录。后台人格编辑可设置独立音色、语速、模型和朗读风格。默认只在回复窗口包含语音时附加语音，也可设为每次回复；文字回复始终保留。
+
+提醒可以使用`/remind 10m 喝水`或明确文字“10分钟后提醒我喝水”；群内自然提醒需@机器人。后台“提醒与日报”可创建、查看、取消及检查执行记录。群聊日报使用“摘要”模型，需先在后台启用；只总结目标群已记录的最近24小时内容。语音转写不会自动执行管理指令或创建提醒。
+
+详见[语音与定时任务配置](docs/voice-and-scheduled-tasks.md)。
+
+## 语音参数怎么填写
+
+入口分为三处：**模型接入 → 模型用途**选ASR/TTS供应商和模型；**概览 → 语音**填写接口和通用参数；**人格 → 编辑 → 人格语音**填写各人格音色。先完成参数，再开启ASR/TTS。供应商必须提供语音接口，普通聊天模型不能代替语音模型。
+
+### 1. 供应商、模型和认证
+
+| 参数/位置 | 怎么填 |
+| --- | --- |
+| 供应商Base URL | 填服务商API基础地址，例如`https://api.openai.com/v1`。不要填到`/audio/speech`或`/audio/transcriptions`。自建服务填它的API基础地址。 |
+| 供应商API Key | 在模型接入里填写自己的密钥；不要写进人格、接口路径、额外JSON或公开配置。 |
+| 供应商额外请求头 | 通常留空；接口需要自定义认证时按服务商填写。程序对OpenAI/custom使用Bearer Key，对Gemini使用`x-goog-api-key`。若custom服务使用其他认证头，将供应商Key留空并在请求头中配置。 |
+| ASR供应商 `llm.roles.asr.provider` | 下拉选择提供识别服务的供应商；留空继承默认供应商。 |
+| ASR模型 `llm.roles.asr.model` | 填服务端真实识别模型ID，必须明确指定；模型未出现在列表中可手填。 |
+| TTS供应商 `llm.roles.tts.provider` | 下拉选择提供合成服务的供应商，可与ASR不同；留空继承默认供应商。 |
+| TTS模型 `llm.roles.tts.model` | 填真实合成模型ID，必须明确指定；人格可以单独覆盖。 |
+
+下面是官方接口的**填写示例**，实际可用模型和音色以自己的账号权限及服务商文档为准：
+
+| 项目 | OpenAI示例 | 硅基流动示例 |
+| --- | --- | --- |
+| Base URL | `https://api.openai.com/v1` | `https://api.siliconflow.cn/v1` |
+| ASR模型 | `gpt-4o-mini-transcribe` | 从服务端选择支持`/audio/transcriptions`的识别模型 |
+| TTS模型 | `gpt-4o-mini-tts` | `FunAudioLLM/CosyVoice2-0.5B` |
+| ASR/TTS协议 | `openai` | `openai` |
+| 默认音色 | `coral` | `FunAudioLLM/CosyVoice2-0.5B:alex` |
+| TTS响应形式 | `binary` | `binary` |
+| 音频格式 | `mp3` | `mp3` |
+| TTS风格字段名 | `instructions`，使用支持此参数的模型 | 不支持独立风格参数时设为空 |
+| 额外请求JSON | `{}`起步 | `{}`起步 |
+
+依据：[OpenAI识别](https://developers.openai.com/api/docs/guides/speech-to-text)、[OpenAI合成](https://developers.openai.com/api/docs/guides/text-to-speech)、[硅基流动合成](https://docs.siliconflow.cn/docs/userguide/capabilities/text-to-speech)。这些示例不需要改变现有聊天模型配置。
+
+### 2. 通用参数与开关
+
+| 参数 | 默认值 | 怎么填及效果 |
+| --- | --- | --- |
+| 启用语音理解 `speech.asr.enabled` | 关闭 | 配好ASR后开启；不需要识别录音时保持关闭。 |
+| 识别允许群内所有语音 `speech.asr.groupAll` | 关闭 | 关闭时只识别需要回复的群语音；开启后识别已通过群/用户准入的群语音，供后续上下文使用，但不强制回复。私聊符合准入时会识别。 |
+| 启用人格语音回复 `speech.tts.enabled` | 关闭 | 配好TTS后开启。先投递正常文字，再附加语音；合成或发送失败保留文字。 |
+| 语音回复场景 `speech.tts.mode` | `on-audio` | `on-audio`：回复窗口包含录音时附加语音；`always`：普通主动/被动模型回复都附加语音。管理指令的固定回复不经过此朗读流程。 |
+| 调用超时 `speech.timeoutMs` | `30000` | 单位毫秒，30000=30秒；允许1000～120000。服务较慢时可设60000。 |
+| 音频大小上限 `speech.maxBytes` | `20000000` | 单位字节，约20MB；允许1024～25000000。服务商上限更低时按其限制降低。不是录音时长。 |
+| 可信语音目录 `speech.allowedDirs` | 空列表 | 填OneBot `get_record`返回的WAV文件实际所在目录，例如`D:/QQAudio/cache`；多个目录用逗号分隔。HTTP/base64音频通常无需此项。不要填机器人QQ号或OneBot WS地址。 |
+| 最大朗读字数 `speech.tts.maxChars` | `1500` | 允许50～4000；超出上限仅保留文字，不截取一半朗读。长回复可先用300～800。 |
+| 默认音色 `speech.tts.voice` | `alloy` | 填服务商音色ID，不是“猫娘”“温柔”等人格名称；例如`coral`或服务商要求的完整`模型:音色`ID。人格音色为空时使用此值。 |
+| 合成音频格式 `speech.tts.format` | `mp3` | 可选`mp3`、`wav`、`opus`；需服务商支持。先用mp3。Gemini原生音频不使用这个OpenAI格式字段，PCM响应会转换为WAV。 |
+| 默认朗读风格 `speech.tts.instructions` | 空 | 可写“用自然、温柔的中文语气朗读”；最多1500字。需接口支持对应参数；不支持时把TTS风格字段名设为空。 |
+
+QQ录音常为SILK，需要OneBot转换为WAV。先确认实现支持`get_record`，再把其返回的实际缓存目录加入可信目录；目录允许不等于具备转换能力。TTS发送还需要OneBot支持`can_send_record`和`record`消息。
+
+目录包含空格时，当前后台列表输入会按空白分隔，请直接在自己的`config/app.local.yaml`用YAML数组填写并重启，例如：
+
+```yaml
+speech:
+  allowedDirs:
+    - 'D:/QQ Audio/cache'
+```
+
+程序最多同时处理4个语音任务，一条消息最多识别2段录音；TTS音频还受OneBot发送缓冲大小限制。转写文字不会自动执行`/forget`等指令，也不会直接创建提醒。
+
+### 3. ASR识别接口参数
+
+| 参数 | 默认值 | 怎么填 |
+| --- | --- | --- |
+| 协议 `speech.asr.protocol` | `auto` | `auto`按供应商协议选Gemini或OpenAI兼容；明确是`/audio/transcriptions`时选`openai`；Gemini音频输入选`gemini`；其他HTTP格式选`custom`。Anthropic/Ollama供应商不能通过auto直接获得语音能力。 |
+| 端点路径 `speech.asr.path` | 空 | OpenAI兼容留空会使用`/audio/transcriptions`；基础地址已有`/v1`时不要再填`/v1/audio/transcriptions`。自定义服务可填`/recognize`或完整HTTP URL。Gemini原生自动生成端点，此项不使用。 |
+| 音频编码 `speech.asr.encoding` | `multipart` | 自定义接口接收文件上传选`multipart`；接收base64 JSON选`base64-json`。OpenAI兼容固定使用multipart，Gemini原生固定使用inlineData。 |
+| 模型字段 `speech.asr.modelField` | `model` | 填服务端接收模型ID的请求字段名，例如`model`或`engine`；留空省略。 |
+| 文件字段 `speech.asr.fileField` | `file` | multipart时填文件字段名，如`file`或`recording`，不能为空；base64-json时该字段装base64字符串，可留空后改用额外JSON嵌套模板。 |
+| 响应字段路径 `speech.asr.responsePath` | 空 | 返回`{"text":"你好"}`时留空；返回`{"result":{"transcript":"你好"}}`时填`result.transcript`。纯文字响应也留空。Gemini原生自动读取文字parts，不使用这个映射。 |
+| 额外请求JSON `speech.asr.extra` | `{}` | 填服务端额外参数的JSON对象，如`{"language":"zh"}`，需接口支持。base64-json可用嵌套模板；multipart按表单参数发送固定值，不替换模板变量。Gemini原生请求不使用此项。 |
+
+**ASR中若显示“文字字段、音色字段、speedField、instructionsField、formatField”，它们是共用配置项，当前识别请求不使用，可保持默认。** ASR始终按文字/JSON解析结果，不需要配置TTS的binary/base64/url响应形式。
+
+
+以下共用字段保留默认即可，当前ASR不会发送它们：
+
+| 共用配置项 | 默认值 | 当前作用 |
+| --- | --- | --- |
+| `speech.asr.textField` | `input` | 识别不需要输入文字字段 |
+| `speech.asr.voiceField` | `voice` | 识别不选择音色 |
+| `speech.asr.speedField` | `speed` | 识别不发送朗读语速 |
+| `speech.asr.instructionsField` | `instructions` | 识别不发送TTS风格提示 |
+| `speech.asr.formatField` | `response_format` | 识别不发送此格式字段；需要识别响应格式时按接口文档放进ASR额外JSON |
+| `speech.tts.fileField` | `file` | 合成输入是文字，不上传录音文件 |
+
+### 4. TTS合成接口参数
+
+| 参数 | 默认值 | 怎么填 |
+| --- | --- | --- |
+| 协议 `speech.tts.protocol` | `auto` | OpenAI兼容选`openai`；Gemini音频输出选`gemini`；其他HTTP格式选`custom`。必须搭配支持音频输出的模型。 |
+| 端点路径 `speech.tts.path` | 空 | OpenAI兼容留空使用`/audio/speech`；自定义可填`/synthesize`或完整HTTP URL。Gemini原生自动生成端点，此项不使用。 |
+| 响应形式 `speech.tts.responseType` | `binary` | 接口直接返回MP3/WAV/Opus字节选`binary`；JSON内放base64选`base64`；JSON内放音频下载URL选`url`。Gemini原生自动解析音频，不使用此项。 |
+| 响应字段路径 `speech.tts.responsePath` | 空 | binary留空；JSON默认读取`audio`，返回`{"data":{"audio":"..."}}`时填`data.audio`。必须指向base64字符串或HTTP音频URL。 |
+| 模型字段 `speech.tts.modelField` | `model` | 服务端模型字段名；例如`model`或`engine`。 |
+| 输入文字字段 `speech.tts.textField` | `input` | 服务端要朗读的文字字段名；若文档写`text`，这里填`text`。 |
+| 音色字段 `speech.tts.voiceField` | `voice` | 音色字段名；例如`voice`、`speaker`、`speaker_id`。 |
+| 语速字段 `speech.tts.speedField` | `speed` | 服务端支持语速时填其字段名；不支持时设为空。语速数值在“人格语音”中填。 |
+| 风格字段 `speech.tts.instructionsField` | `instructions` | 接口支持风格提示时保留或改成服务端字段名；不支持时设为空，避免发送无效参数。 |
+| 格式字段 `speech.tts.formatField` | `response_format` | 服务端接收输出格式的字段名；若写`format`则填`format`；不支持时设为空。 |
+| 额外请求JSON `speech.tts.extra` | `{}` | 填自定义参数或嵌套请求模板。标准字段会在模板之后写入；嵌套格式应把不需要的平铺字段名设为空。Gemini原生不使用额外JSON或上述字段映射。 |
+
+TTS当前发送JSON请求，文件字段与音频编码设置不参与合成。**请求字段名只是一级键名**，填写`request.text`不会自动创建嵌套对象；嵌套对象请用额外JSON。响应字段路径才支持`data.audio`这样的点路径。
+
+### 5. 人格语音参数及继承顺序
+
+| 人格参数 | 默认值 | 怎么填及继承规则 |
+| --- | --- | --- |
+| 允许语音 `voice.enabled` | 开启 | 仅允许这个人格使用全局TTS；全局TTS关闭时仍不会发送语音。 |
+| 覆盖供应商 `voice.provider` | 空 | 填“模型接入”里已有供应商的标识，不是服务商网址；留空使用TTS用途供应商。 |
+| 覆盖模型 `voice.model` | 空 | 填该供应商支持的真实TTS模型ID；留空使用TTS用途模型。更换人格供应商时，通常也要填写匹配模型。 |
+| 音色ID `voice.voice` | 空 | 填该模型支持的音色ID；留空使用全局默认音色。不能直接填写人格ID来获得对应声音。 |
+| 语速 `voice.speed` | `1` | 1=正常；可先试0.9或1.1。项目允许0.25～4，但服务端可能有更窄范围，需遵守服务端限制。Gemini原生不发送数值speed，可在风格描述中表达语速。 |
+| 朗读风格 `voice.instructions` | 空 | 例如“用轻松、温柔的中文语气朗读”；留空使用全局风格。Gemini将其加入朗读提示，其他接口需支持风格字段。 |
+
+供应商和模型各自独立继承：人格覆盖 → TTS用途 → 默认供应商；**TTS模型没有聊天模型回退**。音色与风格为人格优先、全局其次；语速使用人格数值。
+
+### 6. 自定义接口填写示例
+
+假设ASR收`{"request":{"audio":"base64...","engine":"模型ID"}}`，返回`{"result":{"transcript":"识别文字"}}`：协议选custom、编码选base64-json、路径按服务端填写，模型字段和文件字段设为空，响应路径填`result.transcript`，额外JSON填：
+
+```json
+{"request":{"audio":"$audioBase64","engine":"$model","mime":"$mimeType"}}
+```
+
+假设TTS收嵌套请求，返回`{"data":{"audio":"base64..."}}`：协议选custom，响应形式选base64，响应路径填`data.audio`；模型/文字/音色/语速/风格/格式这些平铺字段名都设为空，额外JSON填：
+
+```json
+{"request":{"model":"$model","text":"$text","speaker":"$voice","speed":"$speed","format":"$format"}}
+```
+
+可用变量为`$model`、`$audioBase64`、`$mimeType`、`$text`、`$voice`、`$speed`、`$instructions`、`$format`，按识别/合成请求使用对应变量。只有整个字符串等于变量名时才替换；`$speed`保留数字类型，`前缀$text`不会拼接替换。不要填写JavaScript表达式。
+
+### 7. 填完后的检查顺序
+
+1. 确认ASR/TTS供应商启用，且选择的是语音模型，Key有权限。
+2. ASR开启后，私聊发送一段短录音；失败时检查日志中的get_record转换、可信目录、HTTP状态和响应字段。
+3. TTS先选on-audio，音色选服务商支持的ID，语速1，额外JSON为`{}`；服务不支持风格/speed时将相应字段名设为空。
+4. 已收到文字但没有语音时，检查人格允许语音、全局TTS、场景模式、文本长度及OneBot语音发送能力。
+5. 提示响应字段不存在时核对binary/base64/url和字段路径；“非支持音频”常见原因是服务返回了错误JSON或尚未转换的SILK。
+
+后台保存后通常对后续请求生效；手工修改配置需要重启。服务需要专用签名、实时WebSocket或异步轮询时，请通过兼容HTTP网关接入。
+
 
 ## 无真实 QQ 的调试与测试
 
@@ -236,6 +408,10 @@ npm run test:command-permissions
 npm run test:persona-context
 npm run test:proactive-relevance
 npm run test:reply-window
+npm run test:forward-messages
+npm run test:speech
+npm run test:scheduled-tasks
+npm run test:links-cards
 ```
 
 构建后可使用 `node dist/src/index.js` 启动；保留 `src/web/panel.html`，编译产物不会单独包含该页面。
@@ -248,7 +424,7 @@ npm run test:reply-window
 4. 执行 `npm ci`，再运行测试和构建。
 5. 重启并检查账号、模型和权限设置。
 
-旧数据库升级前会自动生成迁移备份。本版本使用 schema v4；更新程序本身不会代替你删除原始数据。需要回滚代码时，同时考虑数据库版本与迁移备份。
+旧数据库升级前会自动生成迁移备份。本版本使用 schema v5；更新程序本身不会代替你删除原始数据。需要回滚代码时，同时考虑数据库版本与迁移备份。
 
 ## 目录与公开发布
 
