@@ -32,7 +32,7 @@ Windows 提供 `.bat` 启动文件；也可使用下面的 npm 命令。项目�
 
 ### 1. 下载与启动
 
-下载仓库源码并解压，或使用 Git 克隆。Windows 可双击 `start.bat`，首次启动会安装依赖。
+下载仓库源码并解压，或使用 Git 克隆。Windows 可双击 `start.bat`，首次启动会优先按锁文件执行 `npm ci` 安装依赖；安装失败时停止并保留错误信息。
 
 命令行方式：
 
@@ -302,3 +302,26 @@ npm生成的包不附带 `package-lock.json`；从该包解压运行时使用 `n
 **端口占用或 OneBot 一直重连**
 
 核对 `napcat.url`、服务端端口和 Token，避免同时启用占用相同端口的真实服务与 Mock。连接失败不会阻止本地后台启动。
+
+### 双击脚本出现碎片化命令错误
+
+如果出现 `'-click'`、`'mis-decode'`、`'anel:'` 等“不是内部或外部命令”，说明旧批处理的换行被转换成了 LF。请使用本次修复后的 `start.bat`、`start-mock.bat` 和 `test.bat`，保持 ASCII、无 BOM 和 CRLF；不需要改动自己的数据库或模型配置。
+
+仓库的 `.gitattributes` 使用 `*.bat -text` 和 `*.cmd -text`，保留 Git 对象中的原始 CRLF 字节，使 GitHub Download ZIP 和 Git 克隆都能得到可执行的批处理。[Git 属性说明](https://git-scm.com/docs/gitattributes)
+
+如果你维护已有 GitHub 仓库，请一起提交并推送这三个脚本和 `.gitattributes`。只修改换行属性而不重新提交脚本，旧归档不会自动修复。
+
+在更新脚本前，也可以打开命令提示符，进入项目目录，手动执行 `npm ci` 和 `npm start`。如果命令提示符本身也提示找不到 npm，请安装满足要求的 Node.js 并重新打开终端。
+
+### 启动日志中文乱码
+
+如果日志出现“鍚姩”“鏁版嵁”等乱码，终端通常正在用代码页936解释UTF-8。新版三个批处理会在安装和启动前执行 `chcp 65001 >nul`。替换对应启动脚本即可，保留自己的配置和数据库。
+
+直接在命令提示符运行 npm 时，先切换编码：
+
+```cmd
+chcp 65001
+npm start
+```
+
+若中文正常但emoji显示为方框，属于字体显示问题，可用Windows Terminal或支持相应字符的字体。

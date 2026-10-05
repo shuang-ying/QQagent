@@ -1,52 +1,39 @@
 @echo off
-REM ============================================================
-REM  QQ Agent launcher - just double-click this file.
-REM  ASCII-only on purpose: cmd can mis-decode UTF-8 .bat files.
-REM ============================================================
-chcp 65001 >nul 2>&1
-setlocal
-
+setlocal EnableExtensions DisableDelayedExpansion
+chcp 65001 >nul
 cd /d "%~dp0"
 
-REM Resolve npm to a FULL PATH before calling it.
-REM NOTE: `call "npm.cmd"` (bare name, quoted) breaks npm's own
-REM %~dp0 self-resolution and fails with MODULE_NOT_FOUND.
+REM Keep this file ASCII with CRLF. See .gitattributes.
 set "NPMPATH="
 for /f "delims=" %%i in ('where npm.cmd 2^>nul') do if not defined NPMPATH set "NPMPATH=%%i"
-if not defined NPMPATH if exist "D:\NodeJs\npm.cmd" set "NPMPATH=D:\NodeJs\npm.cmd"
-
+if not defined NPMPATH if exist "%ProgramFiles%\nodejs\npm.cmd" set "NPMPATH=%ProgramFiles%\nodejs\npm.cmd"
 if not defined NPMPATH (
-  echo.
-  echo [X] npm not found. Please install Node.js v22.16 or newer.
-  pause
+  echo [X] npm was not found. Install Node.js 22.16 or newer, then reopen this window.
+  if not defined QQ_AGENT_NO_PAUSE pause
   exit /b 1
 )
 
-if not exist "node_modules" (
-  echo.
-  echo [!] Dependencies not found. Running install first...
-  echo.
-  call "%NPMPATH%" install --no-fund --no-audit
-  if errorlevel 1 (
-    echo.
-    echo [X] Install failed. Check your network and Node.js version ^(need v22.16+^).
-    pause
-    exit /b 1
-  )
+call :ensure_dependencies
+if not "%ERRORLEVEL%"=="0" (
+  echo [X] Dependency installation failed. Check the error above and your network.
+  if not defined QQ_AGENT_NO_PAUSE pause
+  exit /b 1
 )
 
-echo.
-echo ============================================================
-echo   Starting QQ Agent...
-echo   Panel: http://127.0.0.1:3081
-echo ============================================================
-echo.
+echo Starting QQ Agent...
+echo Open the panel at http://127.0.0.1:3081
+call "%NPMPATH%" run start
+set "AGENT_EXIT=%ERRORLEVEL%"
+if not "%AGENT_EXIT%"=="0" echo [X] Agent exited with code %AGENT_EXIT%. Check the error above.
+if not defined QQ_AGENT_NO_PAUSE pause
+exit /b %AGENT_EXIT%
 
-REM 延时2秒后自动打开浏览器面板（服务启动后自动跳转）
-start "" cmd /c "timeout /t 1 /nobreak >nul && start http://127.0.0.1:3081"
-
-call "%NPMPATH%" exec --no -- tsx src/index.ts
-
-echo.
-echo Agent stopped.
-pause
+:ensure_dependencies
+if exist "node_modules\.bin\tsx.cmd" if exist "node_modules\sharp\package.json" exit /b 0
+echo [!] Installing dependencies...
+if exist "package-lock.json" (
+  call "%NPMPATH%" ci --no-fund --no-audit
+) else (
+  call "%NPMPATH%" install --no-fund --no-audit
+)
+exit /b %ERRORLEVEL%

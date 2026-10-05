@@ -45,14 +45,15 @@
     "test:context-budget": "tsx scripts/test-context-budget.ts",
     "test:summary-strategies": "tsx scripts/test-summary-strategies.ts",
     "test:optimizations-next": "npm run test:background && npm run test:reply-strategy && npm run test:addressing && npm run test:auxiliary && npm run test:media && npm run test:vision-description && npm run test:image-history && npm run test:sticker-candidates && npm run test:context-budget && npm run test:summary-strategies",
-    "test:optimizations-final": "tsx scripts/test-memory-index.ts && tsx scripts/test-memory-retrieval.ts && tsx scripts/test-fact-lifecycle.ts && tsx scripts/test-config-atomic.ts && tsx scripts/test-database-maintenance.ts && tsx scripts/test-operations.ts && npm run test:command-permissions && npm run test:persona-context && npm run test:proactive-relevance && npm run test:reply-window",
+    "test:optimizations-final": "tsx scripts/test-memory-index.ts && tsx scripts/test-memory-retrieval.ts && tsx scripts/test-fact-lifecycle.ts && tsx scripts/test-config-atomic.ts && tsx scripts/test-database-maintenance.ts && tsx scripts/test-operations.ts && npm run test:command-permissions && npm run test:persona-context && npm run test:proactive-relevance && npm run test:reply-window && npm run test:launchers",
     "test:replay": "tsx scripts/test-agent-replay.ts",
     "test:isolated": "npm run test:stage1 && npm run test:panel-isolated",
     "test:panel-isolated": "tsx scripts/test-panel-isolated.ts",
     "test:command-permissions": "tsx scripts/test-command-permissions.ts",
     "test:persona-context": "tsx scripts/test-persona-context.ts",
     "test:proactive-relevance": "tsx scripts/test-proactive-relevance.ts",
-    "test:reply-window": "tsx scripts/test-reply-window.ts"
+    "test:reply-window": "tsx scripts/test-reply-window.ts",
+    "test:launchers": "tsx scripts/test-launchers.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",
@@ -86,6 +87,7 @@
     "start.bat",
     "start-mock.bat",
     "test.bat",
-    "package-lock.json"
+    "package-lock.json",
+    ".gitattributes"
   ]
 }
