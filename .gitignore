@@ -4,6 +4,7 @@ data/
 runtime/
 logs/
 *.log
+docs/
 
 # 本地私密配置：含 API key，绝不外传
 config/providers.local.yaml
