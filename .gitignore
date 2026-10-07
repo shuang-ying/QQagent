@@ -41,3 +41,6 @@ docs/online-*.md
 docs/*-result.json
 docs/*-test-output*.txt
 docs/*-test-first-failure.txt
+
+!docs/token-budgets.md
+!docs/log-diagnostics.md

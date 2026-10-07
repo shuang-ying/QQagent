@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 回复分发器：把「一段文本」变成「像真人那样发出去的消息」
  *
@@ -13,6 +14,8 @@ import type { ObMessageSegment, ReplyBehavior } from '../core/types.js';
 import type { OneBotAction } from '../onebot/action.js';
 import { atSegment, buildReplySegments, textSegment, OneBotActionError } from '../onebot/action.js';
 import { readFile, access, constants } from 'node:fs/promises';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
 import { setTimeout as wait } from 'node:timers/promises';
 import { splitMessage } from './segments.js';
 
@@ -188,7 +191,7 @@ export class ReplyDispatcher {
         const unknown = !(e instanceof OneBotActionError) || e.outcome === 'unknown';
         out.failed++;
         this.log.warn(
-          { scope: ctx.scope, index: i, err: (e as Error).message },
+          { scope: ctx.scope, index: i, ...errorDetails(e), err: (e as Error).message },
           '发送消息失败',
         );
         // 若带 @/引用 的整段被拒（部分实现不支持 reply 段），退化为纯文本再试一次
@@ -248,7 +251,7 @@ export class ReplyDispatcher {
         await api.poke(ev.scope, ev.userId, { throwOnError: true });
         poked = true;
       } catch (e) {
-        this.log.debug({ scope: ev.scope, err: (e as Error).message }, '戳回去失败（实现可能不支持）');
+        this.log.debug({ scope: ev.scope, ...errorDetails(e), err: (e as Error).message }, '戳回去失败（实现可能不支持）');
       }
     }
 
@@ -262,7 +265,7 @@ export class ReplyDispatcher {
         await api.sendToScope(ev.scope, segs, { throwOnError: true });
         said = true;
       } catch (e) {
-        this.log.warn({ scope: ev.scope, err: (e as Error).message }, '戳后说话失败');
+        this.log.warn({ scope: ev.scope, ...errorDetails(e), err: (e as Error).message }, '戳后说话失败');
       }
     }
 
@@ -276,7 +279,7 @@ export class ReplyDispatcher {
       await api.setMsgEmojiLike(messageId, this.cfg.emojiLike.emojiId, { throwOnError: true });
       return true;
     } catch (e) {
-      this.log.debug({ messageId, err: (e as Error).message }, '表情回应失败');
+      this.log.debug({ messageId, ...errorDetails(e), err: (e as Error).message }, '表情回应失败');
       return false;
     }
   }
@@ -284,10 +287,11 @@ export class ReplyDispatcher {
   /**
    * 发送一张表情包。
    *
-   * 优先用本地路径（NapCat 与本程序同机，直接读文件最高效）。
+   * 优先用标准 file URI（OneBot 与本程序同机时可直接读文件）。
    * 若路径方式失败（有些实现只认 base64/URL），退化为 base64 内联再试一次。
    */
-  async sendSticker(api: OneBotAction, scope: string, file: string): Promise<boolean> {
+  async sendSticker(api: OneBotAction, scope: string, file: string, opts: {signal?:AbortSignal} = {}): Promise<boolean> {
+    if (opts.signal?.aborted) return false;
     // 先确认文件真的在：否则只能等 NapCat 报错，日志里看不出原因
     try {
       await access(file, constants.R_OK);
@@ -298,24 +302,39 @@ export class ReplyDispatcher {
 
     // 1) 本地路径
     try {
-      await api.sendToScope(scope, [{ type: 'image', data: { file } }], { throwOnError: true });
+      if (opts.signal?.aborted) return false;
+      const receipt = await api.sendToScope(scope, [{ type: 'image', data: { file:pathToFileURL(path.resolve(file)).href } }], { throwOnError: true });
+      if (!Number.isSafeInteger(receipt?.message_id) || !receipt.message_id) {
+        this.log.warn({scope,file,route:'file-uri',outcome:'unknown'}, '表情包回执缺少可靠消息ID，未重复发送');
+        return false;
+      }
+      this.log.info({scope,file,route:'file-uri',messageId:receipt.message_id}, '表情包已确认投递');
       return true;
     } catch (e) {
-      if (!(e instanceof OneBotActionError) || e.outcome === 'unknown') return false;
-      this.log.debug({ scope, file, err: (e as Error).message }, '表情包按路径发送失败，改用 base64');
+      if (!(e instanceof OneBotActionError) || e.outcome === 'unknown') {
+        this.log.warn({scope,file,outcome:'unknown',...errorDetails(e), reason: (e as Error).message}, '表情包投递结果未知，未重复发送');
+        return false;
+      }
+      this.log.debug({ scope, file, ...errorDetails(e), err: (e as Error).message }, '表情包按路径发送失败，改用 base64');
     }
 
     // 2) base64 兜底
     try {
       const buf = await readFile(file);
-      await api.sendToScope(
+      if (opts.signal?.aborted) return false;
+      const receipt = await api.sendToScope(
         scope,
         [{ type: 'image', data: { file: `base64://${buf.toString('base64')}` } }],
         { throwOnError: true },
       );
+      if (!Number.isSafeInteger(receipt?.message_id) || !receipt.message_id) {
+        this.log.warn({scope,file,route:'base64',outcome:'unknown'}, '表情包回执缺少可靠消息ID，未重复发送');
+        return false;
+      }
+      this.log.info({scope,file,route:'base64',messageId:receipt.message_id}, '表情包已确认投递');
       return true;
     } catch (e) {
-      this.log.warn({ scope, file, err: (e as Error).message }, '表情包发送失败');
+      this.log.warn({ scope, file, ...errorDetails(e), err: (e as Error).message }, '表情包发送失败');
       return false;
     }
   }

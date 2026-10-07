@@ -278,8 +278,8 @@
           两条路都开着，可以各自开关（在「概览 → 功能开关 → 回复行为」）：<br>
           <b>① 模型自主决定</b>：提示词里带上每张图的标签和描述，模型觉得该发时会在正文末尾写
           <span class="mono">[表情:标签]</span>，正文照常发，然后单独发一条图。<br>
-          <b>② 按情绪自动补图</b>：模型没主动发时，命中情绪且强度够就自己补一张。
-          受<b>冷却</b>和<b>概率</b>限制 —— 每次都发会显得很机械，也容易招人烦。<br>
+          <b>② 自动发送</b>：开启后，模型点名和自动补图统一受<b>情绪强度、冷却和概率</b>限制，每轮只判定一次概率。
+          模型没写标记时，结合回复内容和已识别情绪挑选图片；用户明确要求发表情包时直接满足。<br>
           <span class="muted">建议：先只开 ①，观察一阵再考虑开 ②；② 的冷却别低于 120 秒。</span>
         </div>
       </div>
@@ -1245,8 +1245,11 @@ function renderToggle(s) {
   if (s.type === 'number') {
     const range = (s.min !== undefined || s.max !== undefined)
       ? '（' + (s.min !== undefined ? s.min : '') + ' ~ ' + (s.max !== undefined ? s.max : '') + '）' : '';
+    const budgetHint = s.originalBudget
+      ? '<div class="d">原预算（填 0 继承）：' + esc(s.originalBudget) +
+        '</div><div class="d">当前：' + (Number(s.value) === 0 ? '继承原预算及原重试策略' : esc(s.value) + ' tokens / 次，重试也受此上限约束') + '</div>' : '';
     return '<div class="toggle-row">' +
-      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div></div>' +
+      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div>' + budgetHint + '</div>' +
       '<input type="number" id="' + inputId + '" class="setting-number" value="' + esc(s.value) + '"' +
         (s.min !== undefined ? ' min="' + s.min + '"' : '') + (s.max !== undefined ? ' max="' + s.max + '"' : '') +
         ' step="any" onchange="applySetting(\'' + s.path + '\', Number(this.value), this)">' +

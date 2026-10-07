@@ -1,3 +1,5 @@
+import { errorDetails } from '../core/logger.js';
+import { originalTokenBudgetLabel } from '../llm/token-budgets.js';
 /**
  * 管理面板服务端
  *
@@ -15,7 +17,7 @@ import { serve } from '@hono/node-server';
 import type { Logger } from '../core/logger.js';
 import { APP_VERSION } from '../core/version.js';
 import type { AppConfig, LlmRoleName, Persona, ProviderConfig } from '../core/types.js';
-import { LLM_ROLE_LABELS, LLM_ROLE_NAMES } from '../core/types.js';
+import { LLM_ROLE_LABELS, LLM_ROLE_NAMES, TOKEN_BUDGET_PURPOSES, TokenBudgetValueSchema } from '../core/types.js';
 import {memoryTerms} from '../memory/store.js';
 import type { MemoryStore } from '../memory/store.js';
 import type { ProviderManager } from '../llm/manager.js';
@@ -122,6 +124,12 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
   const { cfg, store, providers, personas, log, runtime } = deps;
   if (!['127.0.0.1','localhost','::1'].includes(cfg.server.host) && !cfg.server.authToken) throw new Error('非回环面板必须配置 authToken');
   const app = new Hono();
+  app.use('*', async (c, next) => {
+    const startedAt = Date.now();
+    await next();
+    if (c.res.status >= 400) log.warn({method:c.req.method,route:c.req.path,status:c.res.status,
+      elapsedMs:Date.now()-startedAt}, '管理接口返回错误状态');
+  });
 
   // ==================== 鉴权 ====================
   // authToken 为空且只监听回环地址时视为本机可信任
@@ -152,7 +160,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
   app.get('/api/speech/status',c=>c.json({ok:true,status:deps.speechStatus?.()??null}));
   app.get('/api/tasks',c=>c.json({ok:true,tasks:deps.tasks?.list(c.req.query('scope'))??[],runs:store.db.prepare('SELECT * FROM scheduled_task_runs ORDER BY created_at DESC LIMIT 100').all(),timezone:cfg.app.timezone}));
   app.post('/api/tasks',async c=>{if(!deps.tasks)return c.json({ok:false,error:'服务未启动'},503);try{const body=await c.req.json();if(!['reminder','digest'].includes(body.kind)||typeof body.scope!=='string'||!Number.isSafeInteger(body.ownerId)||body.ownerId<=0)throw Error('任务参数无效');
-    const task=body.kind==='digest'?deps.tasks.createDaily(body.scope,body.ownerId,String(body.clock??'')):(()=>{const parsed=parseReminder(String(body.when??'')+' '+String(body.text??''),cfg.app.timezone);return deps.tasks!.createReminder(body.scope,body.ownerId,parsed.text,parsed.dueAt);})();return c.json({ok:true,task});}catch(e){return c.json({ok:false,error:(e as Error).message},400);}});
+    const task=body.kind==='digest'?deps.tasks.createDaily(body.scope,body.ownerId,String(body.clock??'')):(()=>{const parsed=parseReminder(String(body.when??'')+' '+String(body.text??''),cfg.app.timezone);return deps.tasks!.createReminder(body.scope,body.ownerId,parsed.text,parsed.dueAt);})();return c.json({ok:true,task});}catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');return c.json({ok:false,error:(e as Error).message},400);}});
   app.post('/api/tasks/:id/cancel',c=>deps.tasks?.cancel(c.req.param('id'))?c.json({ok:true}):c.json({ok:false,error:'任务不存在或正在执行'},400));
   app.get('/api/memory/forgetting', c => c.json({ok:true,records:store.db.prepare('SELECT * FROM memory_forgetting ORDER BY id DESC LIMIT 100').all()}));
   app.get('/api/memory/explain', c => {
@@ -295,7 +303,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.saveProvider(key, config);
       return c.json({ ok: true, message: `供应商 ${key} 已保存`, key });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -311,7 +319,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         cfg.llm.defaultModel = '';
       }
       return c.json({ ok: true, message: `供应商 ${key} 已删除` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -347,7 +355,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       // 清除缓存，让下次重新发现
       providers.clearCache(key);
       return c.json({ ok: true, message: `供应商 ${key} 已更新` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -359,7 +367,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const r = await providers.testConnection(body.providerKey, body.model);
       return c.json(r);
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -371,7 +379,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.updateDefaultModel(body.providerKey, body.model ?? '');
       return c.json({ ok: true, message: `默认已设为 ${body.providerKey}${body.model ? '/' + body.model : ''}（重启后完全生效）` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -382,7 +390,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const { protocol, models } = await providers.ensureModels(key);
       return c.json({ ok: true, protocol, models });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -398,6 +406,10 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       group: d.group,
       ...(d.options ? { options: d.options } : {}),
       value: readPath(cfg, d.path),
+      ...(d.path.startsWith('llm.tokenBudgets.') ? {
+        originalBudget:originalTokenBudgetLabel(cfg.llm,d.path.slice('llm.tokenBudgets.'.length)),
+        min:d.min,max:d.max,
+      } : {}),
     }));
 
     // 分组，便于前端渲染
@@ -425,8 +437,34 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         changed,
         message: changed === 0 ? '没有变化' : `已更新 ${changed} 项并立即生效`,
       });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
+    }
+  });
+
+  /** 模型用途（chat / emotion / summary / facts / embedding / vision） */
+  app.get('/api/token-budgets', c => c.json({ok:true,budgets:cfg.llm.tokenBudgets,
+    defaults:{chat:cfg.llm.generation.maxTokens,summary:cfg.llm.generation.summaryMaxTokens,
+      vision:{min:1200,perImage:500,max:6000},sticker:600,emotion:200,facts:800,daily:1200},
+    limits:{min:0,max:131072},unit:'output-tokens-per-call',
+    note:'0 保持原用途/人格预算；非零覆盖每次生成（含重试）的输出上限。模型上下文可能进一步降低；不含输入，不是累计额度。'}));
+  app.patch('/api/token-budgets', async c => {
+    const body = await c.req.json().catch(()=>null);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key=>key!=='budgets')
+      || !body.budgets || typeof body.budgets !== 'object' || Array.isArray(body.budgets)
+      || Object.keys(body.budgets).length===0) return c.json({ok:false,error:'需要非空 budgets 对象'},400);
+    const patch: Record<string,unknown> = {};
+    for (const [purpose,value] of Object.entries(body.budgets)) {
+      if (!(TOKEN_BUDGET_PURPOSES as readonly string[]).includes(purpose) || !TokenBudgetValueSchema.safeParse(value).success)
+        return c.json({ok:false,error:`非法预算 ${purpose}：用途须受支持，数量须为 0～131072 的整数`},400);
+      patch[`llm.tokenBudgets.${purpose}`] = value;
+    }
+    try {
+      const changed = deps.updateSettings(patch);
+      return c.json({ok:true,changed,budgets:cfg.llm.tokenBudgets});
+    } catch (error) {
+      log.warn({method:c.req.method,route:c.req.path,...errorDetails(error)},'Token预算保存失败');
+      return c.json({ok:false,error:(error as Error).message},400);
     }
   });
 
@@ -478,7 +516,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const r = await deps.testEmbedding(providerKey, model);
       return c.json(r);
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -539,7 +577,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const changed = deps.updateAccess(result.entries);
       return c.json({ ok: true, changed, message: `已更新 ${changed} 项并立即生效` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
     }
   });
@@ -599,7 +637,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const conversationId=personas.switchForSession(body.scope,body.personaId,body.history??'keep');
       return c.json({ok:true,conversationId,personaId:body.personaId,history:body.history??'keep'});
-    }catch(e){return c.json({ok:false,error:(e as Error).message},400);}
+    }catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');return c.json({ok:false,error:(e as Error).message},400);}
   });
 
   /** 切换默认人格 */
@@ -609,7 +647,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.setDefaultPersona(body.personaId);
       return c.json({ ok: true, message: `默认人格已切换为 ${body.personaId}` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
     }
   });
@@ -622,7 +660,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.savePersona(checked.persona, true);
       return c.json({ ok: true, message: `人格「${checked.persona.name}」已创建`, id: checked.persona.id });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
     }
   });
@@ -638,7 +676,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.savePersona(checked.persona, false);
       return c.json({ ok: true, message: `人格「${checked.persona.name}」已保存` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
     }
   });
@@ -649,7 +687,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       deps.deletePersona(id);
       return c.json({ ok: true, message: `人格 ${id} 已删除` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 400);
     }
   });
@@ -659,7 +697,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const count = deps.reloadPersonas();
       return c.json({ ok: true, count, message: `已重新加载 ${count} 个人格` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -687,7 +725,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
           isCurrent: x.id === current,
         })),
       });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -729,7 +767,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const id = store.newConversation(body.scope, body.title?.trim() || '');
       return c.json({ ok: true, id, message: '已新建话题并切过去' });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -829,7 +867,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
           descCharsInPrompt: cfg.sticker.descCharsInPrompt,
         },
       });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -861,7 +899,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
           'cache-control': 'no-cache',
         },
       });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -877,7 +915,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         tags: lib.tags().length,
         message: `已重新扫描：${lib.usable().length} 张图、${lib.tags().length} 个标签`,
       });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -892,7 +930,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       const limit = Math.max(1, Math.min(Number(body.limit) || 48, 500));
       const result = await deps.importQqStickers(limit);
       return c.json({ ...result, ok: result.added > 0 || result.skipped > 0 });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -914,7 +952,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         ...(Array.isArray(body.files) && body.files.length ? { files: body.files.map(String) } : {}),
       });
       return c.json({ ...result, ok: result.failed === 0 });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -951,7 +989,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
         },
       ]);
       return c.json({ ok: true, message: '已保存' });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -974,13 +1012,13 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
           if (fs.existsSync(abs)) fs.unlinkSync(abs);
           removed++;
         } catch (e) {
-          log.warn({ file: rel, err: (e as Error).message }, '删除表情包文件失败');
+          log.warn({ file: rel, ...errorDetails(e), err: (e as Error).message }, '删除表情包文件失败');
         }
       }
       lib.forget(list);
       lib.reload();
       return c.json({ ok: true, removed, message: `已删除 ${removed} 张` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -991,7 +1029,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
     try {
       const r = await deps.pushStickerDesc();
       return c.json({ ...r, ok: r.failed === 0, message: `回写成功 ${r.ok} 张，失败 ${r.failed} 张` });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });
@@ -1189,7 +1227,7 @@ export function createServer(deps: ServerDeps): { app: Hono; start: () => void; 
       const content = fs.readFileSync(path.join(logDir, latest), 'utf8');
       const all = content.split(/\r?\n/).filter(Boolean);
       return c.json({ ok: true, file: latest, lines: all.slice(-lines) });
-    } catch (e) {
+    } catch (e) { log.warn({method:c.req.method,route:c.req.path,...errorDetails(e)}, '管理接口处理失败');
       return c.json({ ok: false, error: (e as Error).message }, 500);
     }
   });

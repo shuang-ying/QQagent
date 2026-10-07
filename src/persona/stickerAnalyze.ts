@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 让 AI「看懂」表情包
  *
@@ -11,13 +12,12 @@
  *
  * 结果写进 manifest，之后不必重跑。已经识别过的默认跳过（force 可强制重跑）。
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import type { Logger } from '../core/logger.js';
 import type { ChatMessage, StickerEntry } from '../core/types.js';
 import type { ProviderManager } from '../llm/manager.js';
-import { sniffMime } from '../llm/vision.js';
-import type { StickerView, StickerLibrary } from './stickers.js';
+import { loadMedia } from '../llm/media.js';
+import { hasStickerUnderstanding, type StickerView, type StickerLibrary } from './stickers.js';
 
 /**
  * 允许的情绪集合。
@@ -112,7 +112,7 @@ export async function analyzeStickers(
   }
   if (!opts.force) {
     const before = targets.length;
-    targets = targets.filter((s) => !s.desc.trim());
+    targets = targets.filter((s) => !hasStickerUnderstanding(s));
     out.skipped = before - targets.length;
   }
   if (opts.limit && targets.length > opts.limit) {
@@ -141,7 +141,7 @@ export async function analyzeStickers(
       opts.onProgress?.(++done, targets.length, item.file);
 
       try {
-        const meta = await analyzeOne(providers, role.provider, role.model, item, log);
+        const meta = await analyzeOne(providers, role.provider, role.model, item, lib.root, log, opts.signal);
         collected.push({
           file: item.file,
           tags: meta.tags,
@@ -164,7 +164,8 @@ export async function analyzeStickers(
         out.failed++;
         const msg = `${item.file}: ${(e as Error).message}`;
         if (out.errors.length < 10) out.errors.push(msg);
-        log.warn({ file: item.file, err: (e as Error).message }, '表情包识别失败');
+        log.warn({file:item.file,phase:'sticker-analysis',provider:role.provider,model:role.model,
+          ...errorDetails(e),err:(e as Error).message}, '表情包识别失败');
       }
     }
   };
@@ -186,24 +187,26 @@ async function analyzeOne(
   provider: string,
   model: string,
   item: StickerView,
+  root: string,
   log: Logger,
+  signal?: AbortSignal,
 ): Promise<{ tags: string[]; desc: string; useWhen: string; emotions: string[] }> {
-  const buf = fs.readFileSync(item.absPath);
-  const mimeType = sniffMime(buf);
+  // 视觉接口并非都支持 GIF/WebP；只将首帧标准化为 PNG，发送仍使用原文件。
+  const image = await loadMedia(item.absPath, '', { allowedDirs: [root], signal });
 
   const messages: ChatMessage[] = [
     {
       role: 'user',
       content: [
         { type: 'text', text: ANALYZE_PROMPT },
-        { type: 'image', mimeType, data: buf.toString('base64') },
+        image.part,
       ],
     },
   ];
 
   const baseBudget = 600;
   const call = (maxTokens: number) =>
-    providers.chat(messages, provider, model, { temperature: 0.2, maxTokens });
+    providers.chat(messages, provider, model, { purpose: 'sticker', temperature: 0.2, maxTokens, signal });
 
   let res = await call(baseBudget);
 
@@ -233,8 +236,9 @@ async function analyzeOne(
   if (!parsed) throw new Error(`无法解析 JSON：${text.slice(0, 80)}`);
 
   const tags = normalizeTags(parsed['tags']);
-  const desc = String(parsed['desc'] ?? '').trim().slice(0, 40);
-  const useWhen = String(parsed['useWhen'] ?? parsed['use_when'] ?? '').trim().slice(0, 50);
+  const desc = typeof parsed['desc'] === 'string' ? parsed['desc'].trim().slice(0, 40) : '';
+  const rawUseWhen = parsed['useWhen'] ?? parsed['use_when'];
+  const useWhen = typeof rawUseWhen === 'string' ? rawUseWhen.trim().slice(0, 50) : '';
   const emotions = normalizeEmotions(parsed['emotions']);
 
   // 标签全丢时用文件名兜底 —— 但**只对命名有意义的本地文件**。
@@ -248,6 +252,7 @@ async function analyzeOne(
     }
   }
 
+  if (!desc || tags.length === 0) throw new Error('识别结果缺少有效描述或标签，请重新识别');
   return { tags, desc, useWhen, emotions };
 }
 

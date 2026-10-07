@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 表情包库
  *
@@ -36,8 +37,25 @@ function words(text: string): string[] {
   return [...new Set(out.flatMap(word => /^[a-z]/.test(word) ? [word] : Array.from({ length: Math.max(0, word.length - 1) }, (_, i) => word.slice(i, i + 2))))];
 }
 
-/** 模型用来表达"发个表情"的标记，如 [表情:happy] */
-export const STICKER_MARKER_RE = /\[\s*表情\s*[:：]\s*([^\]\s]+)\s*\]/g;
+/**
+ * 模型用来表达"发个表情"的标记，如 `[表情:happy]`。
+ *
+ * **必须容错**：实测模型会写成 `[表情包：一句画面描述]`、`[j表情:mocking]`、
+ * `【表情:happy】`、`[表情:happy sad]` 这些变体。严格版正则漏掉它们之后，
+ * 标记不会被摘掉，用户就会在群里看到一串 `[表情包：…]` 方括号文字，
+ * 而且那张图也不会发出去 —— 这就是"发表情包有 bug"的直接原因。
+ *
+ * 仍然要求"表情/表情包"后面跟冒号或空格，所以 `[表情管理]` 这类正常用语不会被误吞。
+ */
+export const STICKER_MARKER_RE = /[[【]\s*[a-z]{0,2}\s*表情(?:包)?\s*(?:[:：]|\s)\s*([^\]】\n]{0,80}?)\s*[\]】]/gi;
+
+/** Only explicit positive requests allow a sticker without a model marker. */
+export function requestsSticker(text: string): boolean {
+  if (/(?:不要|别|不用|不许|禁止|停止)[^。！？\n]{0,16}表情(?:包)?/.test(text)
+    || /(?:怎么|如何|为什么|为何|设置|失败|发不出|不能发|不发)[^。！？\n]{0,16}表情(?:包)?/.test(text)
+    || /表情(?:包)?[^。！？\n]{0,10}(?:怎么|如何|设置|失败|发不出)/.test(text)) return false;
+  return /(?:(?:发|来|甩)(?:一下|一个|一张|几个|几张|点|个|张|些)?|给(?:我|我们)?(?:一个|一张|个|张))\s*(?:[\u4e00-\u9fffA-Za-z0-9]{1,10}的)?\s*表情(?:包)?/.test(text);
+}
 
 /**
  * 从 QQ 收藏导入的子目录名。
@@ -54,6 +72,75 @@ export interface StickerView extends StickerEntry {
   size: number;
   /** 文件缺失（manifest 里有记录但文件没了） */
   missing: boolean;
+}
+
+/** QQ 自带的描述不代表已完成识图；发送还需要可引用的标签。 */
+export function hasStickerUnderstanding(s: StickerEntry): boolean {
+  return !!s.desc.trim() && s.tags.some(t => !!t.trim());
+}
+
+/**
+ * 按模型写的标签/描述挑一张图。
+ *
+ * 三级回退，顺序不能变：
+ *   1. **精确标签**命中 `pool`（本轮候选）—— 最贴切，优先；
+ *   2. **精确标签**命中 `all`（整个库）—— 模型写对了标签，但那张图没进本轮候选。
+ *      候选只有 6 张而库里有几十个标签，以前这种情况直接丢掉，模型说要发却什么都没发；
+ *   3. **模糊/描述型** —— 标签大小写、单复数、包含关系，或者模型干脆写了一句
+ *      `[表情包:胖乎乎的鱼翻肚皮]`，那就拿这句话当查询词去比 desc/useWhen。
+ *
+ * 纯函数（不读磁盘），这样提示词侧的候选、面板和测试替身都能复用同一套选择规则。
+ */
+export function pickByLabel(
+  label: string,
+  pool: StickerView[] = [],
+  opts: { excludedFiles?: string[]; all?: StickerView[] } = {},
+): StickerView | undefined {
+  const query = cleanStickerLabel(label);
+  if (!query) return undefined;
+
+  const lower = query.toLowerCase();
+  const excluded = new Set(opts.excludedFiles ?? []);
+  // pool 在前：同样的标签，优先挑本轮语境下的那张
+  const entries = [...pool, ...(opts.all ?? [])].filter((s) => !s.missing && !excluded.has(s.file));
+
+  const exact = entries.find((s) => s.tags.some((t) => t.toLowerCase() === lower));
+  if (exact) return exact;
+
+  // 单字标签做包含匹配会乱套（"鱼"能匹配一堆），所以要求至少两个字符
+  if (lower.length < 2) return undefined;
+
+  const loose = entries.find((s) =>
+    s.tags.some((t) => {
+      const tl = t.toLowerCase();
+      return tl.includes(lower) || lower.includes(tl);
+    }),
+  );
+  if (loose) return loose;
+
+  // 描述型：`[表情包:一句描述]` —— 用这句话的用词去比库里的 desc/useWhen
+  const tokens = words(query);
+  let best: { s: StickerView; score: number } | undefined;
+  for (const s of entries) {
+    if (!s.desc.trim()) continue;
+    const text = `${s.desc} ${s.useWhen} ${s.tags.join(' ')}`.toLowerCase();
+    const wordScore = tokens.filter((w) => text.includes(w)).length;
+    // 中文没有空格，描述和库里 desc 常常没有共同的二字词（"胖乎乎的鱼翻肚皮" vs "鲸鱼竖大拇指"），
+    // 这时退化成"共同汉字数"；要求至少 2 个字重合，免得撞上一个"不/的"就乱配。
+    const score = wordScore > 0 ? wordScore : cjkOverlap(query, text);
+    if (score > 0 && (!best || score > best.score)) best = { s, score };
+  }
+  return best?.s;
+}
+
+/** 中文描述兜底用：query 里有几个不同的实义汉字出现在 text 里 */
+function cjkOverlap(query: string, text: string): number {
+  // 虚词（的/了/不/是…）几乎每句都有，算进去会把"随便什么标签"都配上图
+  const STOP = new Set(['的', '了', '是', '不', '在', '有', '我', '你', '他', '她', '这', '那', '和', '就', '都', '也', '很', '个']);
+  const chars = new Set((query.match(/[\u4e00-\u9fff]/g) ?? []).filter((c) => !STOP.has(c)));
+  let n = 0;
+  for (const c of chars) if (text.includes(c)) n++;
+  return n >= 2 ? n : 0;
 }
 
 export class StickerLibrary {
@@ -98,7 +185,7 @@ export class StickerLibrary {
         }
       }
     } catch (e) {
-      this.log.warn({ err: (e as Error).message }, '读取表情包 manifest 失败，按文件名重建');
+      this.log.warn({ ...errorDetails(e), err: (e as Error).message }, '读取表情包 manifest 失败，按文件名重建');
     }
 
     const metaByRel = new Map<string, StickerEntry>();
@@ -165,7 +252,7 @@ export class StickerLibrary {
         this.all.push(view);
       }
     } catch (e) {
-      this.log.warn({ dir: this.dir, err: (e as Error).message }, '扫描表情包目录失败');
+      this.log.warn({ dir: this.dir, ...errorDetails(e), err: (e as Error).message }, '扫描表情包目录失败');
     }
 
     const usable = this.all.filter((s) => !s.missing);
@@ -181,7 +268,7 @@ export class StickerLibrary {
       try {
         this.syncManifest();
       } catch (e) {
-        this.log.debug({ err: (e as Error).message }, '自动补全 manifest 失败（不影响运行）');
+        this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '自动补全 manifest 失败（不影响运行）');
       }
     }
 
@@ -226,12 +313,12 @@ export class StickerLibrary {
 
   /** 被 AI 理解过的条目（有 desc） */
   understood(): StickerView[] {
-    return this.usable().filter((s) => s.desc.trim().length > 0);
+    return this.usable().filter(hasStickerUnderstanding);
   }
 
   /** 还没被 AI 看过的条目 */
   pending(): StickerView[] {
-    return this.usable().filter((s) => !s.desc.trim());
+    return this.usable().filter((s) => !hasStickerUnderstanding(s));
   }
 
   /**
@@ -283,7 +370,7 @@ export class StickerLibrary {
     return this.candidates('', emotion, 1, { requireDesc: opts.requireDesc })[0];
   }
 
-  candidates(context: string, emotion?: string, limit = 6, opts: { excludedFiles?: string[]; requireDesc?: boolean } = {}): StickerView[] {
+  candidates(context: string, emotion?: string, limit = 6, opts: { excludedFiles?: string[]; requireDesc?: boolean; requestFallback?: boolean } = {}): StickerView[] {
     const query = words(context); const label = emotion ? canonicalEmotion(emotion) : '';
     return this.usable().filter(s => !opts.excludedFiles?.includes(s.file) && (!opts.requireDesc || !!s.desc.trim()))
       .map(s => {
@@ -291,7 +378,7 @@ export class StickerLibrary {
         const score = query.filter(w => text.includes(w)).length +
           (label && label !== 'neutral' && [...s.emotions, ...s.tags.map(canonicalEmotion)].includes(label) ? 2 : 0);
         return { s, score };
-      }).filter(row => row.score > 0).sort((a, b) => b.score - a.score || a.s.file.localeCompare(b.s.file)).slice(0, limit).map(row => row.s);
+      }).filter(row => row.score > 0 || opts.requestFallback && row.s.tags.length > 0 && !!row.s.desc.trim()).sort((a, b) => b.score - a.score || a.s.file.localeCompare(b.s.file)).slice(0, limit).map(row => row.s);
   }
 
   describeCandidatesForPrompt(candidates: StickerView[], descChars = 40): string {
@@ -468,16 +555,38 @@ export function tagFromFilename(name: string): string {
 /**
  * 从模型回复里摘出表情标记。
  * 标记本身被移除，并把结果首尾空白清掉（避免留下 "正文 [表情:x]" 的尾随空格）。
- * @returns 清洗后的文本 + 用到的标签（按出现顺序、去重）
+ *
+ * `markers` 是"看到过几个标记"（哪怕标签是空的），调用方据此判断
+ * "模型确实想发表情" —— 用来给解析不出标签的情况兜底。
+ *
+ * @returns 清洗后的文本 + 用到的标签（按出现顺序、去重）+ 标记个数
  */
-export function extractStickerTags(text: string): { text: string; tags: string[] } {
+export function extractStickerTags(text: string): { text: string; tags: string[]; markers: number } {
   const tags: string[] = [];
+  let markers = 0;
   const cleaned = text.replace(STICKER_MARKER_RE, (_m, tag: string) => {
-    const t = String(tag).trim();
-    if (t && !tags.includes(t)) tags.push(t);
+    markers++;
+    const t = cleanStickerLabel(String(tag ?? ''));
+    if (t && !tags.some((x) => x.toLowerCase() === t.toLowerCase())) tags.push(t);
     return '';
   });
-  return { text: tags.length > 0 ? cleaned.trim() : text, tags };
+  if (markers === 0) return { text, tags, markers };
+  return {
+    // 摘掉标记后可能留下空行/行尾空格，顺手收拾一下
+    text: cleaned.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(),
+    tags,
+    markers,
+  };
+}
+
+/** 把模型写的标签清干净：去引号/方括号、去尾随标点（`[表情:happy。]` 也要能认出来） */
+export function cleanStickerLabel(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[「『“"'（(【\[]+/, '')
+    .replace(/[」』”"'）)】\]]+$/, '')
+    .replace(/[。．.，,、！!？?~～;；:：]+$/, '')
+    .trim();
 }
 
 /** 图片扩展名是否受支持 */

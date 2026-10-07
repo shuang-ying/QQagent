@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 import type { AppConfig, InboundMessage, ObMessageSegment, Persona } from '../core/types.js';
 import type { ProviderManager } from './manager.js';
 import type { OneBotAction } from '../onebot/action.js';
@@ -116,7 +117,7 @@ export class SpeechService {
                 this.providers.recordSpeechCall?.(ep.key, ep.model, kind, success, Date.now() - started);
             }
             catch (e) {
-                this.log.warn({ reason: (e as Error).message }, '语音用量记录失败');
+                this.log.warn({ ...errorDetails(e), reason: (e as Error).message }, '语音用量记录失败');
             }
         }
     }
@@ -244,7 +245,7 @@ export class SpeechService {
             catch (e) {
                 signal?.throwIfAborted();
                 this.lastError = (e as Error).message;
-                this.log.warn({ reason: this.lastError }, '语音转写失败');
+                this.log.warn({scope:msg.scope,phase:'transcription',timeoutMs:cfg.speech.timeoutMs,...errorDetails(e),reason:this.lastError}, '语音转写失败');
                 segments.push({ type: 'text', data: { text: '【语音未能转写：' + this.lastError + '；不要推测录音内容】' } });
             }
         }
@@ -265,7 +266,8 @@ export class SpeechService {
         }
         catch (e) {
             this.lastError = (e as Error).message;
-            this.log.warn({ scope: msg.scope, reason: this.lastError }, '语音回复失败，文字已保留');
+            this.log.warn({scope:msg.scope,phase:'voice-reply',timeoutMs:config.speech.timeoutMs,
+              ...errorDetails(e),reason:this.lastError}, '语音回复失败，文字已保留');
             return false;
         }
     }

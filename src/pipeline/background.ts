@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { Logger } from '../core/logger.js';
+import { errorDetails } from '../core/logger.js';
 
 export interface BackgroundJob {
   id: number; kind: string; scope: string; conversation_id: string;
@@ -60,7 +61,8 @@ export class BackgroundQueue {
           const state = job.attempts + 1 < 3 ? 'queued' : 'failed';
           this.db.prepare("UPDATE background_jobs SET state=?,error=?,available_at=?,updated_at=? WHERE id=? AND state='running'")
             .run(state, String(error?.message ?? error).slice(0, 300), Date.now() + this.retryMs * 2 ** job.attempts, Date.now(), job.id);
-          this.log.warn({ jobId: job.id, state }, '后台任务失败');
+          this.log.warn({ jobId:job.id,kind:job.kind,scope:job.scope,state,attempt:job.attempts+1,
+            retryMs:state==='queued'?this.retryMs*2**job.attempts:undefined,...errorDetails(error) }, '后台任务失败');
         }
       }).finally(() => { this.active.delete(job.id); this.wake(); });
     }

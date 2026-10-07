@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * OneBot 11 WebSocket 客户端
  *
@@ -135,7 +136,7 @@ export class OneBotClient extends EventEmitter<OneBotClientEvents> {
     try {
       ws = new WebSocket(url, { headers, handshakeTimeout: 15000 });
     } catch (e) {
-      this.log.error({ err: (e as Error).message }, '创建 WebSocket 失败');
+      this.log.error({ ...errorDetails(e), err: (e as Error).message }, '创建 WebSocket 失败');
       this.scheduleReconnect();
       return;
     }
@@ -162,7 +163,7 @@ export class OneBotClient extends EventEmitter<OneBotClientEvents> {
 
     ws.on('error', (err: Error) => {
       if (!current()) return;
-      this.log.warn({ err: err.message }, 'OneBot WebSocket 错误');
+      this.log.warn({phase:'websocket',...errorDetails(err),err:err.message}, 'OneBot WebSocket 错误');
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
@@ -206,7 +207,7 @@ export class OneBotClient extends EventEmitter<OneBotClientEvents> {
       this.selfId = this.cfg.selfId;
       this.accountReady = this.selfId > 0;
       this.log.warn(
-        { err: (e as Error).message, fallbackSelfId: this.selfId },
+        { ...errorDetails(e), err: (e as Error).message, fallbackSelfId: this.selfId },
         '获取登录信息失败，使用配置中的 selfId（若为 0 将无法识别 @机器人）',
       );
       this.emit('ready', { selfId: this.selfId, nickname: '' });
@@ -365,7 +366,7 @@ export class OneBotClient extends EventEmitter<OneBotClientEvents> {
           );
           this.emit('message', msg);
         } catch (e) {
-          this.log.warn({ err: (e as Error).message }, '消息归一化失败');
+          this.log.warn({ ...errorDetails(e), err: (e as Error).message }, '消息归一化失败');
         }
       }
     } else if (postType === 'meta_event') {
@@ -390,7 +391,7 @@ export class OneBotClient extends EventEmitter<OneBotClientEvents> {
           this.log.debug({ noticeType: obj['notice_type'], sub: obj['sub_type'] }, '收到其它通知事件');
         }
       } catch (e) {
-        this.log.warn({ err: (e as Error).message }, '通知事件归一化失败');
+        this.log.warn({ ...errorDetails(e), err: (e as Error).message }, '通知事件归一化失败');
       }
     }
   }

@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 语义记忆索引
  *
@@ -66,7 +67,7 @@ export class SemanticIndex {
       validateVectors(res.vectors);
       return res.vectors;
     } catch (e) {
-      this.log.debug({ err: (e as Error).message }, '向量化异常，本次退回关键词检索');
+      this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '向量化异常，本次退回关键词检索');
       return null;
     }
   }
@@ -83,7 +84,7 @@ export class SemanticIndex {
     try {
       missing = this.store.listFactsMissingEmbedding(userId, key, limit);
     } catch (e) {
-      this.log.debug({ err: (e as Error).message }, '查询待补算事实失败');
+      this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '查询待补算事实失败');
       return 0;
     }
     if (missing.length === 0) return 0;
@@ -102,7 +103,7 @@ export class SemanticIndex {
         this.store.saveFactEmbedding(fact.id, vec, key);
         n++;
       } catch (e) {
-        this.log.debug({ err: (e as Error).message, factId: fact.id }, '保存向量失败');
+        this.log.debug({ ...errorDetails(e), err: (e as Error).message, factId: fact.id }, '保存向量失败');
       }
     }
     if (n > 0) this.log.debug({ userId, count: n }, '已补算事实向量');
@@ -127,7 +128,7 @@ export class SemanticIndex {
     try {
       return this.store.searchFactsByVector(userId, qv, { ...opts, model: key });
     } catch (e) {
-      this.log.debug({ err: (e as Error).message }, '向量检索失败');
+      this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '向量检索失败');
       return [];
     }
   }

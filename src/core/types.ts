@@ -206,7 +206,21 @@ export const LLM_ROLE_LABELS: Record<LlmRoleName, { name: string; desc: string; 
   tts: { name: '语音合成', desc: '按人格音色朗读回复', hint: '供应商可继承，模型必须明确填写TTS模型；音色与协议在语音设置中选择' },
 };
 
+export const TOKEN_BUDGET_PURPOSES = ['chat', 'vision', 'sticker', 'emotion', 'facts', 'summary', 'daily'] as const;
+export const TokenBudgetValueSchema = z.number().int().min(0).max(131072);
+export const TokenBudgetsSchema = z.object({
+  chat: TokenBudgetValueSchema.default(0),
+  vision: TokenBudgetValueSchema.default(0),
+  sticker: TokenBudgetValueSchema.default(0),
+  emotion: TokenBudgetValueSchema.default(0),
+  facts: TokenBudgetValueSchema.default(0),
+  summary: TokenBudgetValueSchema.default(0),
+  daily: TokenBudgetValueSchema.default(0),
+});
+
 export const LlmSchema = z.object({
+  /** 每用途每次生成的输出预算，0 保持原有用途/人格预算与重试策略。 */
+  tokenBudgets: TokenBudgetsSchema.prefault({}),
   /** 默认供应商 key（对应 providers.yaml 里的 key） */
   defaultProvider: z.string().default(''),
   /** 默认模型 ID（为空时用该 provider 发现到的第一个模型） */
@@ -410,11 +424,11 @@ export const StickerSchema = z.object({
   autoSend: z
     .object({
       enabled: z.boolean().default(false),
-      /** 命中这些情绪时考虑自动发图 */
+      /** 自动开关开启时，空列表表示任意情绪；非空仅匹配指定情绪及旧字段 */
       emotions: z.array(z.string()).prefault([]),
       /** 情绪强度低于此值不发 */
       minIntensity: z.number().min(0).max(1).default(0.55),
-      /** 命中后的实际发送概率，避免每次都发显得机械 */
+      /** 自动模式下模型点名及补图共用的概率，情绪/冷却/候选满足后每轮只抽一次；明确请求除外 */
       probability: z.number().min(0).max(1).default(0.35),
       /** 同一会话两次自动发图的最小间隔（秒），防刷屏 */
       cooldownSec: z.number().int().min(0).default(180),
@@ -485,7 +499,7 @@ const BaseAppConfigSchema = z.object({
     timeoutMs:z.number().int().min(500).max(15000).default(6000),maxRedirects:z.number().int().min(0).max(5).default(3),
     cacheTtlMs:z.number().int().min(0).max(3600000).default(300000),allowedDomains:z.array(z.string().max(253)).max(100).default([]),denyDomains:z.array(z.string().max(253)).max(100).default([]),
   }).prefault({}),
-  tasks:z.object({remindersEnabled:z.boolean().default(true),dailyEnabled:z.boolean().default(false),maxPerUser:z.number().int().min(1).max(100).default(20),overdueGraceMs:z.number().int().min(1000).max(604800000).default(86400000)}).prefault({}),
+  tasks:z.object({remindersEnabled:z.boolean().default(true),dailyEnabled:z.boolean().default(false),dailyTimeoutMs:z.number().int().min(0).max(600000).refine(v=>v===0||v>=1000,'日报超时须为0或至少1000毫秒').default(0),maxPerUser:z.number().int().min(1).max(100).default(20),overdueGraceMs:z.number().int().min(1000).max(604800000).default(86400000)}).prefault({}),
   memory: MemorySchema.prefault({}),
   emotion: EmotionSchema.prefault({}),
   context: ContextSchema.prefault({}),

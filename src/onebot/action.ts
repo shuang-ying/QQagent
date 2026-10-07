@@ -4,6 +4,7 @@
  * 封装发送消息、获取群成员等 API，统一处理 echo 匹配、超时、错误。
  */
 import type { Logger } from '../core/logger.js';
+import { errorDetails } from '../core/logger.js';
 import type { ObMessageSegment, OneBotResponse, QqFavEmoji } from '../core/types.js';
 import { toCqCodes } from './normalize.js';
 
@@ -64,17 +65,22 @@ export class OneBotAction {
     const payload = JSON.stringify({ action, params, echo });
 
     const timeoutMs = opts.timeoutMs ?? this.defaultTimeoutMs;
+    const startedAt = Date.now();
     const waiter = this.wait(echo, timeoutMs);
     // 立即接住拒绝；发送回调可能晚于断线事件。
     void waiter.catch(() => undefined);
     let sent: boolean;
     try { sent = await Promise.race([Promise.resolve(this.send(payload)), waiter.then(() => true)]); }
     catch (e) {
+      this.log.warn({action,echo,phase:'send',timeoutMs,elapsedMs:Date.now()-startedAt,
+        ...errorDetails(e)}, 'OneBot 动作发送失败');
       this.cancelWait?.(echo);
       throw new OneBotActionError(action, 'failed', -1, (e as Error).message,
         e instanceof OneBotActionError ? e.outcome : 'unknown');
     }
     if (!sent) {
+      this.log.warn({action,echo,phase:'send',timeoutMs,elapsedMs:Date.now()-startedAt,
+        outcome:'failed',reason:'disconnected'}, 'OneBot 动作未发出');
       this.cancelWait?.(echo);
       throw new OneBotActionError(action, 'failed', -1, 'WebSocket 未连接，消息未发出');
     }
@@ -83,18 +89,21 @@ export class OneBotAction {
     try {
       resp = await waiter;
     } catch (e) {
+      this.log.warn({action,echo,phase:'response',timeoutMs,elapsedMs:Date.now()-startedAt,
+        ...errorDetails(e),outcome:'unknown'}, 'OneBot 动作等待响应失败');
       throw new OneBotActionError(action, 'failed', -1, `等待响应超时(${timeoutMs}ms) 或连接中断`, 'unknown');
     }
 
     if (resp.status !== 'ok' || resp.retcode !== 0) {
       const msg = resp.wording || resp.msg || `retcode=${resp.retcode}`;
+      this.log.warn({action,echo,phase:'response',timeoutMs,elapsedMs:Date.now()-startedAt,
+        status:resp.status,retcode:resp.retcode,msg,outcome:resp.status==='async'?'unknown':'failed'}, 'OneBot 动作返回非成功');
       if (EXTENSIONS.has(action) && (resp.retcode === 1404 || /unsupported|not supported|unknown action|不支持|不存在的.*动作/i.test(msg))) {
         this.capabilities.set(action, 'unsupported');
       }
       if (opts.throwOnError) {
         throw new OneBotActionError(action, resp.status, resp.retcode, msg, resp.status === 'async' ? 'unknown' : 'failed');
       }
-      this.log.warn({ action, status: resp.status, retcode: resp.retcode, msg }, 'OneBot 动作返回非成功');
     }
     if (resp.status === 'ok' && resp.retcode === 0 && EXTENSIONS.has(action)) this.capabilities.set(action, 'supported');
     return resp.data as T;

@@ -33,7 +33,7 @@
     "mock:onebot": "tsx scripts/mock-napcat.ts",
     "test:turn-context": "tsx scripts/test-turn-context.ts",
     "test:optimizations": "npm run test:chat-routing && npm run test:llm-protocols && npm run test:llm-reliability && npm run test:llm-fallback && npm run test:onebot-reliability && npm run test:onebot-compat && npm run test:delivery && npm run test:admission && npm run test:scheduler && npm run test:turn-context",
-    "test:offline": "npm run typecheck && npm run test:optimizations && npm run test:optimizations-next && npm run test:optimizations-final && npm run test:replay",
+    "test:offline": "npm run typecheck && npm run test:optimizations && npm run test:optimizations-next && npm run test:optimizations-final && npm run test:replay && npm run test:logging && npm run test:token-budgets",
     "test:background": "tsx scripts/test-background.ts",
     "test:reply-strategy": "tsx scripts/test-reply-strategy.ts",
     "test:addressing": "tsx scripts/test-addressing.ts",
@@ -57,7 +57,9 @@
     "test:forward-messages": "tsx scripts/test-forward-messages.ts",
     "test:speech": "tsx scripts/test-speech.ts",
     "test:scheduled-tasks": "tsx scripts/test-scheduled-tasks.ts",
-    "test:links-cards": "tsx scripts/test-links-cards.ts"
+    "test:links-cards": "tsx scripts/test-links-cards.ts",
+    "test:logging": "tsx scripts/test-logging.ts",
+    "test:token-budgets": "tsx scripts/test-token-budgets.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",
@@ -95,6 +97,8 @@
     ".gitattributes",
     "docs/forward-messages.md",
     "docs/voice-and-scheduled-tasks.md",
-    "docs/links-and-cards.md"
+    "docs/links-and-cards.md",
+    "docs/log-diagnostics.md",
+    "docs/token-budgets.md"
   ]
 }

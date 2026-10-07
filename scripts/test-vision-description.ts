@@ -24,3 +24,20 @@ test('视觉失败或格式错误，主模型收到无法识别说明', async ()
   }
 });
 test('结构化资料拒绝缺项、错数量', () => { assert.throws(() => parseDescriptions('[{"scene":"x"}]', 1)); assert.throws(() => parseDescriptions(description, 2)); });
+
+test('图片预算热更新传到识别调用，并使旧预算的识别缓存失效',async()=>{
+  const f=makeFixture(scenario,'private:1');f.cfg.media.visionPipeline=true;
+  const budgets:number[]=[];
+  f.providers.chat=async(_messages,provider,model,opts)=>{
+    budgets.push(opts?.maxTokens??0);
+    return {content:description,provider:provider!,model:model!,latencyMs:1,
+      usage:{promptTokens:1,completionTokens:1,totalTokens:2}};
+  };
+  try {
+    assert.equal((await f.pipeline.handle(f.msg,f.api)).replied,true);
+    assert.equal(budgets[0],1200);
+    f.cfg.llm.tokenBudgets.vision=4096;
+    assert.equal((await f.pipeline.handle({...f.msg,messageId:11},f.api)).replied,true);
+    assert.deepEqual(budgets,[1200,4096]);
+  } finally {f.store.close();}
+});

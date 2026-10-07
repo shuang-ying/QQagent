@@ -11,7 +11,7 @@
  * proactive / pipeline）在构造时持有的是子对象的引用，替换会让它们看不到变化。
  */
 import type { AppConfig } from '../core/types.js';
-import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES, COMMAND_IDS, CommandPermissionsSchema, type CommandId, type CommandPermission } from '../core/types.js';
+import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES, TOKEN_BUDGET_PURPOSES, COMMAND_IDS, CommandPermissionsSchema, type CommandId, type CommandPermission } from '../core/types.js';
 import { commandPermission } from '../pipeline/command-permissions.js';
 
 export interface SettingOption {
@@ -265,7 +265,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'sticker.autoSend.emotions',
     label: '自动补图的情绪',
-    desc: '命中这些情绪才自动发图，如 ["sadness", "joy"]',
+    desc: '留空表示任何情绪；填写后仅匹配指定情绪，如 sadness, joy。仍受强度、概率、冷却与候选限制',
     type: 'string[]',
     group: '回复行为',
   },
@@ -322,6 +322,14 @@ SETTING_DEFS.push(
  {path:'links.denyDomains',label:'禁止读取的域名',type:'string[]',group:'链接与卡片',desc:'含子域名；本机、内网和保留地址始终拒绝'},
 );
 
+SETTING_DEFS.push({path:'tasks.dailyTimeoutMs',label:'日报模型超时（毫秒）',type:'number',desc:'0继承模型总超时（默认120000）；可单独填写1000～600000，未投递失败最多三次尝试',group:'提醒与日报',min:0,max:600000});
+
+const budgetLabels = {chat:'回复',vision:'图片理解',sticker:'表情包识图',emotion:'情绪分析',facts:'记忆抽取',summary:'上下文摘要',daily:'日报'};
+SETTING_DEFS.push(...TOKEN_BUDGET_PURPOSES.map(purpose => ({
+  path:`llm.tokenBudgets.${purpose}`,label:`${budgetLabels[purpose]}输出 token 上限`,type:'number' as const,
+  min:0,max:131072,group:'Token 预算',
+  desc:'0 保持原预算；非零覆盖该用途每次生成的上限（含重试），不含输入。模型上下文限制仍生效；不是累计用量额度。',
+})));
 const ALLOWED = new Set(SETTING_DEFS.map((d) => d.path));
 
 /** 「模型用途」路径：llm.roles.<role>.provider / .model */
