@@ -1,20 +1,6 @@
 /** 辅助请求的等待预算；晚到结果不会影响本轮，取消信号传给实际调用。 */
-export interface AuxiliaryFailure {
-  kind: 'timeout' | 'cancelled' | 'error';
-  error?: unknown;
-  timeoutMs: number;
-  elapsedMs: number;
-}
 export async function auxiliary<T>(run: (signal: AbortSignal) => Promise<T>, fallback: () => T,
-  timeoutMs: number, parent?: AbortSignal, onFailure?: (failure: AuxiliaryFailure) => void): Promise<T> {
-  const startedAt = Date.now();
-  let timedOut = false, reported = false;
-  const report = (kind: AuxiliaryFailure['kind'], error?: unknown) => {
-    if (reported) return;
-    reported = true;
-    try { onFailure?.({kind, error, timeoutMs, elapsedMs:Date.now()-startedAt}); }
-    catch { /* 诊断回调失败不影响原有降级与取消行为 */ }
-  };
+  timeoutMs: number, parent?: AbortSignal): Promise<T> {
   const ctrl = new AbortController();
   const signal = parent ? AbortSignal.any([parent, ctrl.signal]) : ctrl.signal;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -22,12 +8,12 @@ export async function auxiliary<T>(run: (signal: AbortSignal) => Promise<T>, fal
   try {
     return await Promise.race([Promise.resolve().then(() => { signal.throwIfAborted(); return run(signal); }),
       new Promise<T>(resolve => {
-        onAbort = () => { report(timedOut ? 'timeout' : 'cancelled', signal.reason); resolve(fallback()); };
+        onAbort = () => resolve(fallback());
         signal.addEventListener('abort', onAbort, { once: true });
-        timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+        timer = setTimeout(() => { ctrl.abort(); }, timeoutMs);
         if (signal.aborted) onAbort();
       })]);
-  } catch (error) { report(timedOut ? 'timeout' : signal.aborted ? 'cancelled' : 'error', error); return fallback(); }
+  } catch { return fallback(); }
   finally { if (timer) clearTimeout(timer); if (onAbort) signal.removeEventListener('abort', onAbort); ctrl.abort(); }
 }
 export function modulatedEmotion<T extends { label: string; intensity: number; valence: number; arousal: number; confidence: number }>(current: T,

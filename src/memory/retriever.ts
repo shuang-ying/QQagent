@@ -1,4 +1,3 @@
-import { errorDetails } from '../core/logger.js';
 /**
  * 记忆检索
  *
@@ -170,7 +169,7 @@ export class MemoryRetriever {
       this.store.markFactsHit(hitIds.filter(id => !base.hitIds.includes(id)));
       return { ...base, facts: dedupe(selected.map(([,row]) => row.content)), hitIds, stats: { ...base.stats, semanticHits: hitIds.filter(id => !base.hitIds.includes(id)).length } };
     } catch (e) {
-      this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '语义检索失败，使用关键词结果');
+      this.log.debug({ err: (e as Error).message }, '语义检索失败，使用关键词结果');
       return base;
     }
   }
