@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -295,8 +295,9 @@ CREATE TABLE IF NOT EXISTS reply_deliveries (
 --   github_events      已拉取的事件：去重 + 待推送队列 + 面板历史
 --                      type=RepoPush/RepoRelease 表示仓库订阅产生的事件
 --   github_deliveries  每个事件在每个会话的投递结果（用于重试时跳过已成功的会话）
---   github_authors     每个作者的 ETag 与基线时间（首次拉取只建基线，不推送历史）
+--   github_authors     每个作者的 ETag、基线时间、公开仓库发现时间
 --   github_repos       每个订阅仓库的 HEAD SHA、Release 基线（首次轮询只建基线）
+--   github_author_repos 作者公开仓库映射（不写入手动 repos 配置）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS github_events (
   event_id    TEXT PRIMARY KEY,
@@ -310,7 +311,8 @@ CREATE TABLE IF NOT EXISTS github_events (
   fetched_at  INTEGER NOT NULL,
   state       TEXT NOT NULL DEFAULT 'pending',
   attempts    INTEGER NOT NULL DEFAULT 0,
-  last_error  TEXT NOT NULL DEFAULT ''
+  last_error  TEXT NOT NULL DEFAULT '',
+  dedupe_key  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_github_events_pending ON github_events(state,occurred_at);
 CREATE TABLE IF NOT EXISTS github_deliveries (
@@ -330,7 +332,9 @@ CREATE TABLE IF NOT EXISTS github_authors (
   baseline_at INTEGER NOT NULL DEFAULT 0,
   last_polled_at INTEGER NOT NULL DEFAULT 0,
   last_event_at INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT NOT NULL DEFAULT ''
+  last_error TEXT NOT NULL DEFAULT '',
+  repos_synced_at INTEGER NOT NULL DEFAULT 0,
+  repo_error TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS github_repos (
   repo TEXT PRIMARY KEY,
@@ -343,6 +347,12 @@ CREATE TABLE IF NOT EXISTS github_repos (
   last_polled_at INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS github_author_repos (
+  login TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  PRIMARY KEY(login, repo)
+);
+CREATE INDEX IF NOT EXISTS idx_github_author_repos_repo ON github_author_repos(repo);
 `;
 
 /** 生成一个对话 id（无需依赖 crypto 的 uuid） */
@@ -488,6 +498,10 @@ export function initDatabase(dbPath: string): DatabaseSync {
       addColumnIfMissing(db,'memory_facts','private','INTEGER NOT NULL DEFAULT 0');
       addColumnIfMissing(db,'fact_embeddings','source_content',"TEXT NOT NULL DEFAULT ''");
       addColumnIfMissing(db,'fact_embeddings','content_hash',"TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db,'github_events','dedupe_key',"TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db,'github_authors','repos_synced_at','INTEGER NOT NULL DEFAULT 0');
+      addColumnIfMissing(db,'github_authors','repo_error',"TEXT NOT NULL DEFAULT ''");
+      db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_github_events_dedupe ON github_events(dedupe_key) WHERE dedupe_key <> ''");
       db.exec('CREATE TABLE IF NOT EXISTS fact_cursors (user_id INTEGER NOT NULL, conversation_id TEXT NOT NULL, last_id INTEGER NOT NULL, PRIMARY KEY(user_id,conversation_id)); CREATE TABLE IF NOT EXISTS memory_forgetting (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, source_msg_id INTEGER, cutoff INTEGER NOT NULL, created_at INTEGER NOT NULL)');
       migrateToConversations(db);
       db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('schema_version',String(SCHEMA_VERSION));

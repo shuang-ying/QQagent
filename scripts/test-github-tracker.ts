@@ -67,7 +67,8 @@ function pushEvent(id: string, minutesAgo: number): Record<string, unknown> {
   return event(id, 'PushEvent', 'octocat', 'octocat/hello', minutesAgo, {
     size: 1,
     ref: 'refs/heads/main',
-    head: 'abcdef1234567890',
+    // 每个测试事件用不同 head，模拟真实的不同 push；同一 head 会被跨源去重
+    head: id.padEnd(40, '0').slice(0, 40),
     commits: [{ message: 'update ' + id }],
   });
 }
@@ -99,11 +100,23 @@ function stepResponse(step: Step): GithubHttpResponse {
   };
 }
 
-function fakeGithub(plan: Record<string, Step[]>): FakeGithub {
+function fakeGithub(
+  plan: Record<string, Step[]>,
+  authorRepos: Record<string, Step[]> = {},
+): FakeGithub {
   const calls: string[] = [];
   const index: Record<string, number> = {};
+  const repoIndex: Record<string, number> = {};
   const fetchImpl: GithubFetch = async (url) => {
     calls.push(url);
+    const repoMatch = /\/users\/([^/]+)\/repos/.exec(url);
+    if (repoMatch) {
+      const login = decodeURIComponent(repoMatch[1]!);
+      const steps = authorRepos[login] ?? [{ body: [] }];
+      const position = repoIndex[login] ?? 0;
+      repoIndex[login] = position + 1;
+      return stepResponse(steps[Math.min(position, steps.length - 1)]!);
+    }
     const match = /\/users\/([^/]+)\/events/.exec(url);
     const login = match ? decodeURIComponent(match[1]!) : 'unknown';
     const steps = plan[login] ?? [{ body: [] }];
@@ -136,6 +149,22 @@ function fakeRepoGithub(plan: RepoPlan): FakeGithub {
     }
     const steps = plan.commits;
     return stepResponse(steps[Math.min(indexes.commits++, steps.length - 1)]!);
+  };
+  return { fetchImpl, calls };
+}
+
+/** 作者事件/公开仓库发现 + 仓库 commits/releases 的组合假 fetch */
+function fakeAuthorRepoGithub(
+  eventsPlan: Record<string, Step[]>,
+  authorRepos: Record<string, Step[]>,
+  repoPlan: RepoPlan,
+): FakeGithub {
+  const events = fakeGithub(eventsPlan, authorRepos);
+  const repos = fakeRepoGithub(repoPlan);
+  const calls: string[] = [];
+  const fetchImpl: GithubFetch = (url, init) => {
+    calls.push(url);
+    return url.includes('/repos/') ? repos.fetchImpl(url, init) : events.fetchImpl(url, init);
   };
   return { fetchImpl, calls };
 }
@@ -176,6 +205,7 @@ function repoRelease(
 
 interface FixtureOptions {
   plan?: Record<string, Step[]>;
+  authorRepos?: Record<string, Step[]>;
   config?: Partial<GithubConfig>;
   fetchImpl?: GithubFetch;
   ready?: boolean;
@@ -197,7 +227,9 @@ function fixture(opts: FixtureOptions = {}) {
     ],
     ...(opts.config ?? {}),
   });
-  const fake = opts.fetchImpl ? { fetchImpl: opts.fetchImpl, calls: [] as string[] } : fakeGithub(opts.plan ?? {});
+  const fake = opts.fetchImpl
+    ? { fetchImpl: opts.fetchImpl, calls: [] as string[] }
+    : fakeGithub(opts.plan ?? {}, opts.authorRepos);
   const sent: Array<{ scope: string; text: string; message: unknown }> = [];
   const failing = new Set<string>();
   const sender: GithubDeliverySender = {
@@ -266,6 +298,7 @@ function repoFixture(opts: {
 test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', () => {
   const base = defaultGithubConfig();
   assert.equal(base.aiSummary, true);
+  assert.equal(base.repoDiscoverySec, 10800);
 
   const ok = validateGithubConfig(
     { authors: ['octocat', 'OctoCat', 'torvalds'], targets: ['group:123456', 'group:123456', 'private:10001'] },
@@ -290,10 +323,13 @@ test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', 
     { eventTypes: ['PushEvent', 'NopeEvent'] },
     { token: 'has space' },
     { aiSummary: 'yes' },
+    { repoDiscoverySec: 299 },
   ]) {
     assert.equal(validateGithubConfig(bad, base).ok, false, JSON.stringify(bad));
   }
   assert.equal(validateGithubConfig({ intervalSec: 3600 }, base).ok, true);
+  assert.equal(validateGithubConfig({ repoDiscoverySec: 300 }, base).ok, true);
+  assert.equal(validateGithubConfig({ repoDiscoverySec: 604800 }, base).ok, true);
   const noSummary = validateGithubConfig({ aiSummary: false }, base);
   assert.equal(noSummary.ok, true);
   if (noSummary.ok) assert.equal(noSummary.config.aiSummary, false);
@@ -631,6 +667,208 @@ test('AI 总结器：走 summary 角色并保留失败回退', async () => {
   );
 });
 
+test('追踪作者自动发现并订阅其公开仓库，取消作者一起取消', async () => {
+  const fake = fakeAuthorRepoGithub(
+    { octocat: [{ body: [] }, { body: [] }] },
+    {
+      octocat: [
+        {
+          body: [
+            { full_name: 'octocat/hello', private: false, size: 1 },
+            { full_name: 'octocat/private-repo', private: true, size: 1 },
+            { full_name: 'octocat/empty-repo', private: false, size: 0 },
+          ],
+        },
+      ],
+    },
+    {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit('new-head', 1), repoCommit('base', 30)] },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  );
+  const f = fixture({
+    fetchImpl: fake.fetchImpl,
+    config: { mode: 'authors', repos: [] },
+    summarize: async () => '新增功能',
+  });
+  try {
+    await f.tracker.pollNow(); // 发现 + 作者/仓库基线
+    let snap = f.tracker.snapshot();
+    assert.equal(snap.authors[0]!.repoCount, 1);
+    assert.equal(snap.authorRepos.length, 1);
+    assert.equal(snap.authorRepos[0]!.repo, 'octocat/hello');
+    assert.equal(snap.authorRepos[0]!.baselineAt, NOW);
+    assert.equal(f.sent.length, 0);
+
+    await f.tracker.pollNow();
+    assert.equal(f.sent.length, 2);
+    const text = f.sent[0]!.text;
+    assert.match(text, /📦 GitHub 仓库 · octocat\/hello/);
+    assert.match(text, /有 1 个新提交/);
+    assert.match(text, /🤖 AI 总结/);
+
+    f.tracker.saveConfig({ authors: [] });
+    snap = f.tracker.snapshot();
+    assert.equal(snap.authorRepos.length, 0);
+    assert.equal(
+      (f.store.db.prepare('SELECT COUNT(*) AS c FROM github_author_repos').get() as { c: number }).c,
+      0,
+    );
+    assert.equal(
+      (f.store.db
+        .prepare("SELECT COUNT(*) AS c FROM github_repos WHERE repo='octocat/hello'")
+        .get() as { c: number }).c,
+      0,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('作者公开事件与仓库订阅同一 push 只发一条，仓库消息优先', async () => {
+  const newSha = 'cafebabecafebabecafebabecafebabecafebabe';
+  const fake = fakeAuthorRepoGithub(
+    {
+      octocat: [
+        { body: [] },
+        {
+          body: [
+            event('push-dup', 'PushEvent', 'octocat', 'octocat/hello', 1, {
+              size: 1,
+              ref: 'refs/heads/main',
+              head: newSha,
+              commits: [{ message: 'feat: 新增登录' }],
+            }),
+          ],
+        },
+      ],
+    },
+    {
+      octocat: [{ body: [{ full_name: 'octocat/hello', private: false, size: 1 }] }],
+    },
+    {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit(newSha, 1), repoCommit('base', 30)] },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  );
+  const f = fixture({
+    fetchImpl: fake.fetchImpl,
+    config: { mode: 'authors', repos: [] },
+    summarize: async () => '新增登录能力',
+  });
+  try {
+    await f.tracker.pollNow(); // 基线
+    await f.tracker.pollNow();
+
+    assert.equal(f.sent.length, 2); // 同一事件只发到两个会话
+    const text = f.sent[0]!.text;
+    assert.match(text, /📦 GitHub 仓库 · octocat\/hello/);
+    assert.match(text, /🤖 AI 总结/);
+    assert.match(text, /· 新增登录能力/);
+
+    const rows = f.store.db
+      .prepare('SELECT event_id,type,repo,dedupe_key,state FROM github_events')
+      .all() as unknown as Array<{ event_id: string; type: string; repo: string; dedupe_key: string; state: string }>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.type, 'RepoPush');
+    assert.equal(rows[0]!.dedupe_key, `push:octocat/hello:${newSha}`);
+    assert.notEqual(rows[0]!.event_id, 'repo-push:octocat/hello:' + newSha);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('手动订阅与作者自动仓库重叠时共用轮询，取消作者保留手动订阅', async () => {
+  const fake = fakeAuthorRepoGithub(
+    { octocat: [{ body: [] }, { body: [] }] },
+    { octocat: [{ body: [{ full_name: 'octocat/hello', private: false, size: 1 }] }] },
+    {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit('new-head', 1), repoCommit('base', 30)] },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  );
+  const f = fixture({
+    fetchImpl: fake.fetchImpl,
+    config: {
+      mode: 'both',
+      repos: [{ repo: 'octocat/hello', branch: '', releases: true, enabled: true }],
+    },
+    summarize: async () => '摘要',
+  });
+  try {
+    await f.tracker.pollNow();
+    await f.tracker.pollNow();
+    assert.equal(f.sent.length, 2); // 重叠订阅只产生一个事件
+
+    f.tracker.saveConfig({ authors: [] });
+    const snap = f.tracker.snapshot();
+    assert.equal(snap.config.repos.length, 1);
+    assert.equal(snap.authorRepos.length, 0);
+    assert.equal(
+      (f.store.db
+        .prepare("SELECT COUNT(*) AS c FROM github_repos WHERE repo='octocat/hello'")
+        .get() as { c: number }).c,
+      1,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('作者 ReleaseEvent 与仓库 Release 同一版本只发一条', async () => {
+  const fake = fakeAuthorRepoGithub(
+    {
+      octocat: [
+        { body: [] },
+        {
+          body: [
+            event('release-dup', 'ReleaseEvent', 'octocat', 'octocat/hello', 1, {
+              release: { id: 7, tag_name: 'v1.0.0', name: 'v1.0.0', body: 'notes', prerelease: false },
+            }),
+          ],
+        },
+      ],
+    },
+    { octocat: [{ body: [{ full_name: 'octocat/hello', private: false, size: 1 }] }] },
+    {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit('base', 30)] },
+      ],
+      releases: [{ body: [] }, { body: [repoRelease(7, 'v1.0.0', 1, { body: 'notes' })] }],
+    },
+  );
+  const f = fixture({
+    fetchImpl: fake.fetchImpl,
+    config: { mode: 'authors', repos: [] },
+    summarize: async () => '版本摘要',
+  });
+  try {
+    await f.tracker.pollNow();
+    await f.tracker.pollNow();
+    assert.equal(f.sent.length, 2);
+    assert.match(f.sent[0]!.text, /🚀 发布 v1\.0\.0/);
+    assert.match(f.sent[0]!.text, /版本摘要/);
+    const rows = f.store.db
+      .prepare('SELECT type,dedupe_key FROM github_events')
+      .all() as unknown as Array<{ type: string; dedupe_key: string }>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.type, 'RepoRelease');
+    assert.equal(rows[0]!.dedupe_key, 'release:octocat/hello:7');
+  } finally {
+    await f.dispose();
+  }
+});
+
 test('GitHub 配置文件：保存后可读回，损坏时退回默认配置而不是崩溃', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-github-cfg-'));
   try {
@@ -818,7 +1056,7 @@ test('304 不重复推送；限额用尽时停止请求但继续投递待发事�
     const notModified = await f.tracker.pollNow();
     assert.equal(notModified.ok, true);
     assert.equal(notModified.fetched, 0);
-    assert.equal(f.calls.length, 2);
+    assert.equal(f.calls.length, 4);
     // If-None-Match 应该带上上一轮的 ETag
     assert.equal(f.sent.length, 0);
 
@@ -828,7 +1066,7 @@ test('304 不重复推送；限额用尽时停止请求但继续投递待发事�
     assert.equal(limited.delivered, 1);
 
     const blocked = await f.tracker.pollNow();
-    assert.equal(f.calls.length, 3); // 限额用尽后不再请求 GitHub
+    assert.equal(f.calls.length, 6); // 限额用尽后不再请求 GitHub
     assert.ok(blocked.errors.some((message) => message.includes('限额')));
     assert.equal(f.sent.length, 2); // 没有重复推送
   } finally {
@@ -966,9 +1204,8 @@ test('保存 Token 后清掉旧的匿名限额阻塞，并立即用新凭证重�
 
     const blocked = await f.tracker.pollNow();
     assert.equal(blocked.ok, false);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 2);
     assert.ok(blocked.errors.some((message) => message.includes('限额')));
-
     f.tracker.saveConfig({ token: 'ghp_new_token_value' });
     const resetSnapshot = f.tracker.snapshot();
     assert.equal(resetSnapshot.runtime.rate.remaining, null);
@@ -977,7 +1214,7 @@ test('保存 Token 后清掉旧的匿名限额阻塞，并立即用新凭证重�
 
     const after = await f.tracker.pollNow();
     assert.equal(after.ok, true);
-    assert.equal(f.calls.length, 2);
+    assert.equal(f.calls.length, 4);
   } finally {
     await f.dispose();
   }
@@ -1066,15 +1303,22 @@ test('GitHub 面板 API：状态脱敏、保存校验、立即检查与测试消
       body: JSON.stringify({
         mode: 'both',
         aiSummary: false,
+        repoDiscoverySec: 7200,
         repos: [{ repo: 'owner/repo', branch: 'main', releases: true }],
       }),
     });
     assert.equal(repoGood.status, 200);
     const savedRepo = (await json(repoGood)) as {
-      config: { mode: string; aiSummary: boolean; repos: Array<{ repo: string; branch: string }> };
+      config: {
+        mode: string;
+        aiSummary: boolean;
+        repoDiscoverySec: number;
+        repos: Array<{ repo: string; branch: string }>;
+      };
     };
     assert.equal(savedRepo.config.mode, 'both');
     assert.equal(savedRepo.config.aiSummary, false);
+    assert.equal(savedRepo.config.repoDiscoverySec, 7200);
     assert.equal(savedRepo.config.repos[0]!.repo, 'owner/repo');
     assert.equal(savedRepo.config.repos[0]!.branch, 'main');
 
@@ -1094,7 +1338,12 @@ test('面板含 GitHub 追踪页，内嵌脚本可编译', () => {
   assert.match(html, /id="page-github"/);
   assert.match(html, /id="gh_settings"/);
   assert.match(html, /id="gh_mode"/);
+  assert.match(html, /gh_repoDiscovery/);
   assert.match(html, /id="gh_aiSummary"/);
+  assert.match(html, /id="gh_authorRepos"/);
+  assert.match(html, /id="gh_tokenState"/);
+  assert.match(html, /ghTokenInput/);
+  assert.match(html, /保存 Token/);
   assert.match(html, /用 AI 总结更新内容/);
   assert.match(html, /id="gh_repos"/);
   assert.match(html, /function renderGithubRepos/);

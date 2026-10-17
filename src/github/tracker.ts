@@ -44,6 +44,7 @@ import {
   renderRepoPush,
   renderRepoRelease,
   safeGithubUrl,
+  type GithubEventDto,
 } from './format.js';
 
 /** 只依赖 sendToScope，OneBotAction 与本接口结构化兼容，测试里可以换成假实现 */
@@ -128,6 +129,21 @@ export interface GithubAuthorView {
   lastError: string;
   total: number;
   pending: number;
+  repoCount: number;
+  reposSyncedAt: number;
+  repoError: string;
+}
+
+export interface GithubAuthorRepoView {
+  login: string;
+  repo: string;
+  branch: string;
+  releases: boolean;
+  baselineAt: number;
+  headSha: string;
+  lastPolledAt: number;
+  lastError: string;
+  pending: number;
 }
 
 export interface GithubRepoView {
@@ -189,6 +205,7 @@ export interface GithubSnapshot {
     rate: { limit: number | null; remaining: number | null; resetAt: number | null };
   };
   authors: GithubAuthorView[];
+  authorRepos: GithubAuthorRepoView[];
   repos: GithubRepoView[];
   targets: GithubTargetView[];
   knownSessions: Array<{ scope: string; title: string; lastActive: number }>;
@@ -204,6 +221,16 @@ interface AuthorRow {
   last_polled_at: number;
   last_event_at: number;
   last_error: string;
+  repos_synced_at: number;
+  repo_error: string;
+}
+
+interface RepoSub {
+  repo: string;
+  branch: string;
+  releases: boolean;
+  enabled: boolean;
+  sources: string[];
 }
 
 interface RepoRow {
@@ -249,6 +276,7 @@ interface EventRow {
   state: string;
   attempts: number;
   last_error: string;
+  dedupe_key: string;
 }
 
 /** 单次 HTTP 请求上限；GitHub 正常响应远快于此 */
@@ -291,6 +319,34 @@ function repoOwner(repo: string): string {
 
 function shortSha(sha: string): string {
   return cleanGithubText(sha, 40).slice(0, 7);
+}
+
+/** 作者公开事件与仓库订阅重叠时的去重键；其他事件不参与跨源去重 */
+function authorDedupeKey(event: GithubEventDto): string {
+  const repo = event.repo.trim().toLowerCase();
+  if (!repo) return '';
+  if (event.type === 'PushEvent') {
+    const head = event.payload['head'];
+    if (typeof head === 'string' && head.trim() && !/^0+$/.test(head.trim())) {
+      return `push:${repo}:${head.trim().toLowerCase()}`;
+    }
+    return '';
+  }
+  if (event.type === 'ReleaseEvent') {
+    const release = event.payload['release'];
+    if (typeof release === 'object' && release !== null && !Array.isArray(release)) {
+      const record = release as Record<string, unknown>;
+      const id = toNumber(record['id']);
+      if (id > 0) return `release:${repo}:${id}`;
+      const tag = record['tag_name'];
+      if (typeof tag === 'string' && tag.trim()) return `release:${repo}:${tag.trim().toLowerCase()}`;
+    }
+  }
+  return '';
+}
+
+function isRepoEventType(type: string): boolean {
+  return type === GITHUB_REPO_PUSH_TYPE || type === GITHUB_REPO_RELEASE_TYPE;
 }
 
 function repoCommitInfo(raw: unknown): RepoCommit | null {
@@ -411,6 +467,8 @@ export class GithubTracker {
     this.store.onClose(() => {
       void this.stop();
     });
+    // 作者已从配置移除/暂停时，连同它名下的自动仓库一起取消
+    this.pruneInactiveAuthorRepos();
     // 手工改配置/停机期间被停用的作者，其遗留的待推送事件不应无限挂着
     this.skipInactivePending();
   }
@@ -452,6 +510,8 @@ export class GithubTracker {
       {
         enabled: result.config.enabled,
         mode: result.config.mode,
+        tokenSet: result.config.token.length > 0,
+        repoDiscoverySec: result.config.repoDiscoverySec,
         authors: result.config.authors.length,
         repos: result.config.repos.length,
         targets: result.config.targets.length,
@@ -526,6 +586,15 @@ export class GithubTracker {
           }>
       ).map((row) => [row.key, { total: toNumber(row.total), pending: toNumber(row.pending) }]),
     );
+    const authorRepoRows = this.store.db
+      .prepare('SELECT login,repo FROM github_author_repos ORDER BY login,repo')
+      .all() as unknown as Array<{ login: string; repo: string }>;
+    const authorRepoCounts = new Map<string, number>();
+    for (const row of authorRepoRows) {
+      const key = row.login.toLowerCase();
+      authorRepoCounts.set(key, (authorRepoCounts.get(key) ?? 0) + 1);
+    }
+    const authorNames = new Map(this.cfg.authors.map((author) => [author.login.toLowerCase(), author.login]));
     const authors: GithubAuthorView[] = this.cfg.authors.map((author) => {
       const key = author.login.toLowerCase();
       const row = this.authorRow(key);
@@ -539,6 +608,9 @@ export class GithubTracker {
         lastError: row?.last_error ?? '',
         total: stat?.total ?? 0,
         pending: stat?.pending ?? 0,
+        repoCount: authorRepoCounts.get(key) ?? 0,
+        reposSyncedAt: row?.repos_synced_at ?? 0,
+        repoError: row?.repo_error ?? '',
       };
     });
 
@@ -574,6 +646,24 @@ export class GithubTracker {
         lastError: row?.last_error ?? '',
         releaseTag: row?.release_tag ?? '',
         total: stat?.total ?? 0,
+        pending: stat?.pending ?? 0,
+      };
+    });
+
+    const authorRepos: GithubAuthorRepoView[] = authorRepoRows.map((entry) => {
+      const key = entry.repo.toLowerCase();
+      const row = this.repoRow(key);
+      const stat = repoStats.get(key);
+      const manual = this.cfg.repos.find((repo) => repo.repo.toLowerCase() === key);
+      return {
+        login: authorNames.get(entry.login.toLowerCase()) ?? entry.login,
+        repo: entry.repo,
+        branch: manual?.branch ?? '',
+        releases: true,
+        baselineAt: row?.baseline_at ?? 0,
+        headSha: row?.head_sha ?? '',
+        lastPolledAt: row?.last_polled_at ?? 0,
+        lastError: row?.last_error ?? '',
         pending: stat?.pending ?? 0,
       };
     });
@@ -660,6 +750,7 @@ export class GithubTracker {
         rate: { limit: this.rateLimit, remaining: this.rateRemaining, resetAt: this.rateResetAt },
       },
       authors,
+      authorRepos,
       repos,
       targets,
       knownSessions,
@@ -721,6 +812,18 @@ export class GithubTracker {
         for (const author of this.cfg.authors.filter((a) => a.enabled)) {
           if (this.stopped) break;
           try {
+            // 公开仓库发现频率与事件轮询独立：默认 3 小时，手动「立即检查」强制刷新
+            await this.syncAuthorRepos(author, startedAt, reason === 'manual');
+          } catch (e) {
+            const message = cleanGithubText((e as Error).message, 300) || '未知错误';
+            errors.push(`${author.login} 公开仓库发现：${message}`);
+            this.log.warn(
+              { githubAuthor: author.login, ...errorDetails(e), reason: message },
+              'GitHub 作者公开仓库发现失败',
+            );
+          }
+          if (this.stopped || this.rateRemaining === 0) break;
+          try {
             fetched += await this.pollAuthor(author, startedAt);
           } catch (e) {
             const message = cleanGithubText((e as Error).message, 300) || '未知错误';
@@ -735,8 +838,9 @@ export class GithubTracker {
         }
       }
 
-      if (this.tracksRepos() && this.rateRemaining !== 0) {
-        for (const repo of this.cfg.repos.filter((r) => r.enabled)) {
+      const repoSubs = this.activeRepoSubs();
+      if (repoSubs.length > 0 && this.rateRemaining !== 0) {
+        for (const repo of repoSubs) {
           if (this.stopped || this.rateRemaining === 0) break;
           try {
             fetched += await this.pollRepoCommits(repo, startedAt);
@@ -824,8 +928,8 @@ export class GithubTracker {
     const baseline = row.baseline_at === 0;
     const ageCutoff = now - this.cfg.maxEventAgeHours * 3600_000;
     const insert = this.store.db.prepare(
-      `INSERT OR IGNORE INTO github_events(event_id,login,type,repo,summary,text,url,occurred_at,fetched_at,state)
-       VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT OR IGNORE INTO github_events(event_id,login,type,repo,summary,text,url,occurred_at,fetched_at,state,dedupe_key)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
     );
     let pending = 0;
     let newest = row.last_event_at;
@@ -834,6 +938,11 @@ export class GithubTracker {
       const event = parseGithubEvent(item);
       if (!event) continue;
       if (event.createdAt > newest) newest = event.createdAt;
+
+      // 作者公开事件与仓库订阅可能描述同一次 push/release：已有任意一条时跳过作者事件。
+      // 若作者事件先入库，仓库订阅随后会把它升级成更完整的 RepoPush/RepoRelease。
+      const dedupeKey = authorDedupeKey(event);
+      if (dedupeKey && this.findByDedupe(dedupeKey)) continue;
 
       let state = 'pending';
       let summary = '';
@@ -861,6 +970,7 @@ export class GithubTracker {
         event.createdAt,
         now,
         state,
+        dedupeKey,
       );
       if (Number(result.changes) > 0 && state === 'pending') pending++;
     }
@@ -889,6 +999,194 @@ export class GithubTracker {
     return this.cfg.mode === 'repos' || this.cfg.mode === 'both';
   }
 
+  /**
+   * 实际参与轮询的仓库 = 手动订阅（repos 模式）+ 作者公开仓库（authors 模式）。
+   * 同一个仓库两边都有时合并成一份，手动配置优先，来源同时记录。
+   */
+  private activeRepoSubs(): RepoSub[] {
+    const map = new Map<string, RepoSub>();
+    if (this.tracksRepos()) {
+      for (const repo of this.cfg.repos) {
+        map.set(repo.repo.toLowerCase(), {
+          repo: repo.repo,
+          branch: repo.branch,
+          releases: repo.releases,
+          enabled: repo.enabled,
+          sources: ['manual'],
+        });
+      }
+    }
+    if (this.tracksAuthors()) {
+      const logins = this.cfg.authors.filter((a) => a.enabled).map((a) => a.login.toLowerCase());
+      if (logins.length > 0) {
+        const placeholders = logins.map(() => '?').join(',');
+        const rows = this.store.db
+          .prepare(`SELECT login,repo FROM github_author_repos WHERE lower(login) IN (${placeholders})`)
+          .all(...logins) as unknown as Array<{ login: string; repo: string }>;
+        for (const row of rows) {
+          const key = row.repo.toLowerCase();
+          const existing = map.get(key);
+          if (existing) {
+            // 作者追踪强制覆盖暂停/关闭 Release 的手动设置：作者仓库必须同时追踪 Release
+            existing.enabled = true;
+            existing.releases = true;
+            existing.sources.push(`author:${row.login}`);
+          } else {
+            map.set(key, {
+              repo: row.repo,
+              branch: '',
+              releases: true,
+              enabled: true,
+              sources: [`author:${row.login}`],
+            });
+          }
+        }
+      }
+    }
+    return [...map.values()].filter((repo) => repo.enabled);
+  }
+
+  /** 作者被移除/暂停/模式切走后，删除其自动仓库映射；没有手动订阅的仓库连状态一起清理 */
+  private pruneInactiveAuthorRepos(): void {
+    const active = this.tracksAuthors()
+      ? this.cfg.authors.filter((a) => a.enabled).map((a) => a.login.toLowerCase())
+      : [];
+    let removed: Array<{ login: string; repo: string }>;
+    if (active.length > 0) {
+      const placeholders = active.map(() => '?').join(',');
+      removed = this.store.db
+        .prepare(`SELECT login,repo FROM github_author_repos WHERE lower(login) NOT IN (${placeholders})`)
+        .all(...active) as unknown as Array<{ login: string; repo: string }>;
+      this.store.db
+        .prepare(`DELETE FROM github_author_repos WHERE lower(login) NOT IN (${placeholders})`)
+        .run(...active);
+      this.store.db
+        .prepare(`UPDATE github_authors SET repos_synced_at=0 WHERE lower(login) NOT IN (${placeholders})`)
+        .run(...active);
+    } else {
+      removed = this.store.db
+        .prepare('SELECT login,repo FROM github_author_repos')
+        .all() as unknown as Array<{ login: string; repo: string }>;
+      this.store.db.exec('DELETE FROM github_author_repos; UPDATE github_authors SET repos_synced_at=0');
+    }
+    const seen = new Set<string>();
+    for (const row of removed) {
+      const key = row.repo.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      this.cleanupAuthorRepo(key);
+    }
+  }
+
+  /** 仓库不再由任何作者/手动订阅引用时，清掉 HEAD 状态并跳过待推送事件 */
+  private cleanupAuthorRepo(key: string): void {
+    if (this.cfg.repos.some((repo) => repo.repo.toLowerCase() === key)) return;
+    const other = this.store.db
+      .prepare('SELECT 1 AS hit FROM github_author_repos WHERE lower(repo)=? LIMIT 1')
+      .get(key);
+    if (other) return;
+    this.store.db.prepare('DELETE FROM github_repos WHERE repo=?').run(key);
+    this.store.db
+      .prepare(
+        `UPDATE github_events SET state='skipped', last_error=?
+         WHERE state='pending' AND type IN (?,?) AND lower(repo)=?`,
+      )
+      .run('作者仓库已取消', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE, key);
+  }
+
+  /** 发现作者的所有公开仓库；默认每 repoDiscoverySec 秒一次，手动检查可强制刷新 */
+  private async syncAuthorRepos(author: GithubAuthorConfig, now: number, force: boolean): Promise<void> {
+    const key = author.login.toLowerCase();
+    const row = this.ensureAuthorRow(key);
+    if (
+      !force &&
+      row.repos_synced_at > 0 &&
+      now - row.repos_synced_at < this.cfg.repoDiscoverySec * 1000
+    ) {
+      return;
+    }
+    try {
+      const repos = await this.fetchAuthorRepos(author.login);
+      const db = this.store.db;
+      const removed: string[] = [];
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const existing = db
+          .prepare('SELECT repo FROM github_author_repos WHERE login=?')
+          .all(key) as unknown as Array<{ repo: string }>;
+        const existingKeys = new Set(existing.map((item) => item.repo.toLowerCase()));
+        const discovered = new Set<string>();
+        const insert = db.prepare('INSERT OR IGNORE INTO github_author_repos(login,repo) VALUES(?,?)');
+        for (const repo of repos) {
+          const repoKey = repo.toLowerCase();
+          if (discovered.has(repoKey)) continue;
+          discovered.add(repoKey);
+          if (!existingKeys.has(repoKey)) insert.run(key, repo);
+        }
+        const remove = db.prepare('DELETE FROM github_author_repos WHERE login=? AND lower(repo)=?');
+        for (const old of existing) {
+          const repoKey = old.repo.toLowerCase();
+          if (!discovered.has(repoKey)) {
+            removed.push(repoKey);
+            remove.run(key, repoKey);
+          }
+        }
+        db.prepare('UPDATE github_authors SET repos_synced_at=?, repo_error=? WHERE login=?').run(now, '', key);
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+      for (const repoKey of removed) this.cleanupAuthorRepo(repoKey);
+      if (removed.length > 0) this.skipInactivePending();
+      this.log.info(
+        { githubAuthor: author.login, publicRepos: repos.length, removed: removed.length },
+        '已同步作者公开仓库',
+      );
+    } catch (e) {
+      const message = cleanGithubText((e as Error).message, 300) || '未知错误';
+      this.store.db
+        .prepare('UPDATE github_authors SET repos_synced_at=?, repo_error=? WHERE login=?')
+        .run(now, message, key);
+      throw e;
+    }
+  }
+
+  private async fetchAuthorRepos(login: string): Promise<string[]> {
+    const found = new Set<string>();
+    for (let page = 1; ; page++) {
+      const url = `${this.cfg.apiBase}/users/${encodeURIComponent(login)}/repos?type=owner&per_page=100&page=${page}`;
+      const response = await this.fetchImpl(url, {
+        headers: this.apiHeaders(),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      this.updateRate(response.headers);
+      if (response.status === 404) throw new Error('GitHub 用户不存在或已改名');
+      if (!response.ok) throw new Error(await this.githubFailure(response));
+      const body: unknown = await response.json();
+      if (!Array.isArray(body)) throw new Error('GitHub 公开仓库响应格式不正确');
+      for (const item of body) {
+        if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        if (record['private'] === true) continue;
+        // 空仓库没有可比较的提交，跳过；缺少 size 字段时仍按公开仓库处理
+        if (typeof record['size'] === 'number' && record['size'] === 0) continue;
+        const fullName = typeof record['full_name'] === 'string' ? record['full_name'].trim() : '';
+        if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) continue;
+        found.add(fullName);
+      }
+      if (body.length < 100) break;
+      if (this.rateRemaining === 0) {
+        throw new Error(
+          this.rateResetAt
+            ? `GitHub 接口限额已用尽，${formatGithubTime(this.rateResetAt, this.timezone)} 后恢复`
+            : 'GitHub 接口限额已用尽，请稍后重试',
+        );
+      }
+    }
+    return [...found];
+  }
+
   private apiHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       accept: 'application/vnd.github+json',
@@ -902,6 +1200,7 @@ export class GithubTracker {
   /** 统一把非 2xx 响应转成中文错误；403/429 且剩余为 0 时给出重置时间 */
   private async githubFailure(response: GithubHttpResponse): Promise<string> {
     const body = await this.readErrorBody(response);
+    if (response.status === 401) return 'GitHub Token 无效或已过期，请重新填写';
     if (response.status === 404) return '仓库或分支不存在，或 Token 无权访问';
     if ((response.status === 403 || response.status === 429) && this.rateRemaining === 0) {
       return this.rateResetAt
@@ -933,6 +1232,30 @@ export class GithubTracker {
     return Boolean(
       this.store.db.prepare('SELECT 1 AS hit FROM github_events WHERE event_id=? LIMIT 1').get(eventId),
     );
+  }
+
+  private findByDedupe(dedupeKey: string): EventRow | undefined {
+    if (!dedupeKey) return undefined;
+    return this.store.db
+      .prepare('SELECT * FROM github_events WHERE dedupe_key=? LIMIT 1')
+      .get(dedupeKey) as EventRow | undefined;
+  }
+
+  private hasSentDelivery(eventId: string): boolean {
+    return Boolean(
+      this.store.db
+        .prepare("SELECT 1 AS hit FROM github_deliveries WHERE event_id=? AND status='sent' LIMIT 1")
+        .get(eventId),
+    );
+  }
+
+  /** 仓库事件是否已被作者事件/仓库事件抢先完成，避免白跑一次摘要模型 */
+  private repoEventIsDuplicate(dedupeKey: string): boolean {
+    const existing = this.findByDedupe(dedupeKey);
+    if (!existing) return false;
+    if (isRepoEventType(existing.type)) return true;
+    if (existing.state === 'sent') return true;
+    return this.hasSentDelivery(existing.event_id);
   }
 
   // ============================================================
@@ -1027,8 +1350,10 @@ export class GithubTracker {
     const occurredAt = Math.max(...fresh.map((item) => item.date), head.date) || now;
     const commitInfos = fresh.map((item) => ({ sha: item.sha, author: item.author, message: item.message }));
     const eventId = `repo-push:${key}:${head.sha}`;
+    const dedupeKey = `push:${key}:${head.sha.toLowerCase()}`;
     const existing = this.eventExists(eventId);
-    const aiSummary = existing
+    const duplicate = existing || this.repoEventIsDuplicate(dedupeKey);
+    const aiSummary = duplicate
       ? ''
       : await this.summarize({
           kind: 'push',
@@ -1064,6 +1389,7 @@ export class GithubTracker {
       rendered,
       occurredAt,
       now,
+      dedupeKey,
     );
     this.store.db
       .prepare('UPDATE github_repos SET head_sha=?, last_polled_at=?, last_error=? WHERE repo=?')
@@ -1162,8 +1488,10 @@ export class GithubTracker {
     let lastTag = row.release_tag;
     for (const release of fresh.slice(0, this.cfg.maxEventsPerPoll)) {
       const eventId = `repo-release:${key}:${release.id}`;
+      const dedupeKey = `release:${key}:${release.id}`;
       const existing = this.eventExists(eventId);
-      const aiSummary = existing
+      const duplicate = existing || this.repoEventIsDuplicate(dedupeKey);
+      const aiSummary = duplicate
         ? ''
         : await this.summarize({
             kind: 'release',
@@ -1197,6 +1525,7 @@ export class GithubTracker {
         rendered,
         release.publishedAt,
         now,
+        dedupeKey,
       );
       pending += inserted;
       lastId = release.id;
@@ -1219,13 +1548,55 @@ export class GithubTracker {
     rendered: { summary: string; text: string; url: string },
     occurredAt: number,
     now: number,
+    dedupeKey: string,
   ): number {
+    const existing = this.findByDedupe(dedupeKey);
+    if (existing) {
+      // 已由仓库订阅处理过，或作者事件已经实际发送：先发送者优先，不再重复。
+      if (isRepoEventType(existing.type) || existing.state === 'sent' || this.hasSentDelivery(existing.event_id)) {
+        return 0;
+      }
+      // 作者事件仍待推送/失败/跳过时，把它升级为更完整的仓库订阅消息。
+      const updated = this.store.db
+        .prepare(
+          `UPDATE github_events
+           SET login=?, type=?, repo=?, summary=?, text=?, url=?, occurred_at=?, fetched_at=?,
+               state='pending', attempts=0, last_error=?, dedupe_key=?
+           WHERE event_id=?`,
+        )
+        .run(
+          login,
+          type,
+          repo,
+          rendered.summary,
+          rendered.text,
+          rendered.url,
+          occurredAt,
+          now,
+          '',
+          dedupeKey,
+          existing.event_id,
+        );
+      return Number(updated.changes) > 0 ? 1 : 0;
+    }
     const result = this.store.db
       .prepare(
-        `INSERT OR IGNORE INTO github_events(event_id,login,type,repo,summary,text,url,occurred_at,fetched_at,state)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT OR IGNORE INTO github_events(event_id,login,type,repo,summary,text,url,occurred_at,fetched_at,state,dedupe_key)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
       )
-      .run(eventId, login, type, repo, rendered.summary, rendered.text, rendered.url, occurredAt, now, 'pending');
+      .run(
+        eventId,
+        login,
+        type,
+        repo,
+        rendered.summary,
+        rendered.text,
+        rendered.url,
+        occurredAt,
+        now,
+        'pending',
+        dedupeKey,
+      );
     return Number(result.changes);
   }
 
@@ -1274,35 +1645,34 @@ export class GithubTracker {
       }
     }
 
-    if (this.tracksRepos()) {
-      for (const repo of this.cfg.repos.filter((r) => r.enabled)) {
+    const repoSubs = this.activeRepoSubs();
+    for (const repo of repoSubs) {
+      if (this.stopped) break;
+      const rows = this.store.db
+        .prepare(
+          `SELECT * FROM github_events
+           WHERE state='pending' AND lower(repo)=? AND type IN (?,?)
+           ORDER BY occurred_at ASC LIMIT ?`,
+        )
+        .all(
+          repo.repo.toLowerCase(),
+          GITHUB_REPO_PUSH_TYPE,
+          GITHUB_REPO_RELEASE_TYPE,
+          this.cfg.maxEventsPerPoll,
+        ) as unknown as EventRow[];
+      for (const row of rows) {
         if (this.stopped) break;
-        const rows = this.store.db
-          .prepare(
-            `SELECT * FROM github_events
-             WHERE state='pending' AND lower(repo)=? AND type IN (?,?)
-             ORDER BY occurred_at ASC LIMIT ?`,
-          )
-          .all(
-            repo.repo.toLowerCase(),
-            GITHUB_REPO_PUSH_TYPE,
-            GITHUB_REPO_RELEASE_TYPE,
-            this.cfg.maxEventsPerPoll,
-          ) as unknown as EventRow[];
-        for (const row of rows) {
-          if (this.stopped) break;
-          if (row.type === GITHUB_REPO_RELEASE_TYPE && !repo.releases) {
-            this.markEvent(row.event_id, 'skipped', '仓库已取消 Release 订阅', row.attempts);
-            continue;
-          }
-          if (!row.text) {
-            this.markEvent(row.event_id, 'skipped', '事件正文为空', row.attempts);
-            continue;
-          }
-          const outcome = await this.deliverEvent(row, now);
-          if (outcome === 'sent') delivered++;
-          if (outcome === 'offline') return delivered;
+        if (row.type === GITHUB_REPO_RELEASE_TYPE && !repo.releases) {
+          this.markEvent(row.event_id, 'skipped', '仓库已取消 Release 订阅', row.attempts);
+          continue;
         }
+        if (!row.text) {
+          this.markEvent(row.event_id, 'skipped', '事件正文为空', row.attempts);
+          continue;
+        }
+        const outcome = await this.deliverEvent(row, now);
+        if (outcome === 'sent') delivered++;
+        if (outcome === 'offline') return delivered;
       }
     }
     return delivered;
@@ -1396,6 +1766,7 @@ export class GithubTracker {
     if (authChanged) this.resetRateState();
 
     // 作者被移除/暂停后，不再补发它遗留的待推送事件
+    this.pruneInactiveAuthorRepos();
     this.skipInactivePending();
 
     if (this.stopped) return;
@@ -1447,9 +1818,8 @@ export class GithubTracker {
         .run('作者已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE);
     }
 
-    const activeRepos = this.tracksRepos()
-      ? this.cfg.repos.filter((r) => r.enabled).map((r) => r.repo.toLowerCase())
-      : [];
+    const activeRepoSubs = this.activeRepoSubs();
+    const activeRepos = activeRepoSubs.map((repo) => repo.repo.toLowerCase());
     if (activeRepos.length > 0) {
       const placeholders = activeRepos.map(() => '?').join(',');
       this.store.db
@@ -1468,9 +1838,9 @@ export class GithubTracker {
         .run('仓库已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE);
     }
 
-    const noReleaseRepos = this.cfg.repos
-      .filter((r) => r.enabled && !r.releases)
-      .map((r) => r.repo.toLowerCase());
+    const noReleaseRepos = activeRepoSubs
+      .filter((repo) => !repo.releases)
+      .map((repo) => repo.repo.toLowerCase());
     if (noReleaseRepos.length > 0) {
       const placeholders = noReleaseRepos.map(() => '?').join(',');
       this.store.db

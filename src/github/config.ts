@@ -122,6 +122,8 @@ export const GithubConfigSchema = z.object({
   aiSummary: z.boolean().default(true),
   /** 轮询间隔（秒）；GitHub 官方建议轮询不要太频繁 */
   intervalSec: z.number().int().min(60).max(3600).default(300),
+  /** 作者公开仓库发现间隔（秒），默认 3 小时；与追踪轮询独立 */
+  repoDiscoverySec: z.number().int().min(300).max(604800).default(10800),
   /** 单个作者/仓库每轮最多推送多少条，超出的下一轮继续 */
   maxEventsPerPoll: z.number().int().min(1).max(GITHUB_MAX_EVENTS_PER_POLL).default(5),
   /** 超过这个时长的旧动态直接忽略，避免停机后补发陈年事件；仓库订阅不受此限制 */
@@ -323,6 +325,9 @@ export function validateGithubConfig(
     }
     if (input['intervalSec'] !== undefined) {
       config.intervalSec = integerValue(input['intervalSec'], '轮询间隔', 60, 3600);
+    }
+    if (input['repoDiscoverySec'] !== undefined) {
+      config.repoDiscoverySec = integerValue(input['repoDiscoverySec'], '公开仓库发现间隔', 300, 604800);
     }
     if (input['maxEventsPerPoll'] !== undefined) {
       config.maxEventsPerPoll = integerValue(input['maxEventsPerPoll'], '每轮最多推送条数', 1, GITHUB_MAX_EVENTS_PER_POLL);

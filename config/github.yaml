@@ -10,8 +10,8 @@
 enabled: false
 
 # 追踪模式：
-#   authors = 作者动态（/users/{login}/events/public）
-#   repos   = 仓库订阅（按分支比对 HEAD SHA + Release）
+#   authors = 作者公开事件 + 该作者本人 owner 的全部公开仓库
+#   repos   = 只轮询手动订阅仓库（按分支比对 HEAD SHA + Release）
 #   both    = 两者同时
 mode: authors
 
@@ -21,6 +21,10 @@ aiSummary: true
 
 # 轮询间隔（秒），60~3600。GitHub 建议不要轮询太频繁。
 intervalSec: 300
+
+# 作者公开仓库发现间隔（秒），300~604800，默认 3 小时。
+# 与上面的追踪轮询独立；手动「立即检查」会强制刷新一次。
+repoDiscoverySec: 10800
 
 # 单个作者/仓库每轮最多推送几条，1~20；超出的下一轮继续。
 maxEventsPerPoll: 5
