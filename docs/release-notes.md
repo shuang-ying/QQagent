@@ -1,5 +1,48 @@
 # 发行版更新记录
 
+## 2.3.0（2026-10-17）
+
+同步开发版功能到发行版，并明确内置 SnowLuma 的许可边界与安装方式。版本号统一升到 2.3.0（开发版与发行版同步），启动日志与后台仍从 `package.json` 读取版本。升级不需要手工迁移配置；数据库 schema 由 v5 升到 v6，启动时自动备份。
+
+### 内置 SnowLuma（面板托管）
+
+面板新增「❄ SnowLuma」页：在页面内安装、启动、停止独立进程，查看实时终端并使用上游原生管理界面，不需要一直开着命令行窗口。
+
+- **发行包不含任何上游文件**。snowluma 采用源码可见非商业许可（不是开源许可），原生组件另有专有条款（EULA 第 5 条），因此它的源码、二进制、归档全部位于 Git 与 npm 排除的 `runtime/`，仓库只发布本项目自己的管理代码（`src/snowluma/`、`scripts/snowluma-runner.mjs`）与固定版本、SHA256 校验值清单。
+- 安装按钮的行为是「从上游官方 GitHub 发布页下载到用户自己的机器」：固定 `v1.14.22`，校验 SHA256 后原子发布，失败不覆盖既有账号数据。另提供离线手动放置官方包的步骤（含校验值与 `installation.json` 示例）。
+- 进程与数据分离：Agent 负责回复、模型、人格与记忆，snowluma 负责 QQ 协议和自己的界面，两者只通过 OneBot 连接；不会接管或停止你此前单独运行的 snowluma。
+- 鉴权独立：`/api/snowluma/*` 受现有面板鉴权保护，控制操作拒绝跨站 Origin；内嵌界面通过 8 小时 HttpOnly、SameSite=Strict 会话 Cookie 经专用代理访问，SnowLuma 自己的登录 Token 独立使用。
+- 修复启动包装层的官方入口参数，使数据库迁移工作线程能正常进入官方流程（`ERR_INVALID_ARG_TYPE` 不再出现）。
+
+条款逐条对应、公开分发与商业使用前需要做什么、手动安装步骤见 `docs/snowluma-integration.md`。
+
+### GitHub 作者动态追踪
+
+新增「📡 GitHub 追踪」页与 `config/github.yaml`：追踪一个或多个作者的公开动态，推送到本页单独选定的 QQ 会话（与项目群/用户白名单无关）。首轮只建基线不刷历史，事件落库去重、重启不重发，离线后恢复只补发失败会话；支持 ETag、限额感知、每轮上限、旧事件跳过与可选 Token。不可信文本经消息段转义后发送。
+
+### 按用途 Token 预算
+
+新增七项输出预算（`chat` / `vision` / `sticker` / `emotion` / `facts` / `summary` / `daily`），面板「概览 → 功能开关 → Token 预算」可视化调整，`0` 表示沿用该用途原有预算，因此发行版模板全部为 0、默认行为不变。另提供 `GET/PATCH /api/token-budgets` 部分更新接口，取值 0~131072，沿用原有校验与原子保存。
+
+### 日志诊断增强
+
+在不改变业务行为的前提下补充结构化诊断字段（模块与阶段、会话与轮次、供应商与用途、超时与耗时、失败类型、有界错误快照、OneBot 动作与结果、重试与回退路径）。日志中的密钥、Bearer、Cookie、签名 URL 与 base64 图片会脱敏，不记录消息正文、动作参数、请求体与认证头。新增 `npm run test:logging`。
+
+### 主动发言节奏修正
+
+统一主动发言的机会点、间隔与每小时上限判定，按会话隔离计数器；补充 `npm run test:proactive-cadence` 回归，确认并发与被取消的投递不会额外放大主动消息数量。
+
+### 其他
+
+- 新增文档：逐指令权限、GitHub 追踪、日志诊断、记忆/上下文/Embedding/情绪详解、人格上下文与结构化设定、主动发言相关度、回复窗口与对象归属、Token 预算、内置 SnowLuma。
+- 数据库 schema 升到 v6；升级前自动用 `VACUUM INTO` 生成 `data/brain.db.pre-v6.<时间戳>.bak`，检测到数据库版本高于程序版本时拒绝降级启动。
+- 未新增 npm 依赖，`engines` 仍为 `>=22.16.0`；三个 Windows 批处理与启动回归保持不变。
+- 新增 `config/github.yaml` 脱敏模板（`enabled: false`、`token` 为空）；`config/app.yaml` 补充 `llm.roles.asr`、`llm.tokenBudgets`、`tasks`、`speech` 示例项，其余默认值保持保守。
+
+### 验证
+
+`npm run typecheck` 通过；`npm run test:offline` 通过，41 个测试文件、599 项检查全部通过，其中包含本轮新增的 SnowLuma、GitHub 追踪、Token 预算与日志四项专项回归；`npm run test:isolated` 通过，接入层 37 项与面板隔离 5 项全部通过。全部使用本地夹具和测试子进程，未调用真实模型、未发送真实 QQ 消息、未打开用户账号数据库。
+
 ## Windows 启动脚本修复
 
 修复 GitHub ZIP 将批处理规范化为 LF 后，cmd.exe 把注释和路径片段当成命令的问题。三个批处理统一 ASCII/CRLF，Git属性保留原始字节；首次安装优先使用锁文件，依赖不完整时重装，失败立即停止，运行退出码保留。新增10项启动回归，覆盖含空格/特殊字符路径、首次安装、安装失败、运行失败和Git归档后的实际执行。

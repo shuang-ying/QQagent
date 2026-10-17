@@ -1,0 +1,53 @@
+# GitHub 动态追踪配置
+#
+# 由管理面板「📡 GitHub 追踪」页维护，手改也可以；面板保存时会重写本文件。
+# 这里可能包含 GitHub Token（私密信息）。发行版模板中的 token 为空，
+# 填过 Token 之后请不要再把本文件提交到任何公开仓库。
+#
+# 相关说明：docs/github-tracking.md
+
+# 总开关。默认关闭：不做任何网络请求，也不推送。
+enabled: false
+
+# 轮询间隔（秒），60~3600。GitHub 建议不要轮询太频繁。
+intervalSec: 300
+
+# 单个作者每轮最多推送几条，1~20；超出的下一轮继续。
+maxEventsPerPoll: 5
+
+# 超过这个小时数的旧动态直接跳过，避免停机后补发陈年事件，1~168。
+maxEventAgeHours: 24
+
+# GitHub API 基址；GitHub Enterprise 可改成自己的实例地址。
+apiBase: https://api.github.com
+
+# 可选 Token：留空时匿名请求（每小时 60 次），填了可提升到每小时 5000 次。
+token: ""
+
+# 要推送的事件类型，取消的项不会补发已排队的同类型事件。
+eventTypes:
+  - PushEvent
+  - CreateEvent
+  - ReleaseEvent
+  - PullRequestEvent
+  - PullRequestReviewEvent
+  - IssuesEvent
+  - IssueCommentEvent
+  - ForkEvent
+  - WatchEvent
+  - PublicEvent
+
+# 被追踪的 GitHub 作者（最多 50 个）。首次加入只建立基线，不推送历史动态。
+# 例：
+#   - login: torvalds
+#     enabled: true
+authors: []
+
+# 推送目标会话（最多 50 个），与项目的群/用户白名单无关，独立生效。
+# 格式：group:群号（4~12 位，非 0 开头）或 private:QQ号。
+# 例：
+#   - scope: group:123456789
+#     enabled: true
+#   - scope: private:123456789
+#     enabled: true
+targets: []

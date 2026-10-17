@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { errorDetails, getLogger } from '../core/logger.js';
 import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
@@ -199,6 +200,8 @@ export class LinkReader {
             return page;
         }
         catch (e) {
+            getLogger('links')[signal.aborted && signal.reason?.name !== 'TimeoutError'?'debug':'warn']({scope,
+              phase:'read-page',timeoutMs:settings.timeoutMs,...errorDetails(e)}, '网页读取失败');
             if (signal.aborted && signal.reason?.name !== 'TimeoutError')
                 signal.throwIfAborted();
             return { url, status: 'failed', note: (signal.reason?.name === 'TimeoutError' ? '网页读取超时' : (e as Error).message) + '；不能推测网页正文' };

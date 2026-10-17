@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * QQ 收藏表情导入
  *
@@ -16,7 +17,7 @@ import { createHash } from 'node:crypto';
 import type { Logger } from '../core/logger.js';
 import type { StickerEntry, QqFavEmoji } from '../core/types.js';
 import { sniffMime } from '../llm/vision.js';
-import { isImageFile, QQ_SUBDIR, type StickerLibrary } from './stickers.js';
+import { QQ_SUBDIR, type StickerLibrary } from './stickers.js';
 
 /** 单张下载大小上限 */
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -58,17 +59,6 @@ function extFromMime(mime: string): string {
       return '.bmp';
     default:
       return '.jpg';
-  }
-}
-
-/** 从 URL 路径猜扩展名，猜不到就空串 */
-function extFromUrl(url: string): string {
-  try {
-    const p = new URL(url).pathname;
-    const e = path.extname(p).toLowerCase();
-    return isImageFile(`x${e}`) ? e : '';
-  } catch {
-    return '';
   }
 }
 
@@ -118,7 +108,7 @@ export async function importQqFavorites(
       items = (await api.fetchCustomFaceDetail(limit)).filter((e) => e.url);
     }
   } catch (e) {
-    log.warn({ err: (e as Error).message }, 'fetch_custom_face_detail 不可用，退化为 fetch_custom_face');
+    log.warn({ ...errorDetails(e), err: (e as Error).message }, 'fetch_custom_face_detail 不可用，退化为 fetch_custom_face');
   }
 
   if (items.length === 0 && api.fetchCustomFace) {
@@ -132,7 +122,7 @@ export async function importQqFavorites(
           ? '当前 NapCat 版本不支持读取收藏表情（需要含 fetch_custom_face 扩展动作的版本）'
           : `读取收藏表情失败：${msg}`,
       );
-      log.warn({ err: msg }, '读取 QQ 收藏表情失败');
+      log.warn({phase:'fetch-favorites',...errorDetails(e),err:msg}, '读取 QQ 收藏表情失败');
       return out;
     }
   }
@@ -147,6 +137,8 @@ export async function importQqFavorites(
   const knownMd5 = new Set<string>();
   const knownRes = new Set<string>();
   for (const s of lib.list()) {
+    // 丢失的本地文件必须允许重新下载，不能因 manifest 留着 MD5 而永久跳过。
+    if (s.missing) continue;
     if (s.md5) knownMd5.add(s.md5.toLowerCase());
     if (s.resId) knownRes.add(s.resId);
   }
@@ -183,13 +175,14 @@ export async function importQqFavorites(
       }
 
       const mime = sniffMime(buf);
-      // URL 后缀通常是对的，优先用；没有就按魔数猜
-      const ext = extFromUrl(item.url) || extFromMime(mime);
-      const rel = `${QQ_SUBDIR}/qq_${md5.slice(0, 12)}${ext}`;
+      if (!mime) throw new Error('下载内容不是支持的图片');
+      const previous = lib.list().find(s => s.md5?.toLowerCase() === md5 || !!item.resId && s.resId === item.resId);
+      const rel = previous?.file ?? `${QQ_SUBDIR}/qq_${md5.slice(0, 12)}${extFromMime(mime)}`;
       const abs = path.join(lib.root, rel);
 
       // 文件已存在（上次导入过但 manifest 被删了）：补 manifest 记录即可
       if (!fs.existsSync(abs)) {
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
         fs.writeFileSync(abs, buf);
       }
 
@@ -199,10 +192,10 @@ export async function importQqFavorites(
       newEntries.push({
         file: rel,
         // QQ 那边自带的表情描述有时是空的；有就先用上，AI 识别会再覆盖
-        tags: [],
-        desc: item.desc ?? '',
-        useWhen: '',
-        emotions: [],
+        tags: previous?.tags ?? [],
+        desc: previous?.desc || item.desc || '',
+        useWhen: previous?.useWhen ?? '',
+        emotions: previous?.emotions ?? [],
         source: 'qq',
         resId: item.resId,
         md5,
@@ -215,7 +208,7 @@ export async function importQqFavorites(
       out.failed++;
       const msg = `${item.url.slice(0, 50)}: ${(e as Error).message}`;
       if (out.errors.length < 10) out.errors.push(msg);
-      log.debug({ err: (e as Error).message }, '下载收藏表情失败');
+      log.debug({ ...errorDetails(e), err: (e as Error).message }, '下载收藏表情失败');
     }
   }
 
@@ -259,7 +252,7 @@ export async function pushDescToQq(
       ok++;
     } catch (err) {
       failed++;
-      log.debug({ err: (err as Error).message }, '回写收藏表情描述失败');
+      log.debug({ ...errorDetails(err), err: (err as Error).message }, '回写收藏表情描述失败');
     }
   }
   return { ok, failed };

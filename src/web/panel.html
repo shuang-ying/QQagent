@@ -112,6 +112,8 @@
   .role-row select{flex:1 1 150px;min-width:130px;font-size:12px;padding:6px 8px}
   .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:rgba(107,138,253,.15);color:var(--accent)}
   .pill.grey{background:var(--panel);color:var(--dim)}
+  .snow-terminal{background:#090c12;color:#d8dee9;border:1px solid var(--border);border-radius:8px;padding:12px;height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.65 Consolas,"Microsoft YaHei",monospace}
+  .snow-frame{width:100%;height:740px;border:1px solid var(--border);border-radius:8px;background:var(--bg)}
   @media(max-width:640px){
     .layout{flex-direction:column}
     nav{width:100%;height:auto;position:static;display:flex;flex-wrap:wrap;padding:10px;border-right:0;border-bottom:1px solid var(--border)}
@@ -128,6 +130,7 @@
     <h1>🐱 QQ Agent<small id="appVersion">管理面板</small></h1>
     <a data-page="overview" class="active">📊 概览</a>
     <a data-page="providers">🔌 模型接入</a>
+    <a data-page="snowluma">❄ SnowLuma</a>
     <a data-page="personas">🎭 人格</a>
     <a data-page="stickers">🖼 表情包</a>
     <a data-page="access">🔐 权限</a>
@@ -135,6 +138,7 @@
     <a data-page="emotion">📈 情绪</a>
     <a data-page="logs">📜 日志</a>
     <a data-page="tasks">⏰ 提醒与日报</a>
+    <a data-page="github">📡 GitHub 追踪</a>
   </nav>
   <main>
     <div id="toast"></div>
@@ -278,8 +282,8 @@
           两条路都开着，可以各自开关（在「概览 → 功能开关 → 回复行为」）：<br>
           <b>① 模型自主决定</b>：提示词里带上每张图的标签和描述，模型觉得该发时会在正文末尾写
           <span class="mono">[表情:标签]</span>，正文照常发，然后单独发一条图。<br>
-          <b>② 按情绪自动补图</b>：模型没主动发时，命中情绪且强度够就自己补一张。
-          受<b>冷却</b>和<b>概率</b>限制 —— 每次都发会显得很机械，也容易招人烦。<br>
+          <b>② 自动发送</b>：开启后，模型点名和自动补图统一受<b>情绪强度、冷却和概率</b>限制，每轮只判定一次概率。
+          模型没写标记时，结合回复内容和已识别情绪挑选图片；用户明确要求发表情包时直接满足。<br>
           <span class="muted">建议：先只开 ①，观察一阵再考虑开 ②；② 的冷却别低于 120 秒。</span>
         </div>
       </div>
@@ -350,6 +354,34 @@
       </div>
     </div>
 
+    <div class="page" id="page-snowluma">
+      <h2>SnowLuma</h2>
+      <div class="sub">在此管理独立运行的 SnowLuma，无需保持命令行窗口打开。刷新或离开页面不会停止进程。</div>
+      <div class="card">
+        <h3>运行控制</h3>
+        <div class="row" style="margin-bottom:12px">
+          <button id="snowInstall" onclick="snowAction('install')">安装内置组件</button>
+          <button id="snowStart" onclick="snowAction('start')">启动 SnowLuma</button>
+          <button id="snowStop" class="danger" onclick="snowAction('stop')">停止</button>
+          <button class="ghost" onclick="loadSnowLuma()">刷新状态</button>
+        </div>
+        <div class="grid c3" id="snowStatus"></div>
+        <div id="snowError" class="msg err" style="display:none;margin-top:12px"></div>
+        <div class="muted" id="snowConnection" style="margin-top:12px"></div>
+        <div class="muted" style="margin-top:8px">启动后在下方完成 SnowLuma 自己的登录、使用条款确认和 QQ 接入。进程运行不代表 QQ 已连接；OneBot 连接仍按 Agent 当前配置设置。</div>
+      </div>
+      <div class="card">
+        <h3>终端输出 <button class="sm ghost" onclick="$('snowTerminal').textContent=''">清空当前屏幕</button></h3>
+        <div class="muted" style="margin-bottom:8px">实时显示 SnowLuma 的标准输出、错误输出和安装进度。初始登录密码会出现在这里，只有获得面板访问权限的用户可查看。</div>
+        <pre id="snowTerminal" class="snow-terminal" aria-live="polite"></pre>
+      </div>
+      <div class="card">
+        <h3>SnowLuma 管理界面 <button class="sm ghost" id="snowFrameRefresh" onclick="openSnowFrame(true)">刷新内置界面</button></h3>
+        <div class="muted" id="snowFrameHint">启动并就绪后在此显示官方管理界面。</div>
+        <iframe id="snowFrame" title="SnowLuma 独立管理界面" class="snow-frame" src="about:blank" style="display:none"></iframe>
+      </div>
+    </div>
+
     <div class="page" id="page-tasks">
       <h2>提醒与群聊日报</h2><div class="sub">任务存入数据库，按应用时区执行；结果未知的投递不会自动重发。功能开关在概览中设置。</div>
       <div class="card"><h3>创建任务</h3><div class="grid c2">
@@ -359,6 +391,65 @@
         <div><label>提醒时间或日报时刻</label><input id="task_when" placeholder="10m / 明天09:00 / 日期 时间；日报填21:00"></div>
       </div><label>提醒内容</label><textarea id="task_text" maxlength="1000"></textarea><button onclick="createTask()">创建任务</button><span id="task_timezone" class="muted"></span></div>
       <div class="card"><h3>任务与投递记录 <button class="sm ghost" onclick="loadTasks()">刷新</button></h3><div id="task_list" class="scroll"></div><div id="task_runs" class="scroll"></div></div>
+    </div>
+
+    <div class="page" id="page-github">
+      <h2>GitHub 动态追踪</h2>
+      <div class="sub">追踪一个或多个 GitHub 作者的公开动态，实时推送到<b>本页单独选定</b>的会话；这里的会话与项目里的群/用户白名单互不影响。</div>
+
+      <div class="card">
+        <h3>运行状态 <button class="sm ghost" onclick="loadGithub()">刷新</button><span id="gh_dirty" class="tag warn" style="display:none;margin-left:8px">有未保存的改动</span></h3>
+        <div class="grid c4" id="gh_status"></div>
+        <div id="gh_error" class="msg err" style="display:none;margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <h3>追踪设置</h3>
+        <div id="gh_settings"></div>
+        <div class="row" style="margin-top:14px">
+          <button id="gh_saveBtn" onclick="saveGithubConfig()">保存设置</button>
+          <button class="ghost" id="gh_pollBtn" onclick="githubPollNow()">立即检查</button>
+          <button class="ghost" id="gh_testBtn" onclick="githubTestSend()">发送测试消息</button>
+        </div>
+        <div class="muted" style="margin-top:10px;line-height:1.9">
+          · 配置保存在本机 <span class="mono">config/github.yaml</span>；含 Token 时不会提交到 Git。<br>
+          · GitHub 公开事件接口自身有几十秒到几分钟缓存，轮询间隔建议 ≥ 5 分钟；匿名请求每小时 60 次，填 Token 后 5000 次。<br>
+          · 首次加入某位作者只建立基线，不会把历史动态刷进会话；机器人离线或会话发送失败时保留待推送，恢复后补发。
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>追踪的作者</h3>
+        <div id="gh_authors" class="scroll"></div>
+        <div class="row" style="margin-top:12px">
+          <input id="gh_author_input" placeholder="GitHub 用户名，如 torvalds；多个用逗号或空格分隔">
+          <button onclick="addGithubAuthor()">添加作者</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>推送到指定会话 <span class="muted" style="font-weight:400">只影响 GitHub 推送</span></h3>
+        <div class="muted" style="margin-bottom:10px">私聊填 <span class="mono">private:QQ号</span>，群聊填 <span class="mono">group:群号</span>。不要求该会话出现在项目的群/用户白名单里。</div>
+        <div id="gh_targets" class="scroll"></div>
+        <div class="row" style="margin-top:12px">
+          <input id="gh_target_input" placeholder="group:123456789 或 private:10001">
+          <button onclick="addGithubTarget()">添加会话</button>
+        </div>
+        <details style="margin-top:12px">
+          <summary>从机器人已知会话里选择</summary>
+          <div id="gh_known" class="scroll" style="margin-top:8px"></div>
+        </details>
+      </div>
+
+      <div class="card">
+        <h3>最近动态（最多 30 条）</h3>
+        <div id="gh_events" class="scroll"></div>
+      </div>
+
+      <div class="card">
+        <h3>最近投递（最多 30 条）</h3>
+        <div id="gh_deliveries" class="scroll"></div>
+      </div>
     </div>
   </main>
 </div>
@@ -504,7 +595,9 @@ document.querySelectorAll('nav a').forEach((a) => {
     document.querySelectorAll('.page').forEach((x) => x.classList.remove('active'));
     a.classList.add('active');
     $('page-' + a.dataset.page).classList.add('active');
+    if (a.dataset.page !== 'snowluma') { $('snowFrame').src = 'about:blank'; $('snowFrame').style.display = 'none'; }
     if (a.dataset.page === 'providers') { loadProviders(); loadRoles(); }
+    if (a.dataset.page === 'snowluma') loadSnowLuma();
     if (a.dataset.page === 'personas') loadPersonas();
     if (a.dataset.page === 'stickers') loadStickers();
     if (a.dataset.page === 'access') loadAccess();
@@ -512,9 +605,64 @@ document.querySelectorAll('nav a').forEach((a) => {
     if (a.dataset.page === 'emotion') loadEmoUsers();
     if (a.dataset.page === 'logs') loadLogs();
     if (a.dataset.page === 'tasks') loadTasks();
+    if (a.dataset.page === 'github') loadGithub();
     if (a.dataset.page === 'overview') loadFeatures();
   };
 });
+
+let snowCursor = 0, snowPolling = false, snowBusy = false, snowPhase = '', snowFrameSessionAt = 0;
+const snowPhaseLabels = {not_installed:'尚未安装',stopped:'已停止',installing:'安装中',starting:'启动中',running:'运行中',stopping:'停止中',error:'需要检查日志'};
+async function openSnowFrame(force = false) {
+  if (snowPhase !== 'running') return;
+  try {
+    const session = await post('/api/snowluma/session', {});
+    const url = new URL(location.origin); url.port = String(session.port); url.pathname = '/';
+    snowFrameSessionAt = Date.now();
+    const frame = $('snowFrame');
+    if (force || frame.src !== url.href) frame.src = url.href;
+    frame.style.display = 'block'; $('snowFrameHint').style.display = 'none';
+  } catch (error) { $('snowFrameHint').textContent = '管理界面加载失败：' + error.message; $('snowFrameHint').style.display = 'block'; }
+}
+async function loadSnowLuma() {
+  if (snowPolling) return;
+  snowPolling = true;
+  try {
+    const state = await api('/api/snowluma/status'); snowPhase = state.phase;
+    $('snowStatus').innerHTML = [['状态',snowPhaseLabels[state.phase] || state.phase],['版本',state.version],['进程 PID',state.pid || '-']]
+      .map(x => '<div class="stat"><div class="k">'+esc(x[0])+'</div><div class="v">'+esc(x[1])+'</div></div>').join('');
+    const changing = snowBusy || ['installing','starting','stopping'].includes(state.phase);
+    $('snowInstall').disabled = state.installed || changing || !state.supported;
+    $('snowStart').disabled = !state.installed || changing || !!state.pid;
+    $('snowStop').disabled = (!state.pid && !['installing','starting'].includes(state.phase)) || state.phase === 'stopping';
+    $('snowStop').textContent = state.phase === 'installing' ? '取消安装' : '停止';
+    $('snowFrameRefresh').disabled = state.phase !== 'running';
+    $('snowError').textContent = state.error || (!state.supported ? '官方内置包暂不支持当前平台。' : '');
+    $('snowError').style.display = $('snowError').textContent ? 'block' : 'none';
+    $('snowConnection').textContent = 'Agent 当前 OneBot 模式：' + state.onebot.mode + '；地址：' + state.onebot.url;
+    const terminal = await api('/api/snowluma/terminal?after=' + snowCursor);
+    const box = $('snowTerminal'), follow = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    if (terminal.reset) box.textContent = '[此前日志超出缓存或服务已重启，以下为当前保留日志]\n';
+    if (terminal.entries.length) box.textContent += terminal.entries.map(line => '[' + new Date(line.time).toLocaleTimeString('zh-CN',{hour12:false}) + '] [' + line.stream + '] ' + line.text).join('\n') + '\n';
+    if (box.textContent.length > 160000) box.textContent = box.textContent.slice(-160000);
+    snowCursor = terminal.nextCursor; if (follow) box.scrollTop = box.scrollHeight;
+    if (state.phase === 'running') {
+      if ($('snowFrame').src === 'about:blank' || Date.now() - snowFrameSessionAt > 15 * 60000) await openSnowFrame();
+    } else {
+      $('snowFrame').src = 'about:blank'; $('snowFrame').style.display = 'none';
+      $('snowFrameHint').style.display = 'block'; $('snowFrameHint').textContent = '启动并就绪后在此显示官方管理界面。';
+    }
+  } catch (error) { $('snowError').textContent = error.message; $('snowError').style.display = 'block'; }
+  finally { snowPolling = false; }
+}
+async function snowAction(action) {
+  if (snowBusy && action !== 'stop' || action === 'stop' && snowPhase === 'stopping') return;
+  snowBusy = true;
+  for (const id of ['snowInstall','snowStart','snowStop']) $(id).disabled = true;
+  try { await post('/api/snowluma/' + action, {}); }
+  catch (error) { toast(error.message, 'err'); }
+  finally { snowBusy = false; await loadSnowLuma(); }
+}
+setInterval(() => { if ($('page-snowluma').classList.contains('active')) loadSnowLuma(); }, 1000);
 
 async function loadOverview() {
   try {
@@ -1245,8 +1393,11 @@ function renderToggle(s) {
   if (s.type === 'number') {
     const range = (s.min !== undefined || s.max !== undefined)
       ? '（' + (s.min !== undefined ? s.min : '') + ' ~ ' + (s.max !== undefined ? s.max : '') + '）' : '';
+    const budgetHint = s.originalBudget
+      ? '<div class="d">原预算（填 0 继承）：' + esc(s.originalBudget) +
+        '</div><div class="d">当前：' + (Number(s.value) === 0 ? '继承原预算及原重试策略' : esc(s.value) + ' tokens / 次，重试也受此上限约束') + '</div>' : '';
     return '<div class="toggle-row">' +
-      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div></div>' +
+      '<div class="txt"><div class="t">' + esc(s.label) + '</div><div class="d">' + esc(s.desc) + range + '</div>' + budgetHint + '</div>' +
       '<input type="number" id="' + inputId + '" class="setting-number" value="' + esc(s.value) + '"' +
         (s.min !== undefined ? ' min="' + s.min + '"' : '') + (s.max !== undefined ? ' max="' + s.max + '"' : '') +
         ' step="any" onchange="applySetting(\'' + s.path + '\', Number(this.value), this)">' +
@@ -1665,6 +1816,362 @@ $('emoLoadBtn').onclick = async () => {
         '</table></div></div>';
   } catch (e) { toast('加载情绪失败: ' + e.message, 'err'); }
 };
+
+// ============ GitHub 动态追踪 ============
+let ghState = null;
+let ghDirty = false;
+const GH_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+
+function ghMarkDirty() {
+  ghDirty = true;
+  const badge = $('gh_dirty');
+  if (badge) badge.style.display = 'inline-block';
+}
+function ghClearDirty() {
+  ghDirty = false;
+  const badge = $('gh_dirty');
+  if (badge) badge.style.display = 'none';
+}
+
+async function loadGithub(full = true) {
+  try {
+    const d = await api('/api/github/state');
+    ghState = d;
+    renderGithubStatus();
+    if (full) {
+      renderGithubSettings();
+      renderGithubAuthors();
+      renderGithubTargets();
+      renderGithubKnown();
+      ghClearDirty();
+    }
+    renderGithubEvents();
+    renderGithubDeliveries();
+  } catch (e) {
+    toast('加载 GitHub 追踪失败：' + e.message, 'err');
+  }
+}
+
+let ghCountdownRefreshAt = 0;
+
+/** 下次检查的文案：轮询进行中显示「检查中…」，否则按剩余时间实时倒计时 */
+function githubCountdownText() {
+  if (!ghState) return '-';
+  const r = ghState.runtime;
+  if (!r.enabled || !r.nextPollAt) return '-';
+  if (r.polling) return '检查中…';
+  const remaining = r.nextPollAt - Date.now();
+  if (remaining <= 0) return '检查中…';
+  return fmtDuration(remaining) + '后';
+}
+
+/** 每秒只刷新倒计时文本，不重拉整页状态；到点后触发一次状态刷新以拿到新的 nextPollAt */
+function updateGithubCountdown() {
+  const page = $('page-github');
+  if (!page || !page.classList.contains('active') || !ghState) return;
+  const el = $('gh_nextPoll');
+  if (!el) return;
+  el.textContent = githubCountdownText();
+  const r = ghState.runtime;
+  if (!r.enabled || !r.nextPollAt) return;
+  if (r.nextPollAt - Date.now() > 0) return;
+  const now = Date.now();
+  if (now - ghCountdownRefreshAt < 3000) return;
+  ghCountdownRefreshAt = now;
+  void loadGithub(false);
+}
+
+function renderGithubStatus() {
+  if (!ghState) return;
+  const r = ghState.runtime, cfg = ghState.config;
+  const rateText = r.rate.remaining === null ? '-' : r.rate.remaining + (r.rate.limit === null ? '' : ' / ' + r.rate.limit);
+  const intervalText = cfg.intervalSec % 60 === 0 ? (cfg.intervalSec / 60) + ' 分钟' : cfg.intervalSec + ' 秒';
+  const rows = [
+    ['追踪状态', !r.enabled ? '○ 已关闭' : (r.polling ? '● 检查中' : '● 运行中')],
+    ['轮询间隔', intervalText],
+    ['上次检查', r.lastPollAt ? fmtTime(r.lastPollAt) : '尚未检查'],
+    ['下次检查', '<span id="gh_nextPoll">' + esc(githubCountdownText()) + '</span>', true],
+    ['待推送事件', r.pendingCount + ' 条'],
+    ['GitHub 限额剩余', rateText],
+  ];
+  $('gh_status').innerHTML = rows.map((x) =>
+    '<div class="stat"><div class="k">' + esc(x[0]) + '</div><div class="v" style="font-size:16px">' +
+    (x[2] ? x[1] : esc(x[1])) + '</div></div>').join('');
+  updateGithubCountdown();
+  const box = $('gh_error');
+  const notes = [];
+  if (r.lastError) notes.push(r.lastError);
+  if (!cfg.authors.length) notes.push('还没有追踪任何作者。');
+  if (!cfg.targets.filter((t) => t.enabled).length) notes.push('还没有启用任何推送会话。');
+  box.textContent = notes.join(' ');
+  box.className = r.lastError ? 'msg err' : 'msg info';
+  box.style.display = notes.length ? 'block' : 'none';
+  box.style.marginTop = '12px';
+}
+
+function renderGithubSettings() {
+  if (!ghState) return;
+  const cfg = ghState.config;
+  const numField = (label, hint, id, value, min, max) =>
+    '<div><label>' + esc(label) + '</label><input id="' + id + '" type="number" value="' + esc(value) + '"' +
+    (min !== undefined ? ' min="' + min + '"' : '') + (max !== undefined ? ' max="' + max + '"' : '') +
+    ' onchange="ghMarkDirty()"><div class="muted">' + esc(hint) + '</div></div>';
+  const eventTypes = (ghState.eventTypes || []).map((t) =>
+    '<label class="toggle-row" style="cursor:pointer;padding:8px 10px;align-items:center">' +
+    '<input type="checkbox" name="gh_evt" value="' + esc(t.value) + '"' + (cfg.eventTypes.indexOf(t.value) >= 0 ? ' checked' : '') +
+    ' style="width:auto;flex:0 0 auto;margin-right:8px" onchange="ghMarkDirty()">' +
+    '<span style="font-size:12.5px">' + esc(t.label) + '</span></label>').join('');
+  $('gh_settings').innerHTML =
+    '<div class="toggle-row"><div class="txt"><div class="t">启用 GitHub 动态追踪</div><div class="d">关闭后不再自动轮询；「立即检查」仍可手动试跑</div></div>' +
+    '<label class="switch"><input type="checkbox" id="gh_enabled"' + (cfg.enabled ? ' checked' : '') + ' onchange="ghMarkDirty()"><span class="slider"></span></label></div>' +
+    '<div class="grid c3" style="margin-top:12px">' +
+    numField('轮询间隔（秒）', '60~3600，默认 300', 'gh_interval', cfg.intervalSec, 60, 3600) +
+    numField('每个作者每轮最多推送条数', '1~20，超出部分下一轮继续', 'gh_max', cfg.maxEventsPerPoll, 1, 20) +
+    numField('忽略超过 N 小时的旧动态', '1~168，避免停机后补发陈年动态', 'gh_age', cfg.maxEventAgeHours, 1, 168) +
+    '</div>' +
+    '<div class="toggle-row" style="margin-top:12px;align-items:center"><div class="txt"><div class="t">GitHub Token（可选）</div>' +
+    '<div class="d">只保存在本机 config/github.yaml；不填为匿名请求（60 次/小时）</div></div>' +
+    '<div style="flex:0 0 260px"><input id="gh_token" type="password" style="margin:0" placeholder="' +
+    (cfg.tokenSet ? '已设置，留空保持不变' : 'ghp_... 或 github_pat_...') + '" onchange="ghMarkDirty()"></div></div>' +
+    (cfg.tokenSet ? '<label class="muted" style="display:block;margin-top:8px"><input type="checkbox" id="gh_clearToken" style="width:auto;margin-right:6px" onchange="ghMarkDirty()">清除已保存的 Token</label>' : '') +
+    '<div style="margin-top:14px"><label>推送哪些类型的事件</label><div class="grid c3">' + eventTypes + '</div></div>';
+}
+
+function renderGithubAuthors() {
+  if (!ghState) return;
+  const stats = new Map((ghState.authors || []).map((a) => [a.login.toLowerCase(), a]));
+  const authors = ghState.config.authors || [];
+  if (!authors.length) {
+    $('gh_authors').innerHTML = '<div class="empty">还没有追踪任何作者。输入 GitHub 用户名后点「添加作者」。</div>';
+    return;
+  }
+  $('gh_authors').innerHTML = '<table><tr><th>作者</th><th>状态</th><th>上次检查</th><th>最近动态</th><th>操作</th></tr>' + authors.map((author) => {
+    const a = stats.get(author.login.toLowerCase()) || {};
+    const tags = [
+      author.enabled ? '<span class="tag ok">追踪中</span>' : '<span class="tag">已暂停</span>',
+      a.baselineAt ? '<span class="tag acc">已建基线</span>' : '<span class="tag warn">待建基线</span>',
+      a.pending ? '<span class="tag warn">待推送 ' + a.pending + '</span>' : '',
+      a.lastError ? '<span class="tag err" title="' + esc(a.lastError) + '">拉取失败</span>' : '',
+    ].join('');
+    return '<tr><td class="mono">@' + esc(author.login) + '</td><td>' + tags + '</td>' +
+      '<td class="muted">' + esc(a.lastPolledAt ? fmtTime(a.lastPolledAt) : '-') + '</td>' +
+      '<td class="muted">' + (a.lastEventAt ? esc(fmtAgo(a.lastEventAt)) : '-') + ' · 累计 ' + (a.total || 0) + ' 条</td>' +
+      '<td><label class="switch" style="vertical-align:middle;margin-right:8px"><input type="checkbox"' + (author.enabled ? ' checked' : '') +
+      ' onchange="toggleGithubAuthor(\'' + esc(author.login) + '\',this.checked)"><span class="slider"></span></label>' +
+      '<button class="sm ghost" onclick="removeGithubAuthor(\'' + esc(author.login) + '\')">移除</button></td></tr>';
+  }).join('') + '</table>';
+}
+
+function renderGithubTargets() {
+  if (!ghState) return;
+  const stats = new Map((ghState.targets || []).map((t) => [t.scope, t]));
+  const targets = ghState.config.targets || [];
+  if (!targets.length) {
+    $('gh_targets').innerHTML = '<div class="empty">还没有推送会话。可以先添加已知会话，或手动填写 group:/private:。</div>';
+    return;
+  }
+  $('gh_targets').innerHTML = '<table><tr><th>会话</th><th>名称</th><th>状态</th><th>投递统计</th><th>上次推送</th><th>操作</th></tr>' + targets.map((target) => {
+    const t = stats.get(target.scope) || {};
+    return '<tr><td class="mono">' + esc(target.scope) + '</td><td>' + esc(t.title || '-') + '</td>' +
+      '<td>' + (target.enabled ? '<span class="tag ok">推送中</span>' : '<span class="tag">已暂停</span>') + '</td>' +
+      '<td class="muted">成功 ' + (t.sent || 0) + ' · 失败 ' + (t.failed || 0) + '</td>' +
+      '<td class="muted">' + esc(t.lastSentAt ? fmtAgo(t.lastSentAt) : '-') + '</td>' +
+      '<td><label class="switch" style="vertical-align:middle;margin-right:8px"><input type="checkbox"' + (target.enabled ? ' checked' : '') +
+      ' onchange="toggleGithubTarget(\'' + esc(target.scope) + '\',this.checked)"><span class="slider"></span></label>' +
+      '<button class="sm ghost" onclick="removeGithubTarget(\'' + esc(target.scope) + '\')">移除</button></td></tr>';
+  }).join('') + '</table>';
+}
+
+function renderGithubKnown() {
+  if (!ghState) return;
+  const have = new Set((ghState.config.targets || []).map((t) => t.scope));
+  const rows = (ghState.knownSessions || []).filter((s) => !have.has(s.scope));
+  if (!rows.length) {
+    $('gh_known').innerHTML = '<div class="empty">没有其它已知会话，可直接在上方手动填写。</div>';
+    return;
+  }
+  $('gh_known').innerHTML = '<table><tr><th>会话</th><th>名称</th><th>最近活跃</th><th></th></tr>' + rows.slice(0, 50).map((s) =>
+    '<tr><td class="mono">' + esc(s.scope) + '</td><td>' + esc(s.title || '-') + '</td><td class="muted">' +
+    esc(s.lastActive ? fmtAgo(s.lastActive) : '-') + '</td>' +
+    '<td><button class="sm ghost" onclick="addGithubTargetScope(\'' + esc(s.scope) + '\')">添加</button></td></tr>').join('') + '</table>';
+}
+
+function renderGithubEvents() {
+  if (!ghState) return;
+  const rows = ghState.recentEvents || [];
+  if (!rows.length) {
+    $('gh_events').innerHTML = '<div class="empty">还没有动态</div>';
+    return;
+  }
+  const stateTag = (s) => s === 'sent' ? '<span class="tag ok">已推送</span>' : s === 'failed' ? '<span class="tag err">推送失败</span>' : '<span class="tag warn">待推送</span>';
+  $('gh_events').innerHTML = '<table><tr><th>时间</th><th>作者</th><th>动态</th><th>状态</th></tr>' + rows.map((e) =>
+    '<tr><td class="muted">' + esc(fmtTime(e.occurredAt)) + '</td><td class="mono">@' + esc(e.login) + '</td>' +
+    '<td>' + esc(e.summary || e.type) + '</td><td>' + stateTag(e.state) +
+    (e.attempts ? ' <span class="muted">重试 ' + e.attempts + '</span>' : '') + '</td></tr>').join('') + '</table>';
+}
+
+function renderGithubDeliveries() {
+  if (!ghState) return;
+  const rows = ghState.recentDeliveries || [];
+  if (!rows.length) {
+    $('gh_deliveries').innerHTML = '<div class="empty">还没有投递记录</div>';
+    return;
+  }
+  $('gh_deliveries').innerHTML = '<table><tr><th>时间</th><th>会话</th><th>动态</th><th>结果</th></tr>' + rows.map((d) =>
+    '<tr><td class="muted">' + esc(fmtTime(d.createdAt)) + '</td><td class="mono">' + esc(d.scope) + '</td>' +
+    '<td>' + esc(d.summary || ('@' + d.login + ' ' + d.eventId)) + '</td>' +
+    '<td>' + (d.status === 'sent' ? '<span class="tag ok">已送达</span>' : '<span class="tag err" title="' + esc(d.error) + '">失败</span>') + '</td></tr>').join('') + '</table>';
+}
+
+window.toggleGithubAuthor = (login, enabled) => {
+  if (!ghState) return;
+  const author = ghState.config.authors.find((a) => a.login.toLowerCase() === String(login).toLowerCase());
+  if (!author) return;
+  author.enabled = Boolean(enabled);
+  ghMarkDirty();
+  renderGithubAuthors();
+};
+
+window.removeGithubAuthor = (login) => {
+  if (!ghState) return;
+  ghState.config.authors = ghState.config.authors.filter((a) => a.login.toLowerCase() !== String(login).toLowerCase());
+  ghMarkDirty();
+  renderGithubAuthors();
+};
+
+window.addGithubAuthor = () => {
+  if (!ghState) { toast('页面还在加载，请稍候', 'info'); return; }
+  const raw = $('gh_author_input').value;
+  const names = raw.split(/[\s,，]+/).map((s) => s.trim()).filter(Boolean);
+  if (!names.length) { toast('请输入 GitHub 用户名', 'err'); return; }
+  const existing = new Set(ghState.config.authors.map((a) => a.login.toLowerCase()));
+  const added = [];
+  for (const name of names) {
+    if (!GH_LOGIN_RE.test(name)) { toast('用户名「' + name + '」不合法', 'err'); continue; }
+    if (existing.has(name.toLowerCase())) continue;
+    existing.add(name.toLowerCase());
+    ghState.config.authors.push({ login: name, enabled: true });
+    added.push(name);
+  }
+  if (!added.length) return;
+  $('gh_author_input').value = '';
+  ghMarkDirty();
+  renderGithubAuthors();
+  toast('已添加 ' + added.length + ' 个作者，点击「保存设置」后开始追踪', 'ok');
+};
+
+window.toggleGithubTarget = (scope, enabled) => {
+  if (!ghState) return;
+  const target = ghState.config.targets.find((t) => t.scope === scope);
+  if (!target) return;
+  target.enabled = Boolean(enabled);
+  ghMarkDirty();
+  renderGithubTargets();
+};
+
+window.removeGithubTarget = (scope) => {
+  if (!ghState) return;
+  ghState.config.targets = ghState.config.targets.filter((t) => t.scope !== scope);
+  ghMarkDirty();
+  renderGithubTargets();
+  renderGithubKnown();
+};
+
+window.addGithubTargetScope = (scope) => {
+  if (!ghState) return;
+  if (ghState.config.targets.some((t) => t.scope === scope)) return;
+  ghState.config.targets.push({ scope, enabled: true });
+  ghMarkDirty();
+  renderGithubTargets();
+  renderGithubKnown();
+  toast('已添加 ' + scope + '，点击「保存设置」后生效', 'ok');
+};
+
+window.addGithubTarget = () => {
+  if (!ghState) { toast('页面还在加载，请稍候', 'info'); return; }
+  const raw = $('gh_target_input').value.trim();
+  const m = /^(group|private):([1-9]\d{3,11})$/.exec(raw);
+  if (!m) { toast('格式应为 group:123456789 或 private:10001', 'err'); return; }
+  const scope = m[1] + ':' + m[2];
+  if (ghState.config.targets.some((t) => t.scope === scope)) { toast('该会话已经在列表里', 'info'); return; }
+  ghState.config.targets.push({ scope, enabled: true });
+  $('gh_target_input').value = '';
+  ghMarkDirty();
+  renderGithubTargets();
+  renderGithubKnown();
+  toast('已添加 ' + scope + '，点击「保存设置」后生效', 'ok');
+};
+
+window.saveGithubConfig = async () => {
+  if (!ghState) { toast('页面还在加载，请稍候', 'info'); return; }
+  const tokenInput = $('gh_token');
+  const clearToken = $('gh_clearToken');
+  const payload = {
+    enabled: $('gh_enabled').checked,
+    intervalSec: Number($('gh_interval').value),
+    maxEventsPerPoll: Number($('gh_max').value),
+    maxEventAgeHours: Number($('gh_age').value),
+    eventTypes: Array.from(document.querySelectorAll('input[name="gh_evt"]:checked')).map((x) => x.value),
+    authors: ghState.config.authors,
+    targets: ghState.config.targets,
+  };
+  if (clearToken && clearToken.checked) payload.token = '';
+  else if (tokenInput && tokenInput.value.trim()) payload.token = tokenInput.value.trim();
+  $('gh_saveBtn').disabled = true;
+  try {
+    await post('/api/github/config', payload);
+    toast('GitHub 追踪设置已保存并生效', 'ok');
+    await loadGithub();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('gh_saveBtn').disabled = false;
+  }
+};
+
+window.githubPollNow = async () => {
+  $('gh_pollBtn').disabled = true;
+  try {
+    const r = await post('/api/github/poll', {});
+    const errors = (r.errors || []).join('；');
+    toast('检查完成：新增 ' + r.fetched + ' 条，推送 ' + r.delivered + ' 条' + (errors ? '；' + errors : ''), r.ok ? 'ok' : 'info');
+    await loadGithub(false);
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('gh_pollBtn').disabled = false;
+  }
+};
+
+window.githubTestSend = async () => {
+  $('gh_testBtn').disabled = true;
+  try {
+    const r = await post('/api/github/test', {});
+    const results = r.results || [];
+    const okCount = results.filter((x) => x.ok).length;
+    if (r.ok) toast('测试消息已发送到 ' + okCount + ' 个会话', 'ok');
+    else {
+      const failed = results.find((x) => !x.ok);
+      toast('测试消息 ' + okCount + ' / ' + results.length + ' 成功' + (failed ? '：' + failed.scope + ' ' + failed.error : ''), 'err');
+    }
+    await loadGithub(false);
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('gh_testBtn').disabled = false;
+  }
+};
+
+setInterval(() => {
+  if ($('page-github').classList.contains('active')) loadGithub(false);
+}, 10000);
+// 倒计时每秒本地刷新；轮询到点后由 updateGithubCountdown 触发一次状态刷新
+setInterval(updateGithubCountdown, 1000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  updateGithubCountdown();
+  if ($('page-github').classList.contains('active')) loadGithub(false);
+});
 
 async function loadLogs() {
   try {

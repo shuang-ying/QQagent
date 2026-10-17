@@ -36,7 +36,8 @@ test('设置卡片各类型独立闭合，控件保留原值与保存事件',()=
  const render=vm.runInNewContext(escape+'\n'+renderer+'\nrenderToggle');
  const cfg=AppConfigSchema.parse({});
  for(const definition of SETTING_DEFS){
-  const fragment=String(render({...definition,value:readPath(cfg,definition.path),label:'说明<标签>"',desc:'内容</div>不应改变卡片结构'}));
+  const fragment=String(render({...definition,value:readPath(cfg,definition.path),label:'说明<标签>"',desc:'内容</div>不应改变卡片结构',
+    ...(definition.path.startsWith('llm.tokenBudgets.')?{originalBudget:'600 tokens </div>原预算'}:{})}));
   const stack:string[]=[];let roots=0;
   for(const tag of fragment.matchAll(/<(\/)?([a-z]+)\b[^>]*>/g)){
    const name=tag[2]!;
@@ -49,6 +50,10 @@ test('设置卡片各类型独立闭合，控件保留原值与保存事件',()=
   assert.ok(fragment.includes('内容&lt;/div&gt;'));
   if(definition.type==='enum') assert.ok(fragment.includes(' selected'));
   if(definition.type==='boolean') assert.equal(fragment.includes(' checked'),Boolean(readPath(cfg,definition.path)));
+  if(definition.path.startsWith('llm.tokenBudgets.')) {
+    assert.ok(fragment.includes('600 tokens &lt;/div&gt;原预算'));
+    assert.ok(fragment.includes('继承原预算及原重试策略'));
+  }
  }
 });
 test('鉴权覆盖读写，拒绝查询 token、坏 JSON 及未鉴权外网监听',async()=>{

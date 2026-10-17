@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 长期事实抽取
  *
@@ -137,7 +138,7 @@ export class FactExtractor {
       if(!Array.isArray(JSON.parse(json)))throw new Error('抽取未返回合法事实数组');
       facts = parseFactsJson(res.content);
     } catch (e) {
-      this.log.debug({ err: (e as Error).message }, '事实抽取 LLM 调用失败（非致命）');
+      this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '事实抽取 LLM 调用失败（非致命）');
       throw e;
     }
 
@@ -151,7 +152,7 @@ export class FactExtractor {
 
       // 去重
       if (this.store.findSimilarFact(userId, content, scope)) {
-        this.log.debug({ userId, content: content.slice(0, 40) }, '事实已存在，跳过');
+        this.log.debug({userId,contentChars:content.length}, '事实已存在，跳过');
         continue;
       }
 

@@ -9,6 +9,7 @@
  * 并记录完整探测轨迹（面板上能看到"为什么失败"）。
  */
 import type { DiscoveredModel, DiscoverResult, Protocol } from '../core/types.js';
+import { errorDetails, getLogger } from '../core/logger.js';
 import { AUTO_ORDER, candidateApiRoots, getAdapter, inferModelMeta } from './protocol.js';
 import { normalizeBaseUrl } from '../config/loader.js';
 
@@ -80,6 +81,7 @@ async function probeEndpoint(
     }
     return { ok: true, status: res.status, json, note: 'OK' };
   } catch (e) {
+    getLogger('discover').debug({phase:'probe-endpoint',timeoutMs,...errorDetails(e)}, '模型发现端点探测失败');
     const err = e as Error & { cause?: { code?: string } };
     const code = err.cause?.code ?? err.name;
     let note: string;
@@ -124,6 +126,7 @@ export async function discoverModels(opts: DiscoverOptions): Promise<DiscoverRes
         try {
           models = adapter.parseModels(r.json);
         } catch (e) {
+          getLogger('discover').debug({phase:'parse-models',protocol:proto,status:r.status,...errorDetails(e)}, '模型列表解析失败');
           attempts.push({
             url: endpoint,
             protocol: proto,
@@ -246,6 +249,7 @@ export async function testChat(
     }
     return { ok: true, reply, latencyMs };
   } catch (e) {
+    getLogger('discover').warn({phase:'test-connection',protocol,model,elapsedMs:Date.now()-start,...errorDetails(e)}, '模型连接测试失败');
     return { ok: false, reply: '', error: (e as Error).message, latencyMs: Date.now() - start };
   }
 }

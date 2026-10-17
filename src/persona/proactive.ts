@@ -5,7 +5,7 @@
  *
  * 两条策略，各自有**独立可调的概率**：
  *
- *   ① 话题相关：大家在聊的跟机器人的记忆/人格对得上 → 用 relevanceProbability
+ *   ① 话题相关：到消息机会点且跟机器人的记忆/人格对得上 → 用 relevanceProbability
  *   ② 每几句消息：群里每积累 everyNMessages 条就掷一次 → 用 probability
  *      （mode=hybrid 时结合：相关用高概率，不相关用基础概率）
  *
@@ -45,7 +45,7 @@ export interface ProactiveContext {
 export type ProactiveStrategy = 'relevant' | 'probability';
 
 export type ProactiveDecision =
-  | { speak: true; reason: string; strategy: ProactiveStrategy; probability: number }
+  | { speak: true; reason: string; strategy: ProactiveStrategy; probability: number; messagesSinceBot: number }
   | { speak: false; reason: string };
 
 export class ProactiveSpeaker {
@@ -115,7 +115,21 @@ export class ProactiveSpeaker {
     }
 
     // ---- 策略判定 ----
-    const relevant = ctx.relevance >= c.relevanceThreshold;
+    // 阈值为 0 仍需有相关证据，不能把零分的无关话题算成相关。
+    const relevant = ctx.relevance > 0 && ctx.relevance >= c.relevanceThreshold;
+
+    if (c.mode === 'relevant' && !relevant) {
+      return { speak: false, reason: `话题相关度不足（得分 ${ctx.relevance.toFixed(2)}，阈值 ${c.relevanceThreshold}，需有相关证据）` };
+    }
+
+    // 所有策略共用消息间隔，相关话题也不能在每条消息到达时掷骰子。
+    const n = c.everyNMessages;
+    if (ctx.messagesSinceBot < n) {
+      return { speak: false, reason: `距发言后仅 ${ctx.messagesSinceBot} 条消息，未到 ${n} 条` };
+    }
+    if (ctx.messagesSinceBot % n !== 0) {
+      return { speak: false, reason: `已积累 ${ctx.messagesSinceBot} 条，等待下一个 ${n} 条的判定点` };
+    }
 
     // 话题相关，且策略允许走相关路线
     if (relevant && (c.mode === 'relevant' || c.mode === 'hybrid')) {
@@ -124,7 +138,8 @@ export class ProactiveSpeaker {
           speak: true,
           strategy: 'relevant',
           probability: c.relevanceProbability,
-          reason: `话题相关（${ctx.relevance.toFixed(2)}）且概率命中（p=${c.relevanceProbability}）`,
+          messagesSinceBot: ctx.messagesSinceBot,
+          reason: `话题相关（${ctx.relevance.toFixed(2)}），每 ${n} 条消息的机会点命中（${ctx.messagesSinceBot} 条，p=${c.relevanceProbability}）`,
         };
       }
       return {
@@ -133,39 +148,13 @@ export class ProactiveSpeaker {
       };
     }
 
-    // mode=relevant 时不做"每几句消息"，相关度不够就直接放弃
-    if (c.mode === 'relevant') {
-      return {
-        speak: false,
-        reason: `话题相关度不足（${ctx.relevance.toFixed(2)} < ${c.relevanceThreshold}）`,
-      };
-    }
-
-    // ---- 「每几句消息」策略 ----
-    const n = c.everyNMessages;
-    if (ctx.messagesSinceBot < n) {
-      return {
-        speak: false,
-        reason: `距发言后仅 ${ctx.messagesSinceBot} 条消息，未到 ${n} 条`,
-      };
-    }
-
-    // 只在「刚好攒够 N 的整数倍」时掷骰子。
-    // 若每多一条都掷一次，实际概率会远高于配置值（掷 10 次 p=0.3 几乎必中），
-    // 那样"概率可调"就失去意义了。
-    if (ctx.messagesSinceBot % n !== 0) {
-      return {
-        speak: false,
-        reason: `已积累 ${ctx.messagesSinceBot} 条，等待下一个 ${n} 条的判定点`,
-      };
-    }
-
     if (Math.random() < c.probability) {
       return {
         speak: true,
         strategy: 'probability',
         probability: c.probability,
-        reason: `每 ${n} 条消息的机会点命中（${ctx.messagesSinceBot} 条，p=${c.probability}）`,
+        messagesSinceBot: ctx.messagesSinceBot,
+        reason: `纯主动发言：每 ${n} 条消息的机会点命中（${ctx.messagesSinceBot} 条，p=${c.probability}）`,
       };
     }
     return {
@@ -215,13 +204,14 @@ export class ProactiveSpeaker {
 
     this.log.debug({scope, targetId, messagesSinceBot, relevance: Number(relevance.toFixed(2)),
       source: evidence.source, inherited: evidence.inherited, factIds: evidence.factIds,
-      personaId: persona?.id, speak: decision.speak, reason: decision.reason}, '主动相关性判定');
+      personaId: persona?.id, speak: decision.speak, reason: decision.reason,
+      ...(decision.speak ? {strategy: decision.strategy, probability: decision.probability} : {})}, '主动相关性判定');
     return decision;
   }
 
   /** 记录一次主动发言 */
   record(scope: string, reason: string, content: string): void {
-    this.store.logProactive(scope, reason, content);
+    this.store.recordProactiveReply(scope, this.store.currentConversationId(scope), reason, content);
     this.log.info({ scope, reason, preview: content.slice(0, 40) }, '💬 主动发言');
   }
 

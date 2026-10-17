@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 上下文压缩
  *
@@ -222,7 +223,7 @@ export class ContextBuilder {
 
       return { ok: true, summarized: toCompress.length, summaryId };
     } catch (e) {
-      this.log.warn({ scope, err: (e as Error).message }, '摘要生成失败');
+      this.log.warn({ scope, ...errorDetails(e), err: (e as Error).message }, '摘要生成失败');
       return { ok: false, summarized: 0, error: (e as Error).message };
     }
   }
@@ -273,7 +274,7 @@ export class ContextBuilder {
         this.store.commitSummary(scope, conversationId, level + 1, merged.trim(), [], list.map(row => row.id));
         this.log.info({ scope, level: level + 1, mergedFrom: list.length }, '摘要已递归压缩到更高层级');
       } catch (e) {
-        this.log.debug({ err: (e as Error).message }, '摘要递归压缩失败（非致命）');
+        this.log.debug({ ...errorDetails(e), err: (e as Error).message }, '摘要递归压缩失败（非致命）');
         throw e;
       }
     }

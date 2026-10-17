@@ -12,6 +12,7 @@
  * 本地取回来再以 base64 发送，可靠性高得多。
  */
 import { loadMedia, type MediaOptions } from './media.js';
+import { errorDetails, getLogger } from '../core/logger.js';
 import {forwardImageNote} from '../onebot/forward.js';
 
 import type { ContentPart, ObMessageSegment } from '../core/types.js';
@@ -66,7 +67,11 @@ export async function collectImages(segments: ObMessageSegment[], opts: MediaOpt
       const image = await loadMedia(String(seg.data['file'] ?? ''), String(seg.data['url'] ?? ''), opts);
       const forwardNote=forwardImageNote(seg);if(forwardNote)image.forwardNote=forwardNote;
       images.push(image); opts.onImage?.(image, i);
-    } catch (error) { errors.push('读取图片失败：' + (error as Error).message); }
+    } catch (error) {
+      getLogger('vision').warn({phase:'collect-images',imageIndex:i,imageCount:segs.length,
+        timeoutMs:opts.timeoutMs??15000,...errorDetails(error)}, '图片读取或预处理失败');
+      errors.push('读取图片失败：' + (error as Error).message);
+    }
   }
   return { images, errors };
 }

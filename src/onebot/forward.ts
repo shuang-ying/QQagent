@@ -1,4 +1,5 @@
 import type {ObMessageSegment} from '../core/types.js';
+import { errorDetails, getLogger } from '../core/logger.js';
 import type {OneBotAction} from './action.js';
 import {segmentsToText,toSegments} from './normalize.js';
 
@@ -66,7 +67,11 @@ export async function expandForwardMessage(segments:ObMessageSegment[],api:OneBo
         items=nodesFrom(segment.data);
         if(!items.length)items=nodesFrom(await fetchNodes(id));
       }
-    }catch{notices.add('合并转发读取失败或超时，不能推测未读取内容');return '[合并转发未读取]';}
+    }catch(error){
+      getLogger('forward')[signal?.aborted?'debug':'warn']({phase:'expand-forward',depth,calls,
+        timeoutMs:FORWARD_LIMITS.timeoutMs,remainingMs:Math.max(0,deadline-Date.now()),...errorDetails(error)}, '合并转发读取失败，保留占位说明');
+      notices.add('合并转发读取失败或超时，不能推测未读取内容');return '[合并转发未读取]';
+    }
     if(!items.length){notices.add('合并转发返回空内容或不支持的格式');return '[合并转发未读取]';}
     const lines:string[]=[];
     if(items.length>FORWARD_LIMITS.nodes-nodes)notices.add('转发节点达到50条资源上限，剩余内容未读取');

@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -254,6 +254,13 @@ CREATE TABLE IF NOT EXISTS proactive_log (
 );
 CREATE INDEX IF NOT EXISTS idx_proactive ON proactive_log(scope, created_at DESC);
 
+-- 主动发言的消息计数边界；纯表情包无需伪造 assistant 文本也能归零。
+CREATE TABLE IF NOT EXISTS proactive_counters (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  message_boundary INTEGER NOT NULL,
+  replied_at INTEGER NOT NULL
+);
+
 -- ============================================================
 -- 元信息
 -- ============================================================
@@ -281,6 +288,47 @@ CREATE TABLE IF NOT EXISTS reply_deliveries (
   pieces TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
+);
+
+-- ============================================================
+-- GitHub 作者动态追踪（面板「GitHub 追踪」页）
+--   github_events      已拉取的事件：去重 + 待推送队列 + 面板历史
+--   github_deliveries  每个事件在每个会话的投递结果（用于重试时跳过已成功的会话）
+--   github_authors     每个作者的 ETag 与基线时间（首次拉取只建基线，不推送历史）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS github_events (
+  event_id    TEXT PRIMARY KEY,
+  login       TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  repo        TEXT NOT NULL DEFAULT '',
+  summary     TEXT NOT NULL DEFAULT '',
+  text        TEXT NOT NULL DEFAULT '',
+  url         TEXT NOT NULL DEFAULT '',
+  occurred_at INTEGER NOT NULL,
+  fetched_at  INTEGER NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'pending',
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_github_events_pending ON github_events(state,occurred_at);
+CREATE TABLE IF NOT EXISTS github_deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  status TEXT NOT NULL,
+  message_id INTEGER,
+  error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_github_deliveries_event ON github_deliveries(event_id,scope);
+CREATE INDEX IF NOT EXISTS idx_github_deliveries_time ON github_deliveries(created_at DESC);
+CREATE TABLE IF NOT EXISTS github_authors (
+  login TEXT PRIMARY KEY,
+  etag TEXT NOT NULL DEFAULT '',
+  baseline_at INTEGER NOT NULL DEFAULT 0,
+  last_polled_at INTEGER NOT NULL DEFAULT 0,
+  last_event_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT ''
 );
 `;
 

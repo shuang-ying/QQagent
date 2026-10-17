@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * Provider 管理器
  *
@@ -25,6 +26,7 @@ import { resolveApiKey, PROJECT_ROOT } from '../config/loader.js';
 import { discoverModels, testChat } from './discover.js';
 import { inferModelMeta, findOverride } from './protocol.js';
 import { fitModelBudget } from './budget.js';
+import { outputTokenBudget } from './token-budgets.js';
 import { LlmClient, LlmError, type ChatOptions } from './client.js';
 import { embedTexts, type EmbedResult } from './embedding.js';
 
@@ -278,7 +280,7 @@ export class ProviderManager {
         }
       }
     } catch (e) {
-      this.log.warn({ err: (e as Error).message }, '模型缓存损坏，将重新发现');
+      this.log.warn({ ...errorDetails(e), err: (e as Error).message }, '模型缓存损坏，将重新发现');
       this.cache = { version: 1, entries: {} };
     }
   }
@@ -288,7 +290,7 @@ export class ProviderManager {
       fs.mkdirSync(path.dirname(this.cachePath), { recursive: true });
       fs.writeFileSync(this.cachePath, JSON.stringify(this.cache, null, 2), 'utf8');
     } catch (e) {
-      this.log.warn({ err: (e as Error).message }, '保存模型缓存失败');
+      this.log.warn({ ...errorDetails(e), err: (e as Error).message }, '保存模型缓存失败');
     }
   }
 
@@ -362,7 +364,8 @@ export class ProviderManager {
 
     if (!result.ok) {
       this.log.error(
-        { provider: providerKey, error: result.error, attempts: result.attempts.length },
+        { provider:providerKey,error:result.error,attempts:result.attempts.length,
+          probes:result.attempts.map(item => ({protocol:item.protocol,status:item.status,ok:item.ok,note:item.note})) },
         '模型发现失败',
       );
       throw new Error(`[${providerKey}] ${result.error ?? '模型发现失败'}`);
@@ -420,7 +423,7 @@ export class ProviderManager {
           });
         }
       } catch (e) {
-        this.log.warn({ provider: key, err: (e as Error).message }, '该 provider 模型列表不可用，已跳过');
+        this.log.warn({ provider: key, ...errorDetails(e), err: (e as Error).message }, '该 provider 模型列表不可用，已跳过');
       }
     }
     return out;
@@ -434,7 +437,7 @@ export class ProviderManager {
     overrides: Partial<ChatOptions>,
   ): ChatOptions {
     const p = this.providers[providerKey]!;
-    return {
+    const options: ChatOptions = {
       baseURL: p.baseURL,
       apiKey: resolveApiKey(p),
       model: resolved.modelId,
@@ -447,6 +450,8 @@ export class ProviderManager {
       maxTokens: this.llmCfg?.generation.maxTokens,
       ...overrides,
     };
+    options.maxTokens = outputTokenBudget(this.llmCfg, overrides.purpose ?? 'chat', options.maxTokens ?? 1024);
+    return options;
   }
 
   private recordUsage(provider: string, model: string, result: LlmResult, purpose = 'chat', retry = 0): void {
@@ -511,6 +516,9 @@ export class ProviderManager {
             throw new LlmError('该候选模型不支持图片');
           }
           const fitted = fitModelBudget(messages, resolved.contextWindow, opts.maxTokens ?? 1024);
+          if (fitted.maxTokens !== opts.maxTokens) this.log.info({provider:key,model:resolved.modelId,
+            purpose:overrides.purpose??'chat',requestedMaxTokens:opts.maxTokens,effectiveMaxTokens:fitted.maxTokens,
+            contextWindow:resolved.contextWindow}, '输出token预算按模型上下文限制调整');
           opts.maxTokens = fitted.maxTokens;
           let result: LlmResult;
           const chunks: string[] = [];
@@ -536,13 +544,18 @@ export class ProviderManager {
         } catch (e) {
           this.metric(key,candidate.model??'',overrides.purpose??'chat',false,Date.now()-attemptStarted,attempt);
           lastErr = e as Error;
+          this.log[signal?.aborted || e instanceof LlmError && e.cancelled ? 'debug' : 'warn']({
+            provider:key,model:candidate.model,purpose:overrides.purpose??'chat',attempt:attempt+1,
+            elapsedMs:Date.now()-attemptStarted,timeoutMs,remainingMs:Math.max(0,deadline-Date.now()),
+            ...errorDetails(e)}, '模型调用尝试失败');
           if (signal?.aborted || (e instanceof LlmError && e.cancelled)) throw e;
           const retries = overrides.maxRetries ?? this.llmCfg?.request.maxRetries ?? 2;
           const transient = e instanceof LlmError ? e.retriable : e instanceof TypeError;
           if (!transient || attempt >= retries) break;
           const waitMs = (overrides.retryDelayMs ?? this.llmCfg?.request.retryDelayMs ?? 800) * 2 ** attempt;
           if (Date.now() + waitMs >= deadline) throw new LlmError('请求总时间预算已耗尽');
-          this.log.warn({ provider: key, attempt: attempt + 1, waitMs }, '临时错误，重试模型调用');
+          this.log.warn({ provider:key,model:candidate.model,purpose:overrides.purpose??'chat',
+            attempt:attempt+1,waitMs,...errorDetails(e) }, '临时错误，重试模型调用');
           try { await delay(waitMs, undefined, { signal }); }
           catch { throw new LlmError('请求已取消', undefined, false, true); }
         }

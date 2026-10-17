@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import sharp from 'sharp';
+import { errorDetails, getLogger } from '../core/logger.js';
 import type { CollectedImage } from './vision.js';
 
 export interface MediaOptions {
@@ -58,16 +59,29 @@ export async function loadMedia(file: string, url: string, opts: MediaOptions): 
   const release = await permit();
   try {
     opts.signal?.throwIfAborted(); let bytes: Buffer | undefined;
+    const sourceFailures: Record<string, unknown>[] = [];
     for (const source of [file.startsWith('base64://') ? file : '', url, file].filter(Boolean)) {
-      try { bytes = await readSource(source, opts); break; } catch { opts.signal?.throwIfAborted(); }
+      try { bytes = await readSource(source, opts); break; } catch (error) {
+        sourceFailures.push({sourceType:/^https?:/i.test(source)?'url':source.startsWith('base64://')?'base64':'local',...errorDetails(error)});
+        getLogger('media').debug({phase:'read-source',sourceType:/^https?:/i.test(source)?'url':source.startsWith('base64://')?'base64':'local',
+          timeoutMs:opts.timeoutMs??15000,maxBytes:opts.maxBytes??8*1024*1024,...errorDetails(error)}, '图片来源读取失败，继续尝试其他来源');
+        opts.signal?.throwIfAborted();
+      }
     }
     if (!bytes && opts.getImage && file) {
       const recovered = await opts.getImage(file);
       for (const source of [recovered.url, recovered.file].filter(Boolean) as string[]) {
-        try { bytes = await readSource(source, opts); break; } catch { opts.signal?.throwIfAborted(); }
+        try { bytes = await readSource(source, opts); break; } catch (error) {
+          sourceFailures.push({sourceType:'get-image-recovery',...errorDetails(error)});
+          getLogger('media').debug({phase:'recovered-source',...errorDetails(error)}, 'get_image 回退来源读取失败');
+          opts.signal?.throwIfAborted();
+        }
       }
     }
-    if (!bytes) throw new Error('无法获取图片，URL 失效或路径不被允许');
+    if (!bytes) {
+      getLogger('media').warn({phase:'load-media',sourceFailures,timeoutMs:opts.timeoutMs??15000}, '所有图片来源读取失败');
+      throw new Error('无法获取图片，URL 失效或路径不被允许');
+    }
     if (!bytes.length || bytes.length > (opts.maxBytes ?? 8 * 1024 * 1024)) throw new Error('图片为空或超过字节上限');
     const image = sharp(bytes, { limitInputPixels: opts.maxPixels ?? 40000000, pages: 1, failOn: 'warning' });
     const meta = await image.metadata();

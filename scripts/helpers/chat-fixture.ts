@@ -55,7 +55,8 @@ export function makeFixture(scenario: Scenario, scope: string) {
     memory: { factExtraction: false, summary: { enabled: false } },
     trigger: { group: { cooldownMs: 0 } },
     reply: { recentImages: 2 },
-    proactive: { imageLookback: 2, quietHours: [] },
+    // 路由/媒体/调度用例通常只录入一条消息；主动消息间隔由专门的 cadence 用例覆盖。
+    proactive: { everyNMessages: 1, imageLookback: 2, quietHours: [] },
   });
   const logs: Array<Record<string, unknown>> = [];
   const log = pino({ level: 'debug' }, { write: (line: string) => { logs.push(JSON.parse(line)); } });

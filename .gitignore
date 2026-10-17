@@ -4,11 +4,23 @@ data/
 runtime/
 logs/
 *.log
+
+# 文档白名单：只提交面向使用者的说明，开发期的测试输出、结果 JSON 和过程记录
+# 一律不进发行版。新增文档时在这里显式加一行，不要用 docs/* 通配反向忽略。
 docs/*
 !docs/release-notes.md
 !docs/forward-messages.md
 !docs/voice-and-scheduled-tasks.md
 !docs/links-and-cards.md
+!docs/command-permissions.md
+!docs/github-tracking.md
+!docs/log-diagnostics.md
+!docs/memory-context-embedding-emotion.md
+!docs/persona-context-and-structure.md
+!docs/proactive-relevance.md
+!docs/reply-window-and-addressing.md
+!docs/snowluma-integration.md
+!docs/token-budgets.md
 
 # 本地私密配置：含 API key，绝不外传
 config/providers.local.yaml
@@ -23,6 +35,10 @@ Thumbs.db
 config/stickers/qq/
 # AI 识别结果属于生成状态，首次加载会自动重建
 config/stickers/manifest.json
+
+# 内置 SnowLuma：来自上游的源码、二进制、归档和账号数据都不提交。
+# 仓库只保留本项目的安装与管理代码（src/snowluma、scripts/snowluma-runner.mjs）。
+runtime/
 
 # Local tools, credentials and build packages
 .codex/

@@ -1,3 +1,5 @@
+# 发布包不含个人运行数据、本地配置、内置 SnowLuma 组件和开发期记录。
+# 上游 SnowLuma 的源码/二进制/归档一律不进包，只发布本项目的安装与管理代码。
 node_modules/
 dist/
 data/
@@ -15,6 +17,9 @@ config/stickers/qq/
 config/stickers/manifest.json
 scripts/archive/
 scripts/test-online-preflight.ts
+docs/*.txt
+docs/*.json
+docs/*-result.json
 *.log
 *.db
 *.db-wal

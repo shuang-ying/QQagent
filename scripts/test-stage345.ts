@@ -888,6 +888,7 @@ async function testEndToEnd(
   const base = {
     ...cfg.proactive,
     enabled: true,
+    everyNMessages: 1, // 本组相关性/频率闸门用例每条提供一个机会；间隔另有专门用例。
     minIntervalMs: 0,
     minGapAfterBotMs: 0,
     relevanceThreshold: 0.1,

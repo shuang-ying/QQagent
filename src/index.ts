@@ -1,3 +1,4 @@
+import { errorDetails } from './core/logger.js';
 /**
  * QQ Agent 启动入口
  *
@@ -30,7 +31,10 @@ import { stripMention } from './persona/trigger.js';
 import { parseCommand } from './pipeline/command-permissions.js';
 import {SpeechService} from './llm/speech.js';
 import {ScheduledTasks,naturalReminder} from './tasks/scheduled.js';
+import { GithubTracker } from './github/tracker.js';
+import { loadGithubConfig } from './github/config.js';
 import { createServer } from './server/api.js';
+import { SnowLumaController } from './snowluma/controller.js';
 import { SemanticIndex } from './memory/semantic.js';
 import {atomicWrite,atomicWriteMany} from './config/atomic.js';
 import {AppConfigSchema,ProvidersFileSchema} from './core/types.js';
@@ -92,7 +96,7 @@ async function main(): Promise<void> {
         const { models } = await providersMgr.ensureModels(key);
         log.info({ provider: key, models: models.length }, `模型列表就绪`);
       } catch (e) {
-        log.warn({ provider: key, err: (e as Error).message }, '模型发现失败（可稍后在面板重试）');
+        log.warn({ provider: key, ...errorDetails(e), err: (e as Error).message }, '模型发现失败（可稍后在面板重试）');
       }
     }
   })();
@@ -212,12 +216,27 @@ async function main(): Promise<void> {
   const napcat = new OneBotClient(app.napcat, getLogger('napcat'));
   const speech=new SpeechService(app,providersMgr,getLogger('speech'));pipeline.attachSpeech(speech);
   const tasks=new ScheduledTasks(app,store,providersMgr,napcat.api,trigger,getLogger('tasks'),()=>napcat.apiReady);
+  // GitHub 作者动态追踪：配置独立放在 config/github.yaml，读坏了也不影响主流程
+  const githubConfig = loadGithubConfig(root);
+  if (githubConfig.warning) log.warn({ warning: githubConfig.warning }, 'config/github.yaml 读取失败，已使用默认配置');
+  const github = new GithubTracker({
+    root,
+    config: githubConfig.config,
+    sender: napcat.api,
+    store,
+    log: getLogger('github'),
+    ready: () => napcat.apiReady,
+    timezone: app.app.timezone,
+  });
+  github.start();
   const commands = new CommandHandler(app, store, personaMgr, getLogger('cmd'),tasks);tasks.start();
   const admission = new InboundAdmission(trigger);
   const pokeEvents = new EventDeduper(1024, 2000);
 
   napcat.on('ready', ({ selfId, nickname }) => {
     log.info({ selfId, nickname }, '🤖 机器人已上线');
+    // OneBot 刚恢复时立刻补一轮，离线期间积压的 GitHub 动态不用等下一个轮询间隔
+    void github.notifyReady();
   });
   napcat.on('reconnecting', ({ attempt, delayMs }) => {
     log.warn({ attempt, delayMs }, '等待重连 OneBot');
@@ -259,7 +278,7 @@ async function main(): Promise<void> {
         );
         log.info({ scope: ev.scope, from: ev.userId, poked: r.poked, said: r.said }, '👆 回应了戳一戳');
       } catch (e) {
-        log.warn({ err: (e as Error).message }, '处理戳一戳失败');
+        log.warn({ ...errorDetails(e), err: (e as Error).message }, '处理戳一戳失败');
       }
     })();
   });
@@ -323,30 +342,33 @@ async function main(): Promise<void> {
         const result = await pipeline.handle(msg, napcat.api);
 
         // ---- 主动发言评估（事件驱动，逐条消息）----
-        // 放在 handle 之后：被 @ 的消息已经走了被动回复（result.replied=true），
-        // 这时不该再叠加一次主动发言。只有"没回"的消息才需要考虑接话。
+        // 仅已准入且未启动被动回复的消息提供主动机会；权限拒绝、合并、
+        // 被动失败或取消均不应再次触发主动模型调用。
         if (
           msg.scopeType === 'group'
+          && result.proactiveEligible
           && !result.replied
           && app.proactive.enabled
           && app.proactive.mode !== 'off'
         ) {
           const decision = proactive.evaluate(msg.scope, msg.groupId ?? 0, msg.mentionsBot);
           if (decision.speak) {
-            log.info({ scope: msg.scope, reason: decision.reason }, '决定主动发言');
+            log.info({ scope: msg.scope, ...decision, everyNMessages: app.proactive.everyNMessages,
+              proactiveType: decision.strategy === 'relevant' ? '话题相关' : '纯主动发言' }, '主动发言候选命中');
             await pipeline.handleProactive(
               msg.scope,
               'group',
               msg.groupId ?? 0,
               decision.reason,
               napcat.api,
+              decision,
             );
           } else {
             log.debug({ scope: msg.scope, reason: decision.reason }, '不主动发言');
           }
         }
       } catch (e) {
-        log.error({ scope: msg.scope, err: (e as Error).message }, '处理消息时发生未捕获异常');
+        log.error({ scope: msg.scope, ...errorDetails(e), err: (e as Error).message }, '处理消息时发生未捕获异常');
       }
     })();
   });
@@ -356,7 +378,9 @@ async function main(): Promise<void> {
   // ==================== 9.5 管理面板 ====================
   const startedAt = Date.now();
   const server = createServer({
+    snowLuma: new SnowLumaController(root, getLogger('snowluma')),
     tasks,
+    github,
     speechStatus:()=>speech.status(),
     cfg: app,
     store,
@@ -610,6 +634,13 @@ async function main(): Promise<void> {
   log.info(`   情绪提取    : ${app.emotion.enabled ? app.emotion.mode : '关闭'}`);
   log.info(`   事实抽取    : ${app.memory.factExtraction ? '开启' : '关闭'}`);
   log.info(`   主动发言    : ${app.proactive.enabled ? app.proactive.mode : '关闭'}`);
+  log.info(
+    `   GitHub 追踪 : ${
+      githubConfig.config.enabled
+        ? `${githubConfig.config.authors.filter((a) => a.enabled).length} 位作者 → ${githubConfig.config.targets.filter((t) => t.enabled).length} 个会话`
+        : '关闭（可在面板「GitHub 追踪」开启）'
+    }`,
+  );
   log.info(`   数据库      : ${dbPath}`);
   log.info(`   日志        : ${path.resolve(root, app.storage.logDir)}`);
   log.info(`   管理面板    : http://${app.server.host}:${app.server.port}`);
@@ -627,8 +658,9 @@ async function main(): Promise<void> {
     const panelClosed=server.stop();
     const panelReady=new Promise<boolean>(resolve=>{const timer=setTimeout(()=>resolve(false),15000);panelClosed.then(()=>{clearTimeout(timer);resolve(true);},()=>{clearTimeout(timer);resolve(false);});});
     const tasksClosed=tasks.stop();
+    const githubClosed=github.stop();
     napcat.removeAllListeners('message');napcat.removeAllListeners('notice');napcat.stop();
-    const [pipelineDrained,panelDrained]=await Promise.all([pipeline.shutdown(),panelReady,tasksClosed]);
+    const [pipelineDrained,panelDrained]=await Promise.all([pipeline.shutdown(),panelReady,tasksClosed,githubClosed]);
     const drained=pipelineDrained && panelDrained;
     if(drained)store.close();else log.error('退出超时：任务尚未结束，保留后台恢复状态，不关闭仍可能被访问的数据库');
     await flushLogger();process.exit(drained?0:1);
@@ -639,10 +671,10 @@ async function main(): Promise<void> {
 
   // 未捕获异常不应让机器人静默死掉
   process.on('uncaughtException', (err) => {
-    log.error({ err: err.message, stack: err.stack?.split('\n').slice(0, 5).join('\n') }, '未捕获异常');
+    log.error({ ...errorDetails(err),err:err.message,stack:err.stack?.split('\n').slice(0,5).join('\n') }, '未捕获异常');
   });
   process.on('unhandledRejection', (reason) => {
-    log.error({ reason: String(reason) }, '未处理的 Promise 拒绝');
+    log.error({ ...errorDetails(reason),reason:String(reason) }, '未处理的 Promise 拒绝');
   });
 
   void PROJECT_ROOT;

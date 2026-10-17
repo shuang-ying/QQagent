@@ -11,7 +11,7 @@
  * proactive / pipeline）在构造时持有的是子对象的引用，替换会让它们看不到变化。
  */
 import type { AppConfig } from '../core/types.js';
-import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES, COMMAND_IDS, CommandPermissionsSchema, type CommandId, type CommandPermission } from '../core/types.js';
+import { AppConfigSchema, PersonaSchema, LLM_ROLE_NAMES, TOKEN_BUDGET_PURPOSES, COMMAND_IDS, CommandPermissionsSchema, type CommandId, type CommandPermission } from '../core/types.js';
 import { commandPermission } from '../pipeline/command-permissions.js';
 
 export interface SettingOption {
@@ -110,7 +110,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'proactive.mode',
     label: '主动发言策略',
-    desc: 'probability 每几句消息按概率 / relevant 话题相关时按概率 / hybrid 两者结合（推荐）',
+    desc: '所有策略都在消息机会点评估：probability 用基础概率 / relevant 仅相关时评估 / hybrid 相关用相关概率，否则用基础概率',
     type: 'enum',
     options: [
       { value: 'off', label: '关闭' },
@@ -123,7 +123,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'proactive.everyNMessages',
     label: '每几句消息评估一次',
-    desc: '群里每积累这么多条消息算一个发言机会点（到点才掷概率，不是每条都掷）',
+    desc: '适用于所有主动策略。群里每积累这么多条消息才评估一次；确认主动发言后归零重新计数（含纯表情包）',
     type: 'number',
     min: 1,
     max: 500,
@@ -141,7 +141,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'proactive.relevanceProbability',
     label: '话题相关时的发言概率',
-    desc: '0~1。话题跟机器人记忆/人格对得上时用这个概率，通常设得比基础概率高',
+    desc: '0~1。到消息机会点且话题跟机器人记忆/人格对得上时用这个概率',
     type: 'number',
     min: 0,
     max: 1,
@@ -150,7 +150,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'proactive.relevanceThreshold',
     label: '话题相关度阈值',
-    desc: '0~1，越高越挑剔。低于它就走基础概率那条路',
+    desc: '0~1，越高越挑剔。设为 0 仍需要相关证据；不相关时 hybrid 走基础概率，relevant 不发言',
     type: 'number',
     min: 0,
     max: 1,
@@ -265,7 +265,7 @@ export const SETTING_DEFS: SettingDef[] = [
   {
     path: 'sticker.autoSend.emotions',
     label: '自动补图的情绪',
-    desc: '命中这些情绪才自动发图，如 ["sadness", "joy"]',
+    desc: '留空表示任何情绪；填写后仅匹配指定情绪，如 sadness, joy。仍受强度、概率、冷却与候选限制',
     type: 'string[]',
     group: '回复行为',
   },
@@ -322,6 +322,14 @@ SETTING_DEFS.push(
  {path:'links.denyDomains',label:'禁止读取的域名',type:'string[]',group:'链接与卡片',desc:'含子域名；本机、内网和保留地址始终拒绝'},
 );
 
+SETTING_DEFS.push({path:'tasks.dailyTimeoutMs',label:'日报模型超时（毫秒）',type:'number',desc:'0继承模型总超时（默认120000）；可单独填写1000～600000，未投递失败最多三次尝试',group:'提醒与日报',min:0,max:600000});
+
+const budgetLabels = {chat:'回复',vision:'图片理解',sticker:'表情包识图',emotion:'情绪分析',facts:'记忆抽取',summary:'上下文摘要',daily:'日报'};
+SETTING_DEFS.push(...TOKEN_BUDGET_PURPOSES.map(purpose => ({
+  path:`llm.tokenBudgets.${purpose}`,label:`${budgetLabels[purpose]}输出 token 上限`,type:'number' as const,
+  min:0,max:131072,group:'Token 预算',
+  desc:'0 保持原预算；非零覆盖该用途每次生成的上限（含重试），不含输入。模型上下文限制仍生效；不是累计用量额度。',
+})));
 const ALLOWED = new Set(SETTING_DEFS.map((d) => d.path));
 
 /** 「模型用途」路径：llm.roles.<role>.provider / .model */

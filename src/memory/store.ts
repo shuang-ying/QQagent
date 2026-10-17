@@ -598,14 +598,17 @@ export class MemoryStore {
     return rows.reverse();
   }
 
-  /** 某会话里机器人最后一次发言的时间（0 = 从没说过） */
+  /** 某会话里机器人最后一次发言的时间，含确认主动发送的纯图片（0 = 从没说过） */
   getLastAssistantAt(scope: string): number {
     const convId = this.currentConversationId(scope);
     const r = this.db
       .prepare(
-        "SELECT created_at FROM messages WHERE conversation_id = ? AND role = 'assistant' ORDER BY created_at DESC, id DESC LIMIT 1",
+        `SELECT MAX(
+          COALESCE((SELECT MAX(created_at) FROM messages WHERE conversation_id = ? AND role = 'assistant'), 0),
+          COALESCE((SELECT replied_at FROM proactive_counters WHERE conversation_id = ?), 0)
+        ) AS created_at`,
       )
-      .get(convId) as { created_at: number } | undefined;
+      .get(convId, convId) as { created_at: number } | undefined;
     return r?.created_at ?? 0;
   }
 
@@ -615,19 +618,20 @@ export class MemoryStore {
    * 按**消息 id** 而不是时间戳比较：同一毫秒内可以插入多条消息，
    * 用 `created_at > t` 会把同一毫秒的消息全部漏掉（实测踩过）。
    * id 是单调递增的，不受时钟精度影响。
+   * 确认的主动发言另存消息边界，纯图片也能重置；不伪造文本消息。
    */
-  countUserMessagesSinceLastAssistant(scope: string): number {
-    const convId = this.currentConversationId(scope);
+  countUserMessagesSinceLastAssistant(scope: string, conversationId?: string): number {
+    const convId = this.resolveConversation(scope, conversationId);
     const r = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM messages
          WHERE conversation_id = ? AND role = 'user'
-           AND id > COALESCE(
-             (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant'),
-             0
+           AND id > MAX(
+             COALESCE((SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant'), 0),
+             COALESCE((SELECT message_boundary FROM proactive_counters WHERE conversation_id = ?), 0)
            )`,
       )
-      .get(convId, convId) as { n: number };
+      .get(convId, convId, convId) as { n: number };
     return r.n;
   }
 
@@ -1104,6 +1108,31 @@ export class MemoryStore {
     this.db
       .prepare('INSERT INTO proactive_log(scope, reason, content, created_at) VALUES (?,?,?,?)')
       .run(scope, reason, content, now);
+  }
+
+  /** 确认主动投递后一起记录频率和计数边界，重启后仍生效；不影响聊天上下文。 */
+  recordProactiveReply(scope: string, conversationId: string, reason: string, content: string, now = Date.now()):
+    { messagesBeforeReset: number; messageBoundary: number } | undefined {
+    this.db.exec('SAVEPOINT proactive_reply');
+    try {
+      this.logProactive(scope, reason, content, now);
+      let reset: { messagesBeforeReset: number; messageBoundary: number } | undefined;
+      // 发送途中切换/删除话题，不得重置新话题的计数。
+      if (this.getConversation(conversationId)?.scope === scope) {
+        const messagesBeforeReset = this.countUserMessagesSinceLastAssistant(scope, conversationId);
+        const { id } = this.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages WHERE conversation_id=?')
+          .get(conversationId) as { id: number };
+        this.db.prepare(`INSERT INTO proactive_counters(conversation_id,message_boundary,replied_at) VALUES(?,?,?)
+          ON CONFLICT(conversation_id) DO UPDATE SET message_boundary=excluded.message_boundary,replied_at=excluded.replied_at`)
+          .run(conversationId, id, now);
+        reset = { messagesBeforeReset, messageBoundary: id };
+      }
+      this.db.exec('RELEASE proactive_reply');
+      return reset;
+    } catch (e) {
+      this.db.exec('ROLLBACK TO proactive_reply; RELEASE proactive_reply');
+      throw e;
+    }
   }
 
   /** 统计某会话在时间窗口内的主动发言次数 */

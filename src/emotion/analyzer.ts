@@ -1,3 +1,4 @@
+import { errorDetails } from '../core/logger.js';
 /**
  * 情绪提取
  *
@@ -291,9 +292,11 @@ export class EmotionAnalyzer {
         this.log.debug({ label: parsed.label, mode: this.mode, ruleLabel: rule.label }, 'LLM 情绪分析完成');
         return parsed;
       }
-      this.log.debug({ raw: res.content.slice(0, 120) }, 'LLM 情绪返回格式异常，回退规则结果');
+      this.log.warn({phase:'emotion-parse',provider:this.providerKey,model:this.modelId,
+        responseChars:res.content.length,errorKind:'invalid-response',fallback:'rule'}, 'LLM 情绪返回格式异常，回退规则结果');
     } catch (e) {
-      this.log.debug({ err: (e as Error).message }, 'LLM 情绪分析失败，回退规则结果');
+      this.log[signal?.aborted?'debug':'warn']({phase:'emotion',provider:this.providerKey,model:this.modelId,
+        ...errorDetails(e),err:(e as Error).message,fallback:'rule'}, 'LLM 情绪分析失败，回退规则结果');
     }
 
     return stripMatched(rule);
