@@ -55,7 +55,7 @@ import { publicGithubConfig } from '../github/config.js';
 export interface ServerDeps {
   snowLuma?: SnowLumaController;
   tasks?:ScheduledTasks;
-  /** GitHub 作者动态追踪（与任务调度一样，服务未启动时面板提示） */
+  /** GitHub 动态追踪（作者 + 仓库订阅；与任务调度一样，服务未启动时面板提示） */
   github?:GithubTracker;
   speechStatus?:()=>unknown;
   cfg: AppConfig;

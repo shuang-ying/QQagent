@@ -1,8 +1,11 @@
-# GitHub 作者动态追踪
+# GitHub 动态追踪（作者 + 仓库订阅）
 
-管理面板新增 **📡 GitHub 追踪** 页：添加一个或多个 GitHub 作者，把他们的公开动态（提交、发布、PR、Issue、Fork、Star 等）实时推送到**本页单独选定**的 QQ 会话。
+管理面板 **📡 GitHub 追踪** 页支持两种可以并存的模式：
 
-这里的推送会话与项目里的「群白名单 / 用户白名单」完全无关：即使某个群不在 `trigger.group.enabledGroups` 里，只要在本页添加了 `group:群号`，它就会收到 GitHub 动态；反过来，本页没添加的会话一条都不会收到。
+- **作者动态**：追踪一个或多个 GitHub 作者的公开动态（Push、Release、PR、Issue、Fork、Star 等）。
+- **仓库订阅**：订阅指定 `owner/repo`，按分支比对 HEAD SHA；有新提交就推送一条汇总，并可同时订阅 Release 新版本。仓库订阅直接查 `commits` / `releases`，不依赖 GitHub 公开事件流，通常比作者动态更即时、更可靠。
+
+两种模式都把消息推送到**本页单独选定**的 QQ 会话。这里的会话与项目里的「群白名单 / 用户白名单」完全无关：即使某个群不在 `trigger.group.enabledGroups` 里，只要在本页添加了 `group:群号`，它就会收到 GitHub 消息；反过来，本页没添加的会话一条都不会收到。
 
 ---
 
@@ -12,12 +15,13 @@
 
 ```yaml
 enabled: true
+mode: both          # authors | repos | both
 intervalSec: 300
 maxEventsPerPoll: 5
 maxEventAgeHours: 24
 apiBase: https://api.github.com
 token: ''          # 可选，建议只放本机
-eventTypes:
+eventTypes:        # 只影响「作者动态」
   - PushEvent
   - CreateEvent
   - ReleaseEvent
@@ -29,6 +33,11 @@ eventTypes:
   - PublicEvent
 authors:
   - login: torvalds
+    enabled: true
+repos:
+  - repo: octocat/Hello-World
+    branch: main        # 留空 = 仓库默认分支
+    releases: true      # 是否同时订阅 Release
     enabled: true
 targets:
   - scope: group:10001
@@ -42,20 +51,34 @@ targets:
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `false` | 总开关。关闭后不再自动轮询；面板的「立即检查」仍可手动试跑 |
+| `mode` | `authors` | `authors` 作者动态 / `repos` 仓库订阅 / `both` 两者同时。老配置没有该字段时按 `authors` 处理 |
 | `intervalSec` | `300` | 轮询间隔，60~3600 秒 |
-| `maxEventsPerPoll` | `5` | 每个作者每轮最多推送几条，超出的留到下一轮 |
-| `maxEventAgeHours` | `24` | 超过这个时长的旧动态直接忽略，避免停机几天后补发陈年事件 |
+| `maxEventsPerPoll` | `5` | 每个作者/仓库每轮最多推送几条，超出的留到下一轮 |
+| `maxEventAgeHours` | `24` | 只对作者动态生效：超过这个时长的旧动态直接忽略 |
 | `apiBase` | `https://api.github.com` | 自建 GitHub Enterprise 可改，面板不暴露此项 |
 | `token` | 空 | 可选。匿名 60 次/小时；填了 5000 次/小时。只写在本机配置文件 |
-| `eventTypes` | 见上 | 推送哪些事件类型；未勾选的类型会被标记为 skipped，不会补发 |
+| `eventTypes` | 见上 | 只影响作者动态；未勾选的类型会被标记为 skipped |
 | `authors` | 空 | `login` + `enabled`；用户名大小写不敏感，自动去重 |
-| `targets` | 空 | `scope` 为 `group:群号` 或 `private:QQ号`；与白名单无关 |
+| `repos` | 空 | `repo`（owner/repo）、`branch`（空=默认分支）、`releases`、`enabled`；最多 50 个 |
+| `targets` | 空 | `scope` 为 `group:群号` 或 `private:QQ号`；两种模式共用，与白名单无关 |
 
 ---
 
-## 2. 添加作者与会话
+## 2. 追踪模式
 
-**作者**：输入 GitHub 用户名（可一次填多个，逗号或空格分隔）→「添加作者」→「保存设置」。
+| 模式 | 轮询内容 | 适用场景 |
+| --- | --- | --- |
+| `authors` | `/users/{login}/events/public` | 想跟某个人的全部公开活动 |
+| `repos` | `/repos/{owner}/{repo}/commits` + `/releases` | 只关心某个仓库的代码和版本，要求更及时 |
+| `both` | 以上两者 | 既跟人，也盯仓库 |
+
+切换模式后，不属于当前模式的待推送事件会被标记为 skipped，避免切回来时突然补发一堆旧消息。修改会自动保存并热更新，约 1 秒内会提前跑一轮。
+
+---
+
+## 3. 作者动态
+
+**添加作者**：输入 GitHub 用户名（可一次填多个，逗号或空格分隔）→「添加作者」。添加后自动保存并热更新。
 
 - 用户名格式：1~39 位字母、数字或短横线，不能以短横线开头/结尾；最多 50 个。
 - 首次加入某位作者时，第一轮成功拉取只**建立基线**：把这批历史事件记为 skipped，不推送。之后出现的新事件才会推送。
@@ -70,9 +93,7 @@ targets:
 
 > 会话只是「消息发到哪里」：不会创建或修改白名单，也不影响聊天准入。
 
----
-
-## 3. 支持的事件
+### 支持的事件
 
 | 事件 | 推送文案示例 |
 | --- | --- |
@@ -92,34 +113,61 @@ targets:
 | `GollumEvent` | 📖 更新 Wiki |
 | `DiscussionEvent` | 💬 讨论 #12 |
 
-每条消息形如：
+---
+
+## 4. 仓库订阅
+
+**添加仓库**：在「订阅仓库」里填 `owner/repo`（如 `octocat/Hello-World`），分支可留空使用默认分支，点「添加仓库」。添加后自动保存并热更新。
+
+- 同一仓库大小写不敏感，自动去重；最多 50 个。
+- 每个仓库可以单独暂停，或关闭 Release 订阅。
+- 首次轮询只记录当前分支 HEAD 和最新 Release 作为**基线**，不推送历史。
+- 之后每轮：
+  1. `GET /repos/{owner}/{repo}/commits?per_page=50&sha={branch}`；
+  2. 用上次保存的 HEAD SHA 在提交列表里定位；在它之前的提交就是新增提交；
+  3. 推送一条汇总，包含**提交数、作者、每条提交首行**和 compare / commit 链接；
+  4. 如果上次 HEAD 不在最近 50 条里（一次推了很多或历史被重写），改用 `compare/{old}...{new}` 拿准确提交数；compare 也失败时按最新一条汇总并注明「历史被重写」。
+- Release：`GET /repos/{owner}/{repo}/releases?per_page=10`，只推送比基线更新的非草稿版本；预发布标为 🧪。一次发现多个新版本时按 `maxEventsPerPoll` 分批，剩下的下一轮继续。
+- 每轮每个仓库通常只发 **2 个请求**（commits + releases），compare 只在必要时才发。
+- 私有仓库：需要 Token 具备 `repo` 权限；只有公开仓库或 Token 有权访问的仓库才能读到 commits/releases。
+
+### 仓库订阅消息示例
 
 ```
-📡 GitHub · torvalds
-🚀 推送 2 个提交到 torvalds/linux
-· 分支：master
-· mm: fix page fault handling
-· docs: 更新维护者名单
-🔗 https://github.com/torvalds/linux/commit/abcdef1
-🕐 2026-10-17 20:30
+📦 GitHub 仓库 · octocat/Hello-World
+🚀 main 有 2 个新提交
+· abc1234 @octocat：feat: 新功能
+· def5678 @octocat：fix: 修复问题
+🔗 https://github.com/octocat/Hello-World/compare/abc...def
+🕐 2026-10-17 18:30
+```
+
+```
+📦 GitHub 仓库 · octocat/Hello-World
+🚀 发布 v1.2.0
+· 1.2.0
+· 修复若干问题
+🔗 https://github.com/octocat/Hello-World/releases/tag/v1.2.0
+🕐 2026-10-17 18:30
 ```
 
 ---
 
-## 4. 轮询、去重与补发
+## 5. 轮询、去重与补发
 
-- **保存即生效**：在面板保存设置后，如果作者或推送会话有增删/启停，约 1 秒内会提前跑一轮（新作者立即建立基线、新增会话立即补发积压），不用等满轮询间隔。
+- **自动保存并热更新**：在面板修改开关、模式、作者、仓库或推送会话后，约 700ms 合并保存一次，并立即热更新追踪器；新作者/仓库立即建立基线、新增会话立即补发积压，不用等满轮询间隔，也不需要手动点保存。「立即保存」仅用于自动保存失败时重试。
 - **倒计时**：面板的「下次检查」每秒在浏览器本地刷新，不会只在每 10 秒拉取状态时跳一下；到点后自动重新拉取状态。
 - **恢复即补发**：OneBot 从离线恢复就绪时立即补一轮待推送事件，不必等下一个轮询周期。
-- **类型变更**：在面板取消某类事件后，已经排队的同类型事件在下次投递时标记为 skipped，不再补发。
-- **去重**：按 GitHub 事件 `id` 落库（`github_events` 主键），同一事件只会推送一次，重启也不会重发。
-- **条件请求**：每个作者保存 `ETag`，下一轮带 `If-None-Match`，GitHub 返回 `304` 时不消耗流量也不重复处理。
+- **Token 变更**：保存新 Token 或修改 `apiBase` 时会清空旧的限额缓存，不会继续等旧匿名额度的 reset 时间。
+- **类型变更**：在面板取消某类作者事件后，已经排队的同类型事件在下次投递时标记为 skipped，不再补发。
+- **去重**：作者事件按 GitHub 事件 `id` 去重；仓库订阅按 `repo-push:{repo}:{headSha}` / `repo-release:{repo}:{releaseId}` 去重。重启不会重复推送。
+- **条件请求**：作者动态保存 `ETag`，下一轮带 `If-None-Match`；仓库订阅直接比对 HEAD，不需要 ETag。
 - **限额**：响应头 `x-ratelimit-remaining` 为 0 时停止请求，等 `x-ratelimit-reset` 后再试；此时已有的待推送事件照常投递。
 - **离线排队**：OneBot 未就绪时事件保持 `pending`，连接恢复后补发。
 - **部分失败**：某个会话发送失败只重试该会话；已成功的会话不会收到第二遍。
 - **重试上限**：同一事件最多 3 轮、或事件超过 48 小时，转为 `failed`，不会永久占用队列。
-- **每轮上限**：每个作者每轮最多推 `maxEventsPerPoll` 条，避免一次刷屏。
-- **事件年龄**：超过 `maxEventAgeHours` 的旧事件直接 skipped。
+- **每轮上限**：每个作者/仓库每轮最多推 `maxEventsPerPoll` 条。
+- **事件年龄**：作者动态超过 `maxEventAgeHours` 的旧事件直接 skipped；仓库订阅以 HEAD 差量为准，不受该限制。
 - **保留期**：已完成/已跳过的记录保留 30 天，自动清理。
 
 事件状态：
@@ -129,14 +177,14 @@ pending ──全部会话成功──> sent
    │
    ├──部分失败──> pending（下轮只补失败会话）
    └──3 轮 / 48 小时──> failed
-其他：skipped（基线、类型未勾选、旧事件、无会话、作者暂停）
+其他：skipped（基线、类型未勾选、旧事件、无会话、作者/仓库暂停、模式切换）
 ```
 
-GitHub 公开事件接口自身有几十秒到几分钟的缓存，轮询达不到「秒级」；间隔 5 分钟是合理默认值。
+GitHub 公开事件接口自身有几十秒到几分钟的缓存，作者动态达不到「秒级」；仓库订阅直接读 commits/releases，通常一次轮询内就能看到新提交。间隔 5 分钟是合理默认值。
 
 ---
 
-## 5. 安全约定
+## 6. 安全约定
 
 - 提交信息、PR 标题、发行说明等来自 GitHub，属于**不可信文本**：只保留单行、截断长度。
 - 发送时使用 OneBot 消息段数组（`text` 段），由 `toCqCodes` 转义 `&`、`[`、`]`、`,`，因此恶意提交信息里的 `[CQ:at,qq=all]` 不会变成真正的 @全体成员。
@@ -146,46 +194,49 @@ GitHub 公开事件接口自身有几十秒到几分钟的缓存，轮询达不�
 
 ---
 
-## 6. HTTP 接口
+## 7. HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/github/state` | 配置（脱敏）+ 运行状态 + 作者/会话统计 + 最近动态与投递 + 已知会话 |
+| GET | `/api/github/state` | 配置（脱敏）+ 运行状态 + 作者/仓库/会话统计 + 最近动态与投递 + 已知会话 |
 | POST | `/api/github/config` | 保存部分配置；服务端归一化、校验、原子写盘并热生效 |
 | POST | `/api/github/poll` | 立即检查一轮（即使总开关关闭也允许）；已在检查中返回 409 |
 | POST | `/api/github/test` | 给每个启用会话发一条测试消息 |
 
 ---
 
-## 7. 数据表
+## 8. 数据表
 
 | 表 | 用途 |
 | --- | --- |
-| `github_events` | 已拉取事件：去重键、待推送队列、面板历史 |
+| `github_events` | 已拉取事件：去重键、待推送队列、面板历史；仓库订阅的 `type` 为 `RepoPush` / `RepoRelease` |
 | `github_deliveries` | 每个事件在每个会话的投递结果 |
 | `github_authors` | 作者的 `ETag`、基线时间、上次检查、错误信息 |
+| `github_repos` | 订阅仓库的 HEAD SHA、Release 基线、上次检查、错误信息 |
 
-数据库 Schema 版本随之升到 6；升级时沿用既有的自动备份流程。
+数据库 Schema 版本随之升到 7；升级时沿用既有的自动备份流程。
 
 ---
 
-## 8. 排查
+## 9. 排查
 
 | 现象 | 处理 |
 | --- | --- |
 | 作者标记「待建基线」 | 等第一轮成功拉取；若一直不消失，看「拉取失败」提示（用户名错误、网络、限额） |
-| 限额剩余 0 | 等重置，或在面板填入 GitHub Token |
+| 仓库标记「待建基线」 | 等第一轮成功拉取；看是否 404（仓库/分支不存在或 Token 无权访问） |
+| 限额剩余 0 | 等重置，或在面板填入 GitHub Token；新 Token 保存后会自动清掉旧限额缓存 |
 | 状态一直「待推送」 | OneBot 是否在线；会话号是否存在；看「最近投递」里的错误 |
-| 添加作者后没有消息 | 首次只建基线；之后作者有新动态才会推送，可点「立即检查」 |
-| 修改后没生效 | 别忘了点「保存设置」；页面上有「有未保存的改动」提示 |
-| 想看完整请求过程 | 日志关键字 `GitHub`：`已建立 GitHub 作者基线`、`GitHub 动态检查完成`、`GitHub 动态推送失败` |
+| 添加作者/仓库后没有消息 | 首次只建基线；之后有新动态/新提交才会推送，可点「立即检查」 |
+| 推送了代码但没有消息 | 确认当前模式包含仓库订阅；确认推送的是订阅的分支；私有仓库需要 Token 有 `repo` 权限 |
+| 修改后没生效 | 看页面顶部是否提示「自动保存失败」；可点「立即保存」重试，并检查网络或面板鉴权 |
+| 想看完整请求过程 | 日志关键字 `GitHub`：`已建立 GitHub 作者基线`、`已建立 GitHub 仓库基线`、`发现 GitHub 仓库新提交`、`发现 GitHub 仓库新 Release`、`GitHub 动态推送失败` |
 
 ---
 
-## 9. 测试
+## 10. 测试
 
 ```powershell
 npm run test:github-tracker
 ```
 
-覆盖：配置归一化与文件损坏回退、事件排版与 CQ 注入转义、基线、去重、离线排队、部分失败重试、304、限额、类型过滤、每轮上限、面板 API 脱敏、面板脚本编译。
+覆盖：配置归一化与文件损坏回退、作者事件排版与 CQ 注入转义、仓库订阅配置、HEAD 基线/新提交/compare 回退、Release 基线/新版本、模式切换、作者基线、去重、离线排队、部分失败重试、304、限额、类型过滤、每轮上限、面板 API 脱敏、面板脚本编译。

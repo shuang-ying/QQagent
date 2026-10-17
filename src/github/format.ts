@@ -304,6 +304,79 @@ export function formatGithubTime(timestamp: number, timezone: string): string {
   }
 }
 
+export interface RepoCommitInfo {
+  sha: string;
+  author: string;
+  message: string;
+}
+
+export interface RepoPushInfo {
+  repo: string;
+  branch: string;
+  total: number;
+  commits: RepoCommitInfo[];
+  url: string;
+  occurredAt: number;
+}
+
+/** 仓库订阅：一个分支 HEAD 变化后的新提交汇总 */
+export function renderRepoPush(info: RepoPushInfo, timezone: string): RenderedGithubEvent {
+  const repo = cleanGithubText(info.repo, 120) || '未知仓库';
+  const branch = cleanGithubText(info.branch, 80) || '默认分支';
+  const total = Math.max(1, Math.trunc(info.total) || info.commits.length || 1);
+  const lines = [`📦 GitHub 仓库 · ${repo}`, `🚀 ${branch} 有 ${total} 个新提交`];
+  const shown = info.commits.slice(0, 5);
+  for (const commit of shown) {
+    const sha = cleanGithubText(commit.sha, 40).slice(0, 7);
+    const author = cleanGithubText(commit.author, 40) || '未知作者';
+    const firstLine = String(commit.message ?? '').split(/\r?\n/)[0] ?? '';
+    const message = cleanGithubText(firstLine, 80);
+    lines.push(`· ${sha} @${author}${message ? `：${message}` : ''}`);
+  }
+  const hidden = total - shown.length;
+  if (hidden > 0) lines.push(`· …另有 ${hidden} 条提交`);
+  const url = safeGithubUrl(info.url);
+  if (url) lines.push(`🔗 ${url}`);
+  lines.push(`🕐 ${formatGithubTime(info.occurredAt, timezone)}`);
+  return {
+    summary: `🚀 ${repo} ${branch} +${total} 提交`,
+    text: lines.join('\n'),
+    url,
+  };
+}
+
+export interface RepoReleaseInfo {
+  tag: string;
+  name: string;
+  body: string;
+  prerelease: boolean;
+  url: string;
+  publishedAt: number;
+}
+
+/** 仓库订阅：GitHub Release 新版本 */
+export function renderRepoRelease(
+  repoName: string,
+  release: RepoReleaseInfo,
+  timezone: string,
+): RenderedGithubEvent {
+  const repo = cleanGithubText(repoName, 120) || '未知仓库';
+  const tag = cleanGithubText(release.tag, 60) || '未知版本';
+  const name = cleanGithubText(release.name, 80);
+  const body = cleanGithubText(release.body, 120);
+  const lines = [`📦 GitHub 仓库 · ${repo}`, `${release.prerelease ? '🧪 预发布' : '🚀 发布'} ${tag}`];
+  if (name && name !== tag) lines.push(`· ${name}`);
+  if (body) lines.push(`· ${body}`);
+  const url = safeGithubUrl(release.url);
+  if (url) lines.push(`🔗 ${url}`);
+  lines.push(`🕐 ${formatGithubTime(release.publishedAt, timezone)}`);
+  return {
+    summary: `${release.prerelease ? '🧪' : '🚀'} ${tag} · ${repo}`,
+    text: lines.join('\n'),
+    url,
+  };
+}
+
 export function renderGithubTestMessage(timezone: string, now = Date.now()): string {
   return [
     '📡 GitHub 动态追踪测试',

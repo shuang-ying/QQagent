@@ -395,7 +395,7 @@
 
     <div class="page" id="page-github">
       <h2>GitHub 动态追踪</h2>
-      <div class="sub">追踪一个或多个 GitHub 作者的公开动态，实时推送到<b>本页单独选定</b>的会话；这里的会话与项目里的群/用户白名单互不影响。</div>
+      <div class="sub">支持两种模式：追踪一个或多个 GitHub 作者的公开动态，或订阅指定仓库（按分支比对 HEAD SHA、跟踪 Release）。两种模式都推送到<b>本页单独选定</b>的会话；这里的会话与项目里的群/用户白名单互不影响。</div>
 
       <div class="card">
         <h3>运行状态 <button class="sm ghost" onclick="loadGithub()">刷新</button><span id="gh_dirty" class="tag warn" style="display:none;margin-left:8px">有未保存的改动</span></h3>
@@ -407,14 +407,14 @@
         <h3>追踪设置</h3>
         <div id="gh_settings"></div>
         <div class="row" style="margin-top:14px">
-          <button id="gh_saveBtn" onclick="saveGithubConfig()">保存设置</button>
+          <button id="gh_saveBtn" onclick="saveGithubConfig()">立即保存</button>
           <button class="ghost" id="gh_pollBtn" onclick="githubPollNow()">立即检查</button>
           <button class="ghost" id="gh_testBtn" onclick="githubTestSend()">发送测试消息</button>
         </div>
         <div class="muted" style="margin-top:10px;line-height:1.9">
           · 配置保存在本机 <span class="mono">config/github.yaml</span>；含 Token 时不会提交到 Git。<br>
-          · GitHub 公开事件接口自身有几十秒到几分钟缓存，轮询间隔建议 ≥ 5 分钟；匿名请求每小时 60 次，填 Token 后 5000 次。<br>
-          · 首次加入某位作者只建立基线，不会把历史动态刷进会话；机器人离线或会话发送失败时保留待推送，恢复后补发。
+          · 作者动态读 GitHub 公开事件流（有几十秒到几分钟缓存）；仓库订阅直接查 commits / releases，更即时、更可靠。<br>
+          · 匿名请求每小时 60 次，填 Token 后 5000 次；首次加入作者或仓库只建立基线，不会把历史动态刷进会话。
         </div>
       </div>
 
@@ -424,6 +424,17 @@
         <div class="row" style="margin-top:12px">
           <input id="gh_author_input" placeholder="GitHub 用户名，如 torvalds；多个用逗号或空格分隔">
           <button onclick="addGithubAuthor()">添加作者</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>订阅仓库 <span class="muted" style="font-weight:400">直接比对 HEAD SHA</span></h3>
+        <div class="muted" style="margin-bottom:10px">填 <span class="mono">owner/repo</span>；分支留空表示默认分支。首次订阅只记录当前 HEAD 和最新 Release，之后有新提交/新版本才推送。私有仓库需要 Token 有 <span class="mono">repo</span> 权限。</div>
+        <div id="gh_repos" class="scroll"></div>
+        <div class="row" style="margin-top:12px">
+          <input id="gh_repo_input" placeholder="owner/repo，如 octocat/Hello-World">
+          <input id="gh_branch_input" placeholder="分支，留空=默认分支" style="max-width:220px">
+          <button onclick="addGithubRepo()">添加仓库</button>
         </div>
       </div>
 
@@ -1820,30 +1831,69 @@ $('emoLoadBtn').onclick = async () => {
 // ============ GitHub 动态追踪 ============
 let ghState = null;
 let ghDirty = false;
+let ghEditVersion = 0;
+let ghSaveTimer = null;
+let ghSaving = false;
+let ghSaveAgain = false;
+const GH_AUTO_SAVE_MS = 700;
 const GH_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const GH_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/;
+const GH_MODE_LABELS = { authors: '作者动态', repos: '仓库订阅', both: '作者动态 + 仓库订阅' };
 
+/** 任意设置改动后自动保存并热更新；700ms 内的连续操作合并为一次请求 */
 function ghMarkDirty() {
   ghDirty = true;
+  ghEditVersion++;
+  if (ghSaving) ghSaveAgain = true;
   const badge = $('gh_dirty');
-  if (badge) badge.style.display = 'inline-block';
+  if (badge) {
+    badge.textContent = '自动保存中…';
+    badge.className = 'tag warn';
+    badge.style.display = 'inline-block';
+  }
+  if (ghSaveTimer) clearTimeout(ghSaveTimer);
+  ghSaveTimer = setTimeout(() => {
+    ghSaveTimer = null;
+    void saveGithubConfig(true);
+  }, GH_AUTO_SAVE_MS);
 }
 function ghClearDirty() {
   ghDirty = false;
+  if (ghSaveTimer) {
+    clearTimeout(ghSaveTimer);
+    ghSaveTimer = null;
+  }
   const badge = $('gh_dirty');
-  if (badge) badge.style.display = 'none';
+  if (badge) {
+    badge.style.display = 'none';
+    badge.className = 'tag warn';
+  }
 }
 
 async function loadGithub(full = true) {
+  const loadVersion = ghEditVersion;
   try {
     const d = await api('/api/github/state');
-    ghState = d;
+    if (ghDirty && ghState) {
+      // 有本地改动/自动保存尚未完成时，只同步运行状态，不能用服务端旧配置覆盖本地列表
+      ghState.runtime = d.runtime;
+      ghState.recentEvents = d.recentEvents;
+      ghState.recentDeliveries = d.recentDeliveries;
+      ghState.knownSessions = d.knownSessions;
+    } else {
+      ghState = d;
+    }
     renderGithubStatus();
-    if (full) {
+    if (full && !ghDirty && ghEditVersion === loadVersion) {
       renderGithubSettings();
       renderGithubAuthors();
+      renderGithubRepos();
       renderGithubTargets();
       renderGithubKnown();
       ghClearDirty();
+    } else if (!full && !ghDirty) {
+      // 10 秒状态刷新时同步仓库统计；有未保存改动时保留用户正在编辑的列表
+      renderGithubRepos();
     }
     renderGithubEvents();
     renderGithubDeliveries();
@@ -1888,6 +1938,7 @@ function renderGithubStatus() {
   const intervalText = cfg.intervalSec % 60 === 0 ? (cfg.intervalSec / 60) + ' 分钟' : cfg.intervalSec + ' 秒';
   const rows = [
     ['追踪状态', !r.enabled ? '○ 已关闭' : (r.polling ? '● 检查中' : '● 运行中')],
+    ['追踪模式', GH_MODE_LABELS[cfg.mode] || cfg.mode],
     ['轮询间隔', intervalText],
     ['上次检查', r.lastPollAt ? fmtTime(r.lastPollAt) : '尚未检查'],
     ['下次检查', '<span id="gh_nextPoll">' + esc(githubCountdownText()) + '</span>', true],
@@ -1901,7 +1952,10 @@ function renderGithubStatus() {
   const box = $('gh_error');
   const notes = [];
   if (r.lastError) notes.push(r.lastError);
-  if (!cfg.authors.length) notes.push('还没有追踪任何作者。');
+  if (cfg.mode !== 'repos' && !cfg.authors.length) notes.push('还没有追踪任何作者。');
+  if (cfg.mode !== 'authors' && !cfg.repos.length) notes.push('还没有订阅任何仓库。');
+  if (cfg.mode === 'authors' && cfg.repos.length) notes.push('当前模式只追踪作者，已配置的仓库订阅不会轮询。');
+  if (cfg.mode === 'repos' && cfg.authors.length) notes.push('当前模式只追踪仓库，已配置的作者不会轮询。');
   if (!cfg.targets.filter((t) => t.enabled).length) notes.push('还没有启用任何推送会话。');
   box.textContent = notes.join(' ');
   box.className = r.lastError ? 'msg err' : 'msg info';
@@ -1921,20 +1975,29 @@ function renderGithubSettings() {
     '<input type="checkbox" name="gh_evt" value="' + esc(t.value) + '"' + (cfg.eventTypes.indexOf(t.value) >= 0 ? ' checked' : '') +
     ' style="width:auto;flex:0 0 auto;margin-right:8px" onchange="ghMarkDirty()">' +
     '<span style="font-size:12.5px">' + esc(t.label) + '</span></label>').join('');
+  const modeOptions = [
+    ['authors', '作者动态（events/public）'],
+    ['repos', '仓库订阅（commits / releases）'],
+    ['both', '两者都追踪'],
+  ].map(([value, label]) =>
+    '<option value="' + value + '"' + (cfg.mode === value ? ' selected' : '') + '>' + esc(label) + '</option>').join('');
   $('gh_settings').innerHTML =
     '<div class="toggle-row"><div class="txt"><div class="t">启用 GitHub 动态追踪</div><div class="d">关闭后不再自动轮询；「立即检查」仍可手动试跑</div></div>' +
     '<label class="switch"><input type="checkbox" id="gh_enabled"' + (cfg.enabled ? ' checked' : '') + ' onchange="ghMarkDirty()"><span class="slider"></span></label></div>' +
+    '<div style="margin-top:12px"><label>追踪模式</label><select id="gh_mode" onchange="ghMarkDirty()">' + modeOptions + '</select>' +
+    '<div class="muted">作者动态读公开事件流；仓库订阅直接比对 HEAD SHA 与 Release，更即时。两种模式共用下面的推送会话。</div>' +
+    '<div class="muted">修改后自动保存并热更新；「立即保存」仅用于自动保存失败时重试。</div></div>' +
     '<div class="grid c3" style="margin-top:12px">' +
     numField('轮询间隔（秒）', '60~3600，默认 300', 'gh_interval', cfg.intervalSec, 60, 3600) +
-    numField('每个作者每轮最多推送条数', '1~20，超出部分下一轮继续', 'gh_max', cfg.maxEventsPerPoll, 1, 20) +
-    numField('忽略超过 N 小时的旧动态', '1~168，避免停机后补发陈年动态', 'gh_age', cfg.maxEventAgeHours, 1, 168) +
+    numField('每个作者/仓库每轮最多推送条数', '1~20，超出部分下一轮继续', 'gh_max', cfg.maxEventsPerPoll, 1, 20) +
+    numField('忽略超过 N 小时的旧动态', '1~168，只影响作者动态', 'gh_age', cfg.maxEventAgeHours, 1, 168) +
     '</div>' +
     '<div class="toggle-row" style="margin-top:12px;align-items:center"><div class="txt"><div class="t">GitHub Token（可选）</div>' +
-    '<div class="d">只保存在本机 config/github.yaml；不填为匿名请求（60 次/小时）</div></div>' +
+    '<div class="d">只保存在本机 config/github.yaml；不填为匿名请求（60 次/小时）；私有仓库需要 repo 权限</div></div>' +
     '<div style="flex:0 0 260px"><input id="gh_token" type="password" style="margin:0" placeholder="' +
     (cfg.tokenSet ? '已设置，留空保持不变' : 'ghp_... 或 github_pat_...') + '" onchange="ghMarkDirty()"></div></div>' +
     (cfg.tokenSet ? '<label class="muted" style="display:block;margin-top:8px"><input type="checkbox" id="gh_clearToken" style="width:auto;margin-right:6px" onchange="ghMarkDirty()">清除已保存的 Token</label>' : '') +
-    '<div style="margin-top:14px"><label>推送哪些类型的事件</label><div class="grid c3">' + eventTypes + '</div></div>';
+    '<div style="margin-top:14px"><label>推送哪些类型的事件（只影响作者动态）</label><div class="grid c3">' + eventTypes + '</div></div>';
 }
 
 function renderGithubAuthors() {
@@ -1959,6 +2022,37 @@ function renderGithubAuthors() {
       '<td><label class="switch" style="vertical-align:middle;margin-right:8px"><input type="checkbox"' + (author.enabled ? ' checked' : '') +
       ' onchange="toggleGithubAuthor(\'' + esc(author.login) + '\',this.checked)"><span class="slider"></span></label>' +
       '<button class="sm ghost" onclick="removeGithubAuthor(\'' + esc(author.login) + '\')">移除</button></td></tr>';
+  }).join('') + '</table>';
+}
+
+function renderGithubRepos() {
+  if (!ghState) return;
+  const stats = new Map((ghState.repos || []).map((r) => [r.repo.toLowerCase(), r]));
+  const repos = ghState.config.repos || [];
+  if (!repos.length) {
+    $('gh_repos').innerHTML = '<div class="empty">还没有订阅仓库。输入 owner/repo 后点「添加仓库」。</div>';
+    return;
+  }
+  $('gh_repos').innerHTML = '<table><tr><th>仓库</th><th>分支</th><th>Release</th><th>状态</th><th>HEAD</th><th>上次检查</th><th>操作</th></tr>' + repos.map((repo) => {
+    const r = stats.get(repo.repo.toLowerCase()) || {};
+    const tags = [
+      repo.enabled ? '<span class="tag ok">追踪中</span>' : '<span class="tag">已暂停</span>',
+      r.baselineAt ? '<span class="tag acc">已建基线</span>' : '<span class="tag warn">待建基线</span>',
+      r.pending ? '<span class="tag warn">待推送 ' + r.pending + '</span>' : '',
+      r.lastError ? '<span class="tag err" title="' + esc(r.lastError) + '">拉取失败</span>' : '',
+    ].join('');
+    const head = r.headSha ? String(r.headSha).slice(0, 7) : '-';
+    return '<tr><td class="mono">' + esc(repo.repo) + '</td>' +
+      '<td class="mono">' + esc(repo.branch || '默认分支') + '</td>' +
+      '<td><label class="switch" style="vertical-align:middle;margin-right:6px"><input type="checkbox"' + (repo.releases ? ' checked' : '') +
+      ' onchange="toggleGithubRepoReleases(\'' + esc(repo.repo) + '\',this.checked)"><span class="slider"></span></label>' +
+      '<span class="muted">' + (repo.releases ? '开' : '关') + (r.releaseTag ? ' · ' + esc(r.releaseTag) : '') + '</span></td>' +
+      '<td>' + tags + '</td>' +
+      '<td class="mono muted" title="' + esc(r.headSha || '') + '">' + esc(head) + '</td>' +
+      '<td class="muted">' + esc(r.lastPolledAt ? fmtTime(r.lastPolledAt) : '-') + '</td>' +
+      '<td><label class="switch" style="vertical-align:middle;margin-right:8px"><input type="checkbox"' + (repo.enabled ? ' checked' : '') +
+      ' onchange="toggleGithubRepo(\'' + esc(repo.repo) + '\',this.checked)"><span class="slider"></span></label>' +
+      '<button class="sm ghost" onclick="removeGithubRepo(\'' + esc(repo.repo) + '\')">移除</button></td></tr>';
   }).join('') + '</table>';
 }
 
@@ -2004,10 +2098,13 @@ function renderGithubEvents() {
     return;
   }
   const stateTag = (s) => s === 'sent' ? '<span class="tag ok">已推送</span>' : s === 'failed' ? '<span class="tag err">推送失败</span>' : '<span class="tag warn">待推送</span>';
-  $('gh_events').innerHTML = '<table><tr><th>时间</th><th>作者</th><th>动态</th><th>状态</th></tr>' + rows.map((e) =>
-    '<tr><td class="muted">' + esc(fmtTime(e.occurredAt)) + '</td><td class="mono">@' + esc(e.login) + '</td>' +
-    '<td>' + esc(e.summary || e.type) + '</td><td>' + stateTag(e.state) +
-    (e.attempts ? ' <span class="muted">重试 ' + e.attempts + '</span>' : '') + '</td></tr>').join('') + '</table>';
+  $('gh_events').innerHTML = '<table><tr><th>时间</th><th>来源</th><th>动态</th><th>状态</th></tr>' + rows.map((e) => {
+    const repoEvent = e.type === 'RepoPush' || e.type === 'RepoRelease';
+    const source = repoEvent ? (e.repo || '@' + e.login) : '@' + e.login;
+    return '<tr><td class="muted">' + esc(fmtTime(e.occurredAt)) + '</td><td class="mono">' + esc(source) + '</td>' +
+      '<td>' + esc(e.summary || e.type) + '</td><td>' + stateTag(e.state) +
+      (e.attempts ? ' <span class="muted">重试 ' + e.attempts + '</span>' : '') + '</td></tr>';
+  }).join('') + '</table>';
 }
 
 function renderGithubDeliveries() {
@@ -2057,7 +2154,53 @@ window.addGithubAuthor = () => {
   $('gh_author_input').value = '';
   ghMarkDirty();
   renderGithubAuthors();
-  toast('已添加 ' + added.length + ' 个作者，点击「保存设置」后开始追踪', 'ok');
+  toast('已添加 ' + added.length + ' 个作者，自动保存中', 'ok');
+};
+
+window.toggleGithubRepo = (repoName, enabled) => {
+  if (!ghState) return;
+  const repo = ghState.config.repos.find((r) => r.repo.toLowerCase() === String(repoName).toLowerCase());
+  if (!repo) return;
+  repo.enabled = Boolean(enabled);
+  ghMarkDirty();
+  renderGithubRepos();
+};
+
+window.toggleGithubRepoReleases = (repoName, releases) => {
+  if (!ghState) return;
+  const repo = ghState.config.repos.find((r) => r.repo.toLowerCase() === String(repoName).toLowerCase());
+  if (!repo) return;
+  repo.releases = Boolean(releases);
+  ghMarkDirty();
+  renderGithubRepos();
+};
+
+window.removeGithubRepo = (repoName) => {
+  if (!ghState) return;
+  ghState.config.repos = ghState.config.repos.filter((r) => r.repo.toLowerCase() !== String(repoName).toLowerCase());
+  ghMarkDirty();
+  renderGithubRepos();
+};
+
+window.addGithubRepo = () => {
+  if (!ghState) { toast('页面还在加载，请稍候', 'info'); return; }
+  const repoName = $('gh_repo_input').value.trim();
+  const branch = $('gh_branch_input').value.trim();
+  if (!GH_REPO_RE.test(repoName)) { toast('仓库格式应为 owner/repo，例如 octocat/Hello-World', 'err'); return; }
+  if (branch && (/[\s]/.test(branch) || branch.startsWith('/') || branch.endsWith('/') || branch.includes('..'))) {
+    toast('分支名不合法', 'err');
+    return;
+  }
+  if (ghState.config.repos.some((r) => r.repo.toLowerCase() === repoName.toLowerCase())) {
+    toast('该仓库已经在订阅列表里', 'info');
+    return;
+  }
+  ghState.config.repos.push({ repo: repoName, branch, releases: true, enabled: true });
+  $('gh_repo_input').value = '';
+  $('gh_branch_input').value = '';
+  ghMarkDirty();
+  renderGithubRepos();
+  toast('已添加 ' + repoName + '，自动保存中', 'ok');
 };
 
 window.toggleGithubTarget = (scope, enabled) => {
@@ -2084,7 +2227,7 @@ window.addGithubTargetScope = (scope) => {
   ghMarkDirty();
   renderGithubTargets();
   renderGithubKnown();
-  toast('已添加 ' + scope + '，点击「保存设置」后生效', 'ok');
+  toast('已添加 ' + scope + '，自动保存中', 'ok');
 };
 
 window.addGithubTarget = () => {
@@ -2099,33 +2242,65 @@ window.addGithubTarget = () => {
   ghMarkDirty();
   renderGithubTargets();
   renderGithubKnown();
-  toast('已添加 ' + scope + '，点击「保存设置」后生效', 'ok');
+  toast('已添加 ' + scope + '，自动保存中', 'ok');
 };
 
-window.saveGithubConfig = async () => {
-  if (!ghState) { toast('页面还在加载，请稍候', 'info'); return; }
+window.saveGithubConfig = async (auto = false) => {
+  if (!ghState) { if (!auto) toast('页面还在加载，请稍候', 'info'); return; }
+  if (ghSaving) { ghSaveAgain = true; return; }
+  if (ghSaveTimer) {
+    clearTimeout(ghSaveTimer);
+    ghSaveTimer = null;
+  }
   const tokenInput = $('gh_token');
   const clearToken = $('gh_clearToken');
   const payload = {
     enabled: $('gh_enabled').checked,
+    mode: $('gh_mode').value,
     intervalSec: Number($('gh_interval').value),
     maxEventsPerPoll: Number($('gh_max').value),
     maxEventAgeHours: Number($('gh_age').value),
     eventTypes: Array.from(document.querySelectorAll('input[name="gh_evt"]:checked')).map((x) => x.value),
     authors: ghState.config.authors,
+    repos: ghState.config.repos,
     targets: ghState.config.targets,
   };
   if (clearToken && clearToken.checked) payload.token = '';
   else if (tokenInput && tokenInput.value.trim()) payload.token = tokenInput.value.trim();
-  $('gh_saveBtn').disabled = true;
+  const version = ghEditVersion;
+  const badge = $('gh_dirty');
+  ghSaving = true;
+  if (badge) {
+    badge.textContent = auto ? '自动保存中…' : '保存中…';
+    badge.className = 'tag warn';
+    badge.style.display = 'inline-block';
+  }
+  if (!auto) $('gh_saveBtn').disabled = true;
   try {
     await post('/api/github/config', payload);
-    toast('GitHub 追踪设置已保存并生效', 'ok');
+    // 保存期间又有改动：保留本地列表，下一轮把最新状态一起提交
+    if (ghEditVersion !== version) {
+      ghSaveAgain = true;
+      return;
+    }
+    ghClearDirty();
+    if (!auto) toast('GitHub 追踪设置已保存并生效', 'ok');
     await loadGithub();
   } catch (e) {
-    toast(e.message, 'err');
+    ghDirty = true;
+    if (badge) {
+      badge.textContent = auto ? '自动保存失败' : '保存失败';
+      badge.className = 'tag err';
+      badge.style.display = 'inline-block';
+    }
+    toast((auto ? '自动保存失败：' : '') + e.message, 'err');
   } finally {
-    $('gh_saveBtn').disabled = false;
+    ghSaving = false;
+    if (!auto) $('gh_saveBtn').disabled = false;
+    if (ghSaveAgain) {
+      ghSaveAgain = false;
+      ghMarkDirty();
+    }
   }
 };
 

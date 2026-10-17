@@ -9,13 +9,20 @@
 # 总开关。默认关闭：不做任何网络请求，也不推送。
 enabled: false
 
+# 追踪模式：
+#   authors = 作者动态（/users/{login}/events/public）
+#   repos   = 仓库订阅（按分支比对 HEAD SHA + Release）
+#   both    = 两者同时
+mode: authors
+
 # 轮询间隔（秒），60~3600。GitHub 建议不要轮询太频繁。
 intervalSec: 300
 
-# 单个作者每轮最多推送几条，1~20；超出的下一轮继续。
+# 单个作者/仓库每轮最多推送几条，1~20；超出的下一轮继续。
 maxEventsPerPoll: 5
 
-# 超过这个小时数的旧动态直接跳过，避免停机后补发陈年事件，1~168。
+# 超过这个小时数的旧作者动态直接跳过，避免停机后补发陈年事件，1~168。
+# 仓库订阅以 HEAD 差量为准，不受此限制。
 maxEventAgeHours: 24
 
 # GitHub API 基址；GitHub Enterprise 可改成自己的实例地址。
@@ -24,7 +31,7 @@ apiBase: https://api.github.com
 # 可选 Token：留空时匿名请求（每小时 60 次），填了可提升到每小时 5000 次。
 token: ""
 
-# 要推送的事件类型，取消的项不会补发已排队的同类型事件。
+# 要推送的事件类型，取消的项不会补发已排队的同类型事件。只影响作者动态。
 eventTypes:
   - PushEvent
   - CreateEvent
@@ -42,6 +49,16 @@ eventTypes:
 #   - login: torvalds
 #     enabled: true
 authors: []
+
+# 订阅仓库（最多 50 个）。首次订阅只记录当前 HEAD / 最新 Release 作为基线，
+# 不推送历史；之后有新提交或新 Release 才推送。
+# branch 留空 = 仓库默认分支；releases 控制是否同时订阅 Release。
+# 例：
+#   - repo: octocat/Hello-World
+#     branch: main
+#     releases: true
+#     enabled: true
+repos: []
 
 # 推送目标会话（最多 50 个），与项目的群/用户白名单无关，独立生效。
 # 格式：group:群号（4~12 位，非 0 开头）或 private:QQ号。

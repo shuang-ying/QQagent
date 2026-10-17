@@ -216,7 +216,7 @@ async function main(): Promise<void> {
   const napcat = new OneBotClient(app.napcat, getLogger('napcat'));
   const speech=new SpeechService(app,providersMgr,getLogger('speech'));pipeline.attachSpeech(speech);
   const tasks=new ScheduledTasks(app,store,providersMgr,napcat.api,trigger,getLogger('tasks'),()=>napcat.apiReady);
-  // GitHub 作者动态追踪：配置独立放在 config/github.yaml，读坏了也不影响主流程
+  // GitHub 动态追踪（作者 + 仓库订阅）：配置独立放在 config/github.yaml，读坏了也不影响主流程
   const githubConfig = loadGithubConfig(root);
   if (githubConfig.warning) log.warn({ warning: githubConfig.warning }, 'config/github.yaml 读取失败，已使用默认配置');
   const github = new GithubTracker({
@@ -637,7 +637,7 @@ async function main(): Promise<void> {
   log.info(
     `   GitHub 追踪 : ${
       githubConfig.config.enabled
-        ? `${githubConfig.config.authors.filter((a) => a.enabled).length} 位作者 → ${githubConfig.config.targets.filter((t) => t.enabled).length} 个会话`
+        ? `${githubConfig.config.authors.filter((a) => a.enabled).length} 位作者 / ${githubConfig.config.repos.filter((r) => r.enabled).length} 个仓库 → ${githubConfig.config.targets.filter((t) => t.enabled).length} 个会话`
         : '关闭（可在面板「GitHub 追踪」开启）'
     }`,
   );

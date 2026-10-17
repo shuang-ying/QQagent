@@ -84,6 +84,18 @@ interface FakeGithub {
   calls: string[];
 }
 
+function stepResponse(step: Step): GithubHttpResponse {
+  const headers = new Map(Object.entries(step.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+  const status = step.status ?? 200;
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name: string) => headers.get(name.toLowerCase()) ?? null },
+    json: async () => (step.body === undefined ? [] : step.body),
+    text: async () => (typeof step.body === 'string' ? step.body : JSON.stringify(step.body ?? '')),
+  };
+}
+
 function fakeGithub(plan: Record<string, Step[]>): FakeGithub {
   const calls: string[] = [];
   const index: Record<string, number> = {};
@@ -94,19 +106,69 @@ function fakeGithub(plan: Record<string, Step[]>): FakeGithub {
     const steps = plan[login] ?? [{ body: [] }];
     const position = index[login] ?? 0;
     index[login] = position + 1;
-    const step = steps[Math.min(position, steps.length - 1)]!;
-    const headers = new Map(Object.entries(step.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-    const status = step.status ?? 200;
-    const response: GithubHttpResponse = {
-      ok: status >= 200 && status < 300,
-      status,
-      headers: { get: (name: string) => headers.get(name.toLowerCase()) ?? null },
-      json: async () => (step.body === undefined ? [] : step.body),
-      text: async () => (typeof step.body === 'string' ? step.body : JSON.stringify(step.body ?? '')),
-    };
-    return response;
+    return stepResponse(steps[Math.min(position, steps.length - 1)]!);
   };
   return { fetchImpl, calls };
+}
+
+interface RepoPlan {
+  commits: Step[];
+  releases?: Step[];
+  compare?: Step[];
+}
+
+/** 仓库订阅用假 fetch：按 URL 路由 commits / releases / compare */
+function fakeRepoGithub(plan: RepoPlan): FakeGithub {
+  const calls: string[] = [];
+  const indexes = { commits: 0, releases: 0, compare: 0 };
+  const fetchImpl: GithubFetch = async (url) => {
+    calls.push(url);
+    if (/\/compare\//.test(url)) {
+      const steps = plan.compare ?? [{ body: { commits: [], total_commits: 0 } }];
+      return stepResponse(steps[Math.min(indexes.compare++, steps.length - 1)]!);
+    }
+    if (/\/releases(\?|$)/.test(url)) {
+      const steps = plan.releases ?? [{ body: [] }];
+      return stepResponse(steps[Math.min(indexes.releases++, steps.length - 1)]!);
+    }
+    const steps = plan.commits;
+    return stepResponse(steps[Math.min(indexes.commits++, steps.length - 1)]!);
+  };
+  return { fetchImpl, calls };
+}
+
+function repoCommit(
+  sha: string,
+  minutesAgo: number,
+  opts: { login?: string; message?: string } = {},
+): Record<string, unknown> {
+  return {
+    sha,
+    commit: {
+      message: opts.message ?? `commit ${sha}`,
+      author: { name: opts.login ?? 'Octo Cat', date: new Date(NOW - minutesAgo * 60_000).toISOString() },
+    },
+    author: { login: opts.login ?? 'octocat' },
+    html_url: `https://github.com/owner/repo/commit/${sha}`,
+  };
+}
+
+function repoRelease(
+  id: number,
+  tag: string,
+  minutesAgo: number,
+  opts: { body?: string; prerelease?: boolean } = {},
+): Record<string, unknown> {
+  return {
+    id,
+    tag_name: tag,
+    name: tag,
+    body: opts.body ?? '',
+    prerelease: opts.prerelease ?? false,
+    draft: false,
+    published_at: new Date(NOW - minutesAgo * 60_000).toISOString(),
+    html_url: `https://github.com/owner/repo/releases/tag/${tag}`,
+  };
 }
 
 interface FixtureOptions {
@@ -177,6 +239,20 @@ function fixture(opts: FixtureOptions = {}) {
   };
 }
 
+function repoFixture(opts: { plan: RepoPlan; config?: Partial<GithubConfig> }) {
+  const fake = fakeRepoGithub(opts.plan);
+  const f = fixture({
+    fetchImpl: fake.fetchImpl,
+    config: {
+      mode: 'repos',
+      authors: [],
+      repos: [{ repo: 'owner/repo', branch: 'main', releases: true, enabled: true }],
+      ...(opts.config ?? {}),
+    },
+  });
+  return { ...f, calls: fake.calls };
+}
+
 test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', () => {
   const base = defaultGithubConfig();
 
@@ -210,6 +286,204 @@ test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', 
   const publicCfg = publicGithubConfig(GithubConfigSchema.parse({ token: 'ghp_secret_value' }));
   assert.equal('token' in publicCfg, false);
   assert.equal(publicCfg.tokenSet, true);
+});
+
+test('GitHub 仓库订阅配置：模式、owner/repo、分支与去重', () => {
+  const base = defaultGithubConfig();
+  assert.equal(base.mode, 'authors');
+
+  const ok = validateGithubConfig(
+    {
+      mode: 'repos',
+      repos: [
+        { repo: 'OctoCat/Hello-World', branch: 'main', releases: false },
+        'octocat/hello-world',
+      ],
+    },
+    base,
+  );
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.config.mode, 'repos');
+    assert.equal(ok.config.repos.length, 1); // 大小写不敏感去重
+    assert.equal(ok.config.repos[0]!.repo, 'OctoCat/Hello-World');
+    assert.equal(ok.config.repos[0]!.branch, 'main');
+    assert.equal(ok.config.repos[0]!.releases, false);
+  }
+
+  for (const bad of [
+    { mode: 'nope' },
+    { repos: ['no-slash'] },
+    { repos: ['a/b/c'] },
+    { repos: [{ repo: 'a/b', branch: 'bad branch' }] },
+    { repos: [{ repo: '-bad/repo' }] },
+  ]) {
+    assert.equal(validateGithubConfig(bad, base).ok, false, JSON.stringify(bad));
+  }
+  assert.equal(validateGithubConfig({ repos: ['owner/repo'] }, base).ok, true);
+});
+
+test('仓库订阅：首次只建基线，HEAD 变化和 Release 推送到本页会话', async () => {
+  const f = repoFixture({
+    plan: {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        {
+          body: [
+            repoCommit('new', 1, { login: 'alice', message: 'feat: 新功能\n\n详细说明' }),
+            repoCommit('base', 30),
+          ],
+        },
+        {
+          body: [
+            repoCommit('new', 1, { login: 'alice', message: 'feat: 新功能\n\n详细说明' }),
+            repoCommit('base', 30),
+          ],
+        },
+      ],
+      releases: [
+        { body: [repoRelease(1, 'v1.0.0', 60)] },
+        { body: [repoRelease(2, 'v1.1.0', 1, { body: '修复若干问题' }), repoRelease(1, 'v1.0.0', 60)] },
+        { body: [repoRelease(2, 'v1.1.0', 1, { body: '修复若干问题' }), repoRelease(1, 'v1.0.0', 60)] },
+      ],
+    },
+  });
+  try {
+    const baseline = await f.tracker.pollNow();
+    assert.equal(baseline.ok, true);
+    assert.equal(baseline.fetched, 0);
+    assert.equal(f.sent.length, 0);
+    const before = f.tracker.snapshot();
+    assert.equal(before.repos[0]!.baselineAt, NOW);
+    assert.equal(before.repos[0]!.headSha, 'base');
+    assert.equal(before.repos[0]!.releaseTag, 'v1.0.0');
+
+    const first = await f.tracker.pollNow();
+    assert.equal(first.ok, true);
+    assert.equal(first.fetched, 2); // 一次 push + 一次 release
+    assert.equal(first.delivered, 2); // 两个事件
+    assert.equal(f.sent.length, 4); // 每个事件 x 两个会话
+    assert.deepEqual(f.sent.map((item) => item.scope).sort(), [
+      'group:10001',
+      'group:10001',
+      'private:20002',
+      'private:20002',
+    ]);
+    const pushText = f.sent.find((item) => item.text.includes('新提交'))!.text;
+    assert.match(pushText, /有 1 个新提交/);
+    assert.match(pushText, /@alice/);
+    assert.match(pushText, /feat: 新功能/);
+    const releaseText = f.sent.find((item) => item.text.includes('发布'))!.text;
+    assert.match(releaseText, /🚀 发布 v1\.1\.0/);
+    assert.match(releaseText, /修复若干问题/);
+    assert.ok(f.calls.some((url) => url.includes('/repos/owner/repo/commits')));
+    assert.ok(f.calls.some((url) => url.includes('/repos/owner/repo/releases')));
+
+    const after = f.tracker.snapshot();
+    assert.equal(after.repos[0]!.headSha, 'new');
+    assert.equal(after.repos[0]!.releaseTag, 'v1.1.0');
+    assert.equal(after.runtime.pendingCount, 0);
+
+    const again = await f.tracker.pollNow();
+    assert.equal(again.fetched, 0);
+    assert.equal(f.sent.length, 4); // 不重复推送
+    const state = f.store.db
+      .prepare("SELECT state FROM github_events WHERE event_id LIKE 'repo-push:%'")
+      .get() as { state: string };
+    assert.equal(state.state, 'sent');
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('仓库订阅：旧 HEAD 不在最近提交里时用 compare 拿到完整提交数', async () => {
+  const f = repoFixture({
+    plan: {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit('new', 1), repoCommit('mid', 2)] },
+      ],
+      compare: [
+        {
+          body: {
+            status: 'diverged',
+            total_commits: 3,
+            commits: [repoCommit('c1', 3), repoCommit('c2', 2), repoCommit('c3', 1)],
+          },
+        },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  });
+  try {
+    await f.tracker.pollNow(); // 基线
+    const result = await f.tracker.pollNow();
+    assert.equal(result.fetched, 1);
+    assert.equal(f.sent.length, 2);
+    const text = f.sent[0]!.text;
+    assert.match(text, /有 3 个新提交/);
+    assert.match(text, /@octocat/);
+    assert.ok(f.calls.some((url) => url.includes('/compare/base...new')));
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('仓库订阅切回作者模式后不再轮询仓库，积压事件标记 skipped', async () => {
+  const f = repoFixture({
+    plan: {
+      commits: [
+        { body: [repoCommit('base', 30)] },
+        { body: [repoCommit('new', 1), repoCommit('base', 30)] },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  });
+  try {
+    await f.tracker.pollNow(); // 基线
+    f.setReady(false);
+    const pending = await f.tracker.pollNow();
+    assert.equal(pending.fetched, 1);
+    assert.equal(f.tracker.snapshot().runtime.pendingCount, 1);
+
+    f.tracker.saveConfig({ mode: 'authors' });
+    assert.equal(f.tracker.snapshot().runtime.pendingCount, 0);
+    const row = f.store.db
+      .prepare("SELECT state FROM github_events WHERE event_id LIKE 'repo-push:%'")
+      .get() as { state: string };
+    assert.equal(row.state, 'skipped');
+
+    const calls = f.calls.length;
+    await f.tracker.pollNow();
+    assert.equal(f.calls.length, calls); // 作者模式、作者列表为空：不再发仓库请求
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('修改订阅分支时重建 HEAD 基线，不把新分支历史当新提交', async () => {
+  const f = repoFixture({
+    plan: {
+      commits: [
+        { body: [repoCommit('main-head', 30)] },
+        { body: [repoCommit('dev-head', 1)] },
+      ],
+      releases: [{ body: [] }, { body: [] }],
+    },
+  });
+  try {
+    await f.tracker.pollNow(); // main 基线
+    f.tracker.saveConfig({ repos: [{ repo: 'owner/repo', branch: 'dev', releases: true, enabled: true }] });
+    const switched = await f.tracker.pollNow();
+    assert.equal(switched.fetched, 0);
+    assert.equal(f.sent.length, 0);
+    const snap = f.tracker.snapshot();
+    assert.equal(snap.repos[0]!.branch, 'dev');
+    assert.equal(snap.repos[0]!.headSha, 'dev-head');
+    assert.equal(snap.repos[0]!.baselineAt, NOW);
+  } finally {
+    await f.dispose();
+  }
 });
 
 test('GitHub 配置文件：保存后可读回，损坏时退回默认配置而不是崩溃', () => {
@@ -523,6 +797,71 @@ test('OneBot 恢复就绪后，立即补发离线期间积压的动态', async (
   }
 });
 
+test('保存 Token 后清掉旧的匿名限额阻塞，并立即用新凭证重试', async () => {
+  const reset = Math.floor(NOW / 1000) + 3600;
+  const f = fixture({
+    plan: {
+      octocat: [
+        {
+          body: [],
+          headers: {
+            'x-ratelimit-limit': '60',
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(reset),
+          },
+        },
+        { body: [] },
+      ],
+    },
+  });
+  try {
+    await f.tracker.pollNow();
+    assert.equal(f.tracker.snapshot().runtime.rate.remaining, 0);
+    assert.equal(f.tracker.snapshot().runtime.rate.limit, 60);
+
+    const blocked = await f.tracker.pollNow();
+    assert.equal(blocked.ok, false);
+    assert.equal(f.calls.length, 1);
+    assert.ok(blocked.errors.some((message) => message.includes('限额')));
+
+    f.tracker.saveConfig({ token: 'ghp_new_token_value' });
+    const resetSnapshot = f.tracker.snapshot();
+    assert.equal(resetSnapshot.runtime.rate.remaining, null);
+    assert.equal(resetSnapshot.runtime.rate.limit, null);
+    assert.equal(resetSnapshot.runtime.lastError, '');
+
+    const after = await f.tracker.pollNow();
+    assert.equal(after.ok, true);
+    assert.equal(f.calls.length, 2);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('配置 Token 后请求带 Authorization，面板快照不泄漏 Token', async () => {
+  let authorization = '';
+  const f = fixture({
+    config: { token: 'ghp_secret_value' },
+    fetchImpl: async (_url, init) => {
+      authorization = init?.headers?.['authorization'] ?? '';
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => [],
+        text: async () => '',
+      };
+    },
+  });
+  try {
+    await f.tracker.pollNow();
+    assert.equal(authorization, 'Bearer ghp_secret_value');
+    assert.equal(JSON.stringify(f.tracker.snapshot()).includes('ghp_secret_value'), false);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test('GitHub 面板 API：状态脱敏、保存校验、立即检查与测试消息', async () => {
   const f = fixture({
     config: { token: 'ghp_secret_value' },
@@ -575,6 +914,28 @@ test('GitHub 面板 API：状态脱敏、保存校验、立即检查与测试消
     const testResult = (await json(testSend)) as { ok: boolean; results: Array<{ ok: boolean }> };
     assert.equal(testResult.ok, true);
     assert.equal(testResult.results.length, 2);
+
+    const repoGood = await app.request('/api/github/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'both',
+        repos: [{ repo: 'owner/repo', branch: 'main', releases: true }],
+      }),
+    });
+    assert.equal(repoGood.status, 200);
+    const savedRepo = (await json(repoGood)) as {
+      config: { mode: string; repos: Array<{ repo: string; branch: string }> };
+    };
+    assert.equal(savedRepo.config.mode, 'both');
+    assert.equal(savedRepo.config.repos[0]!.repo, 'owner/repo');
+    assert.equal(savedRepo.config.repos[0]!.branch, 'main');
+
+    const repoState = (await json(await app.request('/api/github/state'))) as {
+      repos: Array<{ repo: string; branch: string }>;
+    };
+    assert.equal(repoState.repos[0]!.repo, 'owner/repo');
+    assert.equal(repoState.repos[0]!.branch, 'main');
   } finally {
     await f.dispose();
   }
@@ -585,12 +946,20 @@ test('面板含 GitHub 追踪页，内嵌脚本可编译', () => {
   assert.match(html, /data-page="github"/);
   assert.match(html, /id="page-github"/);
   assert.match(html, /id="gh_settings"/);
+  assert.match(html, /id="gh_mode"/);
+  assert.match(html, /id="gh_repos"/);
+  assert.match(html, /function renderGithubRepos/);
   assert.match(html, /\/api\/github\/state/);
   assert.match(html, /\/api\/github\/config/);
   // 「下次检查」必须是独立的节点，由 1 秒定时器本地刷新，而不是只在 10 秒拉取时重算
   assert.match(html, /id="gh_nextPoll"/);
   assert.match(html, /function updateGithubCountdown/);
   assert.match(html, /setInterval\(updateGithubCountdown, 1000\)/);
+  // 设置改动后自动保存并热更新，而不是必须手动点保存
+  assert.match(html, /GH_AUTO_SAVE_MS/);
+  assert.match(html, /saveGithubConfig\(true\)/);
+  assert.match(html, /自动保存中/);
+  assert.match(html, /if \(ghDirty && ghState\)/);
   const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)];
   assert.ok(scripts.length > 0);
   for (const script of scripts) new vm.Script(script[1]!);

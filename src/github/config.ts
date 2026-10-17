@@ -68,17 +68,44 @@ export const DEFAULT_GITHUB_EVENT_TYPES: GithubEventType[] = [
 ];
 
 export const GITHUB_AUTHOR_LIMIT = 50;
+export const GITHUB_REPO_LIMIT = 50;
 export const GITHUB_TARGET_LIMIT = 50;
 export const GITHUB_MAX_EVENTS_PER_POLL = 20;
 export const GITHUB_MAX_EVENT_AGE_HOURS = 168;
 
+/** 追踪模式：作者动态、仓库订阅，或两者同时 */
+export const GITHUB_MODES = ['authors', 'repos', 'both'] as const;
+export type GithubMode = (typeof GITHUB_MODES)[number];
+export const GITHUB_MODE_LABELS: Record<GithubMode, string> = {
+  authors: '作者动态',
+  repos: '仓库订阅',
+  both: '作者动态 + 仓库订阅',
+};
+
+/** 仓库订阅产生的事件类型（不是 GitHub Events API 的 type） */
+export const GITHUB_REPO_PUSH_TYPE = 'RepoPush';
+export const GITHUB_REPO_RELEASE_TYPE = 'RepoRelease';
+export const GITHUB_REPO_EVENT_TYPES = [GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE] as const;
+
 /** GitHub 用户名：1~39 个字母数字或短横线，不能以短横线开头/结尾 */
 const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+/** 仓库：owner/repo；owner 与 repo 都只允许 GitHub 常见字符 */
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9_.-]{1,100}$/;
 /** 会话：group:群号 / private:QQ号，4~12 位数字（与 trigger 白名单一致） */
 const SCOPE_RE = /^(group|private):([1-9]\d{3,11})$/;
 
 export const GithubAuthorSchema = z.object({
   login: z.string().min(1).max(39),
+  enabled: z.boolean().default(true),
+});
+
+export const GithubRepoSchema = z.object({
+  /** owner/repo，大小写不敏感；面板保留用户输入的写法 */
+  repo: z.string().min(3).max(201),
+  /** 分支；留空表示使用仓库默认分支 */
+  branch: z.string().max(200).default(''),
+  /** 是否同时订阅 Release（新版本发布） */
+  releases: z.boolean().default(true),
   enabled: z.boolean().default(true),
 });
 
@@ -89,11 +116,13 @@ export const GithubTargetSchema = z.object({
 
 export const GithubConfigSchema = z.object({
   enabled: z.boolean().default(false),
+  /** 作者动态 / 仓库订阅 / 两者；老配置没有该字段时默认沿用作者动态 */
+  mode: z.enum(GITHUB_MODES).default('authors'),
   /** 轮询间隔（秒）；GitHub 官方建议轮询不要太频繁 */
   intervalSec: z.number().int().min(60).max(3600).default(300),
-  /** 单个作者每轮最多推送多少条，超出的下一轮继续 */
+  /** 单个作者/仓库每轮最多推送多少条，超出的下一轮继续 */
   maxEventsPerPoll: z.number().int().min(1).max(GITHUB_MAX_EVENTS_PER_POLL).default(5),
-  /** 超过这个时长的旧动态直接忽略，避免停机后补发陈年事件 */
+  /** 超过这个时长的旧动态直接忽略，避免停机后补发陈年事件；仓库订阅不受此限制 */
   maxEventAgeHours: z.number().int().min(1).max(GITHUB_MAX_EVENT_AGE_HOURS).default(24),
   /** GitHub API 基址（GitHub Enterprise 可改） */
   apiBase: z.string().max(300).default('https://api.github.com'),
@@ -101,11 +130,13 @@ export const GithubConfigSchema = z.object({
   token: z.string().max(500).default(''),
   eventTypes: z.array(z.enum(GITHUB_EVENT_TYPES)).max(GITHUB_EVENT_TYPES.length).default([...DEFAULT_GITHUB_EVENT_TYPES]),
   authors: z.array(GithubAuthorSchema).max(GITHUB_AUTHOR_LIMIT).default([]),
+  repos: z.array(GithubRepoSchema).max(GITHUB_REPO_LIMIT).default([]),
   targets: z.array(GithubTargetSchema).max(GITHUB_TARGET_LIMIT).default([]),
 });
 
 export type GithubConfig = z.infer<typeof GithubConfigSchema>;
 export type GithubAuthorConfig = z.infer<typeof GithubAuthorSchema>;
+export type GithubRepoConfig = z.infer<typeof GithubRepoSchema>;
 export type GithubTargetConfig = z.infer<typeof GithubTargetSchema>;
 
 /** 面板可见的配置：永不返回 Token 明文，只告诉前端有没有设置 */
@@ -194,6 +225,50 @@ function normalizeAuthors(value: unknown): GithubAuthorConfig[] {
   return out;
 }
 
+function normalizeMode(value: unknown): GithubMode {
+  if (typeof value !== 'string') throw new Error('追踪模式需要是字符串');
+  if (!(GITHUB_MODES as readonly string[]).includes(value)) {
+    throw new Error(`不支持的追踪模式「${value}」（可选：authors / repos / both）`);
+  }
+  return value as GithubMode;
+}
+
+/** 分支名：允许斜杠；拒绝空白、控制字符和明显不安全的路径片段 */
+function normalizeBranch(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') throw new Error('分支名需要是字符串');
+  const branch = value.trim();
+  if (branch.length > 200) throw new Error('分支名过长（最多 200 字符）');
+  if (/[\s\u0000-\u001f\u007f]/.test(branch)) throw new Error('分支名不能包含空白或控制字符');
+  if (branch.startsWith('/') || branch.endsWith('/') || branch.includes('..')) {
+    throw new Error('分支名不合法');
+  }
+  return branch;
+}
+
+function normalizeRepos(value: unknown): GithubRepoConfig[] {
+  if (!Array.isArray(value)) throw new Error('订阅仓库需要是数组');
+  const out: GithubRepoConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const raw = typeof item === 'string' ? { repo: item } : item;
+    if (!isRecord(raw)) throw new Error('仓库条目格式不正确');
+    const repo = String(raw['repo'] ?? '').trim();
+    if (!REPO_RE.test(repo)) {
+      throw new Error(`仓库「${repo}」不合法，应为 owner/repo（只允许字母、数字、点、下划线和短横线）`);
+    }
+    const branch = normalizeBranch(raw['branch']);
+    const releases = typeof raw['releases'] === 'boolean' ? raw['releases'] : true;
+    const enabled = typeof raw['enabled'] === 'boolean' ? raw['enabled'] : true;
+    const key = repo.toLowerCase();
+    if (seen.has(key)) continue; // 仓库大小写不敏感，按小写去重
+    seen.add(key);
+    out.push({ repo, branch, releases, enabled });
+  }
+  if (out.length > GITHUB_REPO_LIMIT) throw new Error(`最多订阅 ${GITHUB_REPO_LIMIT} 个仓库`);
+  return out;
+}
+
 function normalizeTargets(value: unknown): GithubTargetConfig[] {
   if (!Array.isArray(value)) throw new Error('推送会话需要是数组');
   const out: GithubTargetConfig[] = [];
@@ -230,6 +305,7 @@ export function validateGithubConfig(
     ...current,
     eventTypes: [...current.eventTypes],
     authors: current.authors.map((a) => ({ ...a })),
+    repos: current.repos.map((r) => ({ ...r })),
     targets: current.targets.map((t) => ({ ...t })),
   };
 
@@ -238,6 +314,7 @@ export function validateGithubConfig(
       if (typeof input['enabled'] !== 'boolean') throw new Error('启用开关需要是布尔值');
       config.enabled = input['enabled'];
     }
+    if (input['mode'] !== undefined) config.mode = normalizeMode(input['mode']);
     if (input['intervalSec'] !== undefined) {
       config.intervalSec = integerValue(input['intervalSec'], '轮询间隔', 60, 3600);
     }
@@ -251,6 +328,7 @@ export function validateGithubConfig(
     if (input['token'] !== undefined) config.token = normalizeToken(input['token']);
     if (input['eventTypes'] !== undefined) config.eventTypes = normalizeEventTypes(input['eventTypes']);
     if (input['authors'] !== undefined) config.authors = normalizeAuthors(input['authors']);
+    if (input['repos'] !== undefined) config.repos = normalizeRepos(input['repos']);
     if (input['targets'] !== undefined) config.targets = normalizeTargets(input['targets']);
   } catch (e) {
     return { ok: false, error: (e as Error).message };
@@ -294,6 +372,7 @@ export function saveGithubConfig(root: string, config: GithubConfig): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const header = [
     '# GitHub 动态追踪配置：由管理面板「GitHub 追踪」页维护，手改也可以。',
+    '# mode: authors = 作者动态（events/public）, repos = 仓库订阅（commits/releases）, both = 两者。',
     '# 这里可能包含 GitHub Token（私密信息），config/github.yaml 已在 .gitignore 中，请勿提交。',
     '',
   ].join('\n');

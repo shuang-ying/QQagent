@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -291,10 +291,12 @@ CREATE TABLE IF NOT EXISTS reply_deliveries (
 );
 
 -- ============================================================
--- GitHub 作者动态追踪（面板「GitHub 追踪」页）
+-- GitHub 动态追踪（面板「GitHub 追踪」页；作者 + 仓库订阅）
 --   github_events      已拉取的事件：去重 + 待推送队列 + 面板历史
+--                      type=RepoPush/RepoRelease 表示仓库订阅产生的事件
 --   github_deliveries  每个事件在每个会话的投递结果（用于重试时跳过已成功的会话）
 --   github_authors     每个作者的 ETag 与基线时间（首次拉取只建基线，不推送历史）
+--   github_repos       每个订阅仓库的 HEAD SHA、Release 基线（首次轮询只建基线）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS github_events (
   event_id    TEXT PRIMARY KEY,
@@ -328,6 +330,17 @@ CREATE TABLE IF NOT EXISTS github_authors (
   baseline_at INTEGER NOT NULL DEFAULT 0,
   last_polled_at INTEGER NOT NULL DEFAULT 0,
   last_event_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS github_repos (
+  repo TEXT PRIMARY KEY,
+  branch TEXT NOT NULL DEFAULT '',
+  head_sha TEXT NOT NULL DEFAULT '',
+  baseline_at INTEGER NOT NULL DEFAULT 0,
+  release_id INTEGER NOT NULL DEFAULT 0,
+  release_tag TEXT NOT NULL DEFAULT '',
+  release_baseline_at INTEGER NOT NULL DEFAULT 0,
+  last_polled_at INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT ''
 );
 `;

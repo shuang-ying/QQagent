@@ -1,15 +1,20 @@
 /**
- * GitHub 作者动态追踪器
+ * GitHub 动态追踪器
  *
- * 工作方式：
- *   1. 按 intervalSec 轮询每个作者的公开事件（/users/{login}/events/public）
- *   2. 首次成功轮询只建立基线（历史事件记为 skipped，不推送），避免加人时刷屏
- *   3. 新事件写入 github_events，按 occurred_at 顺序推送
- *   4. 推送目标是**本功能页自己配置的会话**（config/github.yaml 的 targets），
- *      完全不走 trigger 里的群/用户白名单 —— 面板上单独设置，互不影响
- *   5. OneBot 离线或某个会话发送失败时保留 pending，下轮补发；超过重试上限/48 小时转 failed
+ * 支持两种模式（config/github.yaml 的 mode）：
+ *   - authors：轮询作者的公开事件（/users/{login}/events/public）
+ *   - repos：订阅指定仓库，按分支比对 HEAD SHA（/repos/{owner}/{repo}/commits），
+ *            并轮询 Release（/releases）；不依赖 events 的缓存，更即时
+ *   - both：两者同时
  *
- * 去重与重试都落 SQLite（github_events / github_deliveries / github_authors），
+ * 首次成功轮询只建立基线（作者历史事件、仓库当前 HEAD/最新 Release 记为 skipped），
+ * 不推送历史；之后的新事件写入 github_events，按 occurred_at 顺序推送。
+ *
+ * 推送目标是**本功能页自己配置的会话**（config/github.yaml 的 targets），
+ * 完全不走 trigger 里的群/用户白名单。
+ * OneBot 离线或某个会话发送失败时保留 pending，下轮补发；超过重试上限/48 小时转 failed。
+ *
+ * 去重与重试都落 SQLite（github_events / github_deliveries / github_authors / github_repos），
  * 重启不会把同一批事件再发一遍。
  */
 import type { Logger } from '../core/logger.js';
@@ -19,11 +24,14 @@ import type { MemoryStore } from '../memory/store.js';
 import {
   GITHUB_EVENT_LABELS,
   GITHUB_EVENT_TYPES,
+  GITHUB_REPO_PUSH_TYPE,
+  GITHUB_REPO_RELEASE_TYPE,
   publicGithubConfig,
   saveGithubConfig,
   validateGithubConfig,
   type GithubAuthorConfig,
   type GithubConfig,
+  type GithubRepoConfig,
   type GithubTargetConfig,
   type PublicGithubConfig,
 } from './config.js';
@@ -33,6 +41,9 @@ import {
   parseGithubEvent,
   renderGithubEvent,
   renderGithubTestMessage,
+  renderRepoPush,
+  renderRepoRelease,
+  safeGithubUrl,
 } from './format.js';
 
 /** 只依赖 sendToScope，OneBotAction 与本接口结构化兼容，测试里可以换成假实现 */
@@ -93,6 +104,20 @@ export interface GithubAuthorView {
   pending: number;
 }
 
+export interface GithubRepoView {
+  repo: string;
+  branch: string;
+  releases: boolean;
+  enabled: boolean;
+  baselineAt: number;
+  headSha: string;
+  lastPolledAt: number;
+  lastError: string;
+  releaseTag: string;
+  total: number;
+  pending: number;
+}
+
 export interface GithubTargetView {
   scope: string;
   enabled: boolean;
@@ -138,6 +163,7 @@ export interface GithubSnapshot {
     rate: { limit: number | null; remaining: number | null; resetAt: number | null };
   };
   authors: GithubAuthorView[];
+  repos: GithubRepoView[];
   targets: GithubTargetView[];
   knownSessions: Array<{ scope: string; title: string; lastActive: number }>;
   recentEvents: GithubEventView[];
@@ -152,6 +178,36 @@ interface AuthorRow {
   last_polled_at: number;
   last_event_at: number;
   last_error: string;
+}
+
+interface RepoRow {
+  repo: string;
+  branch: string;
+  head_sha: string;
+  baseline_at: number;
+  release_id: number;
+  release_tag: string;
+  release_baseline_at: number;
+  last_polled_at: number;
+  last_error: string;
+}
+
+interface RepoCommit {
+  sha: string;
+  author: string;
+  message: string;
+  date: number;
+  url: string;
+}
+
+interface RepoReleaseData {
+  id: number;
+  tag: string;
+  name: string;
+  body: string;
+  prerelease: boolean;
+  url: string;
+  publishedAt: number;
 }
 
 interface EventRow {
@@ -177,6 +233,10 @@ const MAX_DELIVERY_ATTEMPTS = 3;
 const MAX_DELIVERY_AGE_MS = 48 * 3600_000;
 /** 已完成/已跳过记录的保留天数 */
 const HISTORY_RETENTION_DAYS = 30;
+/** 仓库订阅每轮拉取的提交数；通常只需前几条就能找到上一次的 HEAD */
+const REPO_COMMIT_PAGE_SIZE = 50;
+/** 仓库订阅每轮拉取的 Release 数 */
+const REPO_RELEASE_PAGE_SIZE = 10;
 
 function headerNumber(headers: GithubHttpResponse['headers'], name: string): number | null {
   const raw = headers.get(name);
@@ -189,12 +249,93 @@ function toNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : Number(value) || 0;
 }
 
+function parseDate(value: unknown): number {
+  if (typeof value !== 'string') return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function repoPath(repo: string): string {
+  return repo.split('/').map((part) => encodeURIComponent(part)).join('/');
+}
+
+function repoOwner(repo: string): string {
+  return repo.split('/')[0] ?? '';
+}
+
+function shortSha(sha: string): string {
+  return cleanGithubText(sha, 40).slice(0, 7);
+}
+
+function repoCommitInfo(raw: unknown): RepoCommit | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const item = raw as Record<string, unknown>;
+  const sha = typeof item['sha'] === 'string' ? item['sha'].trim() : '';
+  if (!sha) return null;
+  const commit = item['commit'];
+  let message = '';
+  let authorName = '';
+  let date = 0;
+  if (typeof commit === 'object' && commit !== null && !Array.isArray(commit)) {
+    const c = commit as Record<string, unknown>;
+    message = typeof c['message'] === 'string' ? c['message'] : '';
+    const author = c['author'];
+    if (typeof author === 'object' && author !== null && !Array.isArray(author)) {
+      const a = author as Record<string, unknown>;
+      authorName = typeof a['name'] === 'string' ? a['name'] : '';
+      date = parseDate(a['date']);
+    }
+  }
+  const actor = item['author'];
+  const login =
+    typeof actor === 'object' && actor !== null && !Array.isArray(actor) && typeof (actor as Record<string, unknown>)['login'] === 'string'
+      ? String((actor as Record<string, unknown>)['login'])
+      : '';
+  return {
+    sha,
+    author: login || authorName || '未知作者',
+    message,
+    date,
+    url: safeGithubUrl(item['html_url']),
+  };
+}
+
+function repoReleaseData(raw: unknown): RepoReleaseData | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const item = raw as Record<string, unknown>;
+  const id = toNumber(item['id']);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  if (item['draft'] === true) return null;
+  const tag = typeof item['tag_name'] === 'string' ? item['tag_name'] : '';
+  const name = typeof item['name'] === 'string' ? item['name'] : '';
+  const body = typeof item['body'] === 'string' ? item['body'] : '';
+  const prerelease = item['prerelease'] === true;
+  const url = safeGithubUrl(item['html_url']);
+  const publishedAt =
+    parseDate(item['published_at']) || parseDate(item['created_at']) || Date.now();
+  return { id, tag, name, body, prerelease, url, publishedAt };
+}
+
 /** 作者列表是否只是同一批人（用户名大小写不敏感），用于判断保存后要不要立刻补一轮 */
 function sameAuthors(a: GithubAuthorConfig[], b: GithubAuthorConfig[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((item, index) => {
     const other = b[index]!;
     return item.login.toLowerCase() === other.login.toLowerCase() && item.enabled === other.enabled;
+  });
+}
+
+/** 订阅仓库列表是否只是同一批配置 */
+function sameRepos(a: GithubRepoConfig[], b: GithubRepoConfig[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((item, index) => {
+    const other = b[index]!;
+    return (
+      item.repo.toLowerCase() === other.repo.toLowerCase() &&
+      item.branch === other.branch &&
+      item.releases === other.releases &&
+      item.enabled === other.enabled
+    );
   });
 }
 
@@ -280,7 +421,13 @@ export class GithubTracker {
     saveGithubConfig(this.root, result.config);
     this.applyConfig(result.config);
     this.log.info(
-      { enabled: result.config.enabled, authors: result.config.authors.length, targets: result.config.targets.length },
+      {
+        enabled: result.config.enabled,
+        mode: result.config.mode,
+        authors: result.config.authors.length,
+        repos: result.config.repos.length,
+        targets: result.config.targets.length,
+      },
       'GitHub 追踪设置已保存并热生效',
     );
     return result.config;
@@ -338,9 +485,17 @@ export class GithubTracker {
       (
         this.store.db
           .prepare(
-            "SELECT lower(login) AS key, COUNT(*) AS total, SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END) AS pending FROM github_events GROUP BY lower(login)",
+            `SELECT lower(login) AS key, COUNT(*) AS total,
+                    SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END) AS pending
+             FROM github_events
+             WHERE type NOT IN (?,?)
+             GROUP BY lower(login)`,
           )
-          .all() as unknown as Array<{ key: string; total: number; pending: number | null }>
+          .all(GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE) as unknown as Array<{
+            key: string;
+            total: number;
+            pending: number | null;
+          }>
       ).map((row) => [row.key, { total: toNumber(row.total), pending: toNumber(row.pending) }]),
     );
     const authors: GithubAuthorView[] = this.cfg.authors.map((author) => {
@@ -354,6 +509,42 @@ export class GithubTracker {
         lastPolledAt: row?.last_polled_at ?? 0,
         lastEventAt: row?.last_event_at ?? 0,
         lastError: row?.last_error ?? '',
+        total: stat?.total ?? 0,
+        pending: stat?.pending ?? 0,
+      };
+    });
+
+    const repoStats = new Map(
+      (
+        this.store.db
+          .prepare(
+            `SELECT lower(repo) AS key, COUNT(*) AS total,
+                    SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END) AS pending
+             FROM github_events
+             WHERE type IN (?,?)
+             GROUP BY lower(repo)`,
+          )
+          .all(GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE) as unknown as Array<{
+            key: string;
+            total: number;
+            pending: number | null;
+          }>
+      ).map((row) => [row.key, { total: toNumber(row.total), pending: toNumber(row.pending) }]),
+    );
+    const repos: GithubRepoView[] = this.cfg.repos.map((repo) => {
+      const key = repo.repo.toLowerCase();
+      const row = this.repoRow(key);
+      const stat = repoStats.get(key);
+      return {
+        repo: repo.repo,
+        branch: repo.branch,
+        releases: repo.releases,
+        enabled: repo.enabled,
+        baselineAt: row?.baseline_at ?? 0,
+        headSha: row?.head_sha ?? '',
+        lastPolledAt: row?.last_polled_at ?? 0,
+        lastError: row?.last_error ?? '',
+        releaseTag: row?.release_tag ?? '',
         total: stat?.total ?? 0,
         pending: stat?.pending ?? 0,
       };
@@ -441,6 +632,7 @@ export class GithubTracker {
         rate: { limit: this.rateLimit, remaining: this.rateRemaining, resetAt: this.rateResetAt },
       },
       authors,
+      repos,
       targets,
       knownSessions,
       recentEvents,
@@ -497,20 +689,52 @@ export class GithubTracker {
     if (this.rateBlockedUntil > startedAt) {
       errors.push(`GitHub 接口限额已用尽，${formatGithubTime(this.rateBlockedUntil, this.timezone)} 后恢复`);
     } else {
-      for (const author of this.cfg.authors.filter((a) => a.enabled)) {
-        if (this.stopped) break;
-        try {
-          fetched += await this.pollAuthor(author, startedAt);
-        } catch (e) {
-          const message = cleanGithubText((e as Error).message, 300) || '未知错误';
-          this.markAuthorError(author.login, message);
-          errors.push(`${author.login}：${message}`);
-          this.log.warn(
-            { githubAuthor: author.login, ...errorDetails(e), reason: message },
-            'GitHub 作者动态拉取失败',
-          );
+      if (this.tracksAuthors()) {
+        for (const author of this.cfg.authors.filter((a) => a.enabled)) {
+          if (this.stopped) break;
+          try {
+            fetched += await this.pollAuthor(author, startedAt);
+          } catch (e) {
+            const message = cleanGithubText((e as Error).message, 300) || '未知错误';
+            this.markAuthorError(author.login, message);
+            errors.push(`${author.login}：${message}`);
+            this.log.warn(
+              { githubAuthor: author.login, ...errorDetails(e), reason: message },
+              'GitHub 作者动态拉取失败',
+            );
+          }
+          if (this.rateRemaining === 0) break;
         }
-        if (this.rateRemaining === 0) break;
+      }
+
+      if (this.tracksRepos() && this.rateRemaining !== 0) {
+        for (const repo of this.cfg.repos.filter((r) => r.enabled)) {
+          if (this.stopped || this.rateRemaining === 0) break;
+          try {
+            fetched += await this.pollRepoCommits(repo, startedAt);
+          } catch (e) {
+            const message = cleanGithubText((e as Error).message, 300) || '未知错误';
+            this.markRepoError(repo.repo, message);
+            errors.push(`${repo.repo}：${message}`);
+            this.log.warn(
+              { githubRepo: repo.repo, ...errorDetails(e), reason: message },
+              'GitHub 仓库提交拉取失败',
+            );
+          }
+          if (this.rateRemaining === 0) break;
+          if (!repo.releases) continue;
+          try {
+            fetched += await this.pollRepoReleases(repo, startedAt);
+          } catch (e) {
+            const message = cleanGithubText((e as Error).message, 300) || '未知错误';
+            this.markRepoError(repo.repo, message);
+            errors.push(`${repo.repo} Release：${message}`);
+            this.log.warn(
+              { githubRepo: repo.repo, ...errorDetails(e), reason: message },
+              'GitHub 仓库 Release 拉取失败',
+            );
+          }
+        }
       }
     }
 
@@ -537,12 +761,7 @@ export class GithubTracker {
   private async pollAuthor(author: GithubAuthorConfig, now: number): Promise<number> {
     const key = author.login.toLowerCase();
     const row = this.ensureAuthorRow(key);
-    const headers: Record<string, string> = {
-      accept: 'application/vnd.github+json',
-      'user-agent': 'qq-agent-github-tracker',
-      'x-github-api-version': '2022-11-28',
-    };
-    if (this.cfg.token) headers['authorization'] = `Bearer ${this.cfg.token}`;
+    const headers = this.apiHeaders();
     if (row.etag) headers['if-none-match'] = row.etag;
 
     const url = `${this.cfg.apiBase}/users/${encodeURIComponent(author.login)}/events/public?per_page=30`;
@@ -634,6 +853,296 @@ export class GithubTracker {
     return pending;
   }
 
+  private tracksAuthors(): boolean {
+    return this.cfg.mode === 'authors' || this.cfg.mode === 'both';
+  }
+
+  private tracksRepos(): boolean {
+    return this.cfg.mode === 'repos' || this.cfg.mode === 'both';
+  }
+
+  private apiHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      accept: 'application/vnd.github+json',
+      'user-agent': 'qq-agent-github-tracker',
+      'x-github-api-version': '2022-11-28',
+    };
+    if (this.cfg.token) headers['authorization'] = `Bearer ${this.cfg.token}`;
+    return headers;
+  }
+
+  /** 统一把非 2xx 响应转成中文错误；403/429 且剩余为 0 时给出重置时间 */
+  private async githubFailure(response: GithubHttpResponse): Promise<string> {
+    const body = await this.readErrorBody(response);
+    if (response.status === 404) return '仓库或分支不存在，或 Token 无权访问';
+    if ((response.status === 403 || response.status === 429) && this.rateRemaining === 0) {
+      return this.rateResetAt
+        ? `GitHub 接口限额已用尽，${formatGithubTime(this.rateResetAt, this.timezone)} 后恢复`
+        : 'GitHub 接口限额已用尽，请稍后重试';
+    }
+    return `GitHub 返回 ${response.status}${body ? `：${body}` : ''}`;
+  }
+
+  // ============================================================
+  // 仓库订阅：commits / releases
+  // ============================================================
+
+  private async pollRepoCommits(repo: GithubRepoConfig, now: number): Promise<number> {
+    const key = repo.repo.toLowerCase();
+    const row = this.ensureRepoRow(key);
+    const branchQuery = repo.branch ? `&sha=${encodeURIComponent(repo.branch)}` : '';
+    const requestUrl = `${this.cfg.apiBase}/repos/${repoPath(repo.repo)}/commits?per_page=${REPO_COMMIT_PAGE_SIZE}${branchQuery}`;
+    const response = await this.fetchImpl(requestUrl, {
+      headers: this.apiHeaders(),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    this.updateRate(response.headers);
+    if (!response.ok) throw new Error(await this.githubFailure(response));
+
+    const body: unknown = await response.json();
+    if (!Array.isArray(body)) throw new Error('GitHub 响应格式不正确（不是提交数组）');
+    const commits = body
+      .map(repoCommitInfo)
+      .filter((item): item is RepoCommit => item !== null);
+    const head = commits[0];
+    if (!head) throw new Error('仓库没有可读取的提交（分支可能为空）');
+
+    // 分支被修改（或首次以指定分支订阅）时，旧分支的 HEAD 不能用来比较，
+    // 直接以新分支当前 HEAD 重建基线，避免把整段历史当成“新提交”。
+    if (row.branch !== repo.branch) {
+      this.store.db
+        .prepare(
+          'UPDATE github_repos SET head_sha=?, branch=?, baseline_at=?, last_polled_at=?, last_error=? WHERE repo=?',
+        )
+        .run(head.sha, repo.branch, now, now, '', key);
+      this.log.info(
+        { githubRepo: repo.repo, branch: repo.branch || '默认分支', headSha: shortSha(head.sha) },
+        'GitHub 仓库分支已变更，重建 HEAD 基线',
+      );
+      return 0;
+    }
+
+    if (row.baseline_at === 0) {
+      this.store.db
+        .prepare(
+          'UPDATE github_repos SET head_sha=?, branch=?, baseline_at=?, last_polled_at=?, last_error=? WHERE repo=?',
+        )
+        .run(head.sha, repo.branch, now, now, '', key);
+      this.log.info(
+        { githubRepo: repo.repo, headSha: shortSha(head.sha) },
+        '已建立 GitHub 仓库基线：当前 HEAD 不推送，后续新提交开始追踪',
+      );
+      return 0;
+    }
+
+    if (head.sha === row.head_sha) {
+      this.store.db
+        .prepare('UPDATE github_repos SET last_polled_at=?, last_error=? WHERE repo=?')
+        .run(now, '', key);
+      return 0;
+    }
+
+    let fresh: RepoCommit[] = [];
+    let total = 0;
+    let rewritten = false;
+    const oldIndex = commits.findIndex((item) => item.sha === row.head_sha);
+    if (oldIndex > 0) {
+      fresh = commits.slice(0, oldIndex);
+      total = fresh.length;
+    } else if (oldIndex === 0) {
+      // 理论上不会走到：oldIndex=0 说明旧 HEAD 就是当前 HEAD
+      fresh = [head];
+      total = 1;
+    } else {
+      const compared = await this.compareRepoCommits(repo, row.head_sha, head.sha, head);
+      fresh = compared.commits;
+      total = compared.total;
+      rewritten = compared.rewritten;
+    }
+
+    if (fresh.length === 0) {
+      this.store.db
+        .prepare('UPDATE github_repos SET head_sha=?, last_polled_at=?, last_error=? WHERE repo=?')
+        .run(head.sha, now, '', key);
+      return 0;
+    }
+
+    const branchLabel = repo.branch || '默认分支';
+    const url =
+      total > 1
+        ? `https://github.com/${repo.repo}/compare/${row.head_sha}...${head.sha}`
+        : fresh[0]!.url || head.url || `https://github.com/${repo.repo}/commit/${head.sha}`;
+    const occurredAt = Math.max(...fresh.map((item) => item.date), head.date) || now;
+    const rendered = renderRepoPush(
+      {
+        repo: repo.repo,
+        branch: branchLabel,
+        total,
+        commits: fresh.map((item) => ({ sha: item.sha, author: item.author, message: item.message })),
+        url,
+        occurredAt,
+      },
+      this.timezone,
+    );
+    if (rewritten) rendered.text += '\n· 历史被重写或变更过多，按当前分支最新提交汇总';
+
+    const inserted = this.insertRepoEvent(
+      `repo-push:${key}:${head.sha}`,
+      repoOwner(repo.repo),
+      GITHUB_REPO_PUSH_TYPE,
+      repo.repo,
+      rendered,
+      occurredAt,
+      now,
+    );
+    this.store.db
+      .prepare('UPDATE github_repos SET head_sha=?, last_polled_at=?, last_error=? WHERE repo=?')
+      .run(head.sha, now, '', key);
+    if (inserted > 0) {
+      this.log.info(
+        { githubRepo: repo.repo, commits: total, headSha: shortSha(head.sha) },
+        '发现 GitHub 仓库新提交',
+      );
+    }
+    return inserted;
+  }
+
+  /**
+   * 上一次 HEAD 不在最近 50 条提交里（一次性推了很多，或历史被重写）。
+   * 先试 compare 拿到准确的提交数；失败则退回最新一条并标记 rewritten。
+   */
+  private async compareRepoCommits(
+    repo: GithubRepoConfig,
+    oldSha: string,
+    newSha: string,
+    head: RepoCommit,
+  ): Promise<{ commits: RepoCommit[]; total: number; rewritten: boolean }> {
+    const url = `${this.cfg.apiBase}/repos/${repoPath(repo.repo)}/compare/${oldSha}...${newSha}`;
+    const response = await this.fetchImpl(url, {
+      headers: this.apiHeaders(),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    this.updateRate(response.headers);
+    if (response.status === 403 || response.status === 429) {
+      throw new Error(await this.githubFailure(response));
+    }
+    if (response.ok) {
+      const data: unknown = await response.json();
+      if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+        const record = data as Record<string, unknown>;
+        const raw = Array.isArray(record['commits']) ? record['commits'] : [];
+        const commits = raw.map(repoCommitInfo).filter((item): item is RepoCommit => item !== null);
+        const total = toNumber(record['total_commits']) || commits.length;
+        if (commits.length > 0) return { commits, total, rewritten: false };
+      }
+    }
+    return { commits: [head], total: 1, rewritten: true };
+  }
+
+  private async pollRepoReleases(repo: GithubRepoConfig, now: number): Promise<number> {
+    const key = repo.repo.toLowerCase();
+    const row = this.ensureRepoRow(key);
+    const requestUrl = `${this.cfg.apiBase}/repos/${repoPath(repo.repo)}/releases?per_page=${REPO_RELEASE_PAGE_SIZE}`;
+    const response = await this.fetchImpl(requestUrl, {
+      headers: this.apiHeaders(),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    this.updateRate(response.headers);
+    if (!response.ok) throw new Error(await this.githubFailure(response));
+
+    const body: unknown = await response.json();
+    if (!Array.isArray(body)) throw new Error('GitHub 响应格式不正确（不是 Release 数组）');
+    const releases = body
+      .map(repoReleaseData)
+      .filter((item): item is RepoReleaseData => item !== null);
+
+    if (row.release_baseline_at === 0) {
+      let maxId = 0;
+      let tag = '';
+      for (const release of releases) {
+        if (release.id > maxId) {
+          maxId = release.id;
+          tag = release.tag;
+        }
+      }
+      this.store.db
+        .prepare(
+          'UPDATE github_repos SET release_id=?, release_tag=?, release_baseline_at=?, last_polled_at=?, last_error=? WHERE repo=?',
+        )
+        .run(maxId, tag, now, now, '', key);
+      this.log.info(
+        { githubRepo: repo.repo, release: tag || '（暂无 Release）' },
+        '已建立 GitHub 仓库 Release 基线：历史版本不推送',
+      );
+      return 0;
+    }
+
+    const fresh = releases
+      .filter((release) => release.id > row.release_id)
+      .sort((a, b) => a.id - b.id);
+    if (fresh.length === 0) {
+      this.store.db
+        .prepare('UPDATE github_repos SET last_polled_at=?, last_error=? WHERE repo=?')
+        .run(now, '', key);
+      return 0;
+    }
+
+    let pending = 0;
+    let lastId = row.release_id;
+    let lastTag = row.release_tag;
+    for (const release of fresh.slice(0, this.cfg.maxEventsPerPoll)) {
+      const rendered = renderRepoRelease(
+        repo.repo,
+        {
+          tag: release.tag,
+          name: release.name,
+          body: release.body,
+          prerelease: release.prerelease,
+          url: release.url,
+          publishedAt: release.publishedAt,
+        },
+        this.timezone,
+      );
+      const inserted = this.insertRepoEvent(
+        `repo-release:${key}:${release.id}`,
+        repoOwner(repo.repo),
+        GITHUB_REPO_RELEASE_TYPE,
+        repo.repo,
+        rendered,
+        release.publishedAt,
+        now,
+      );
+      pending += inserted;
+      lastId = release.id;
+      lastTag = release.tag;
+    }
+    this.store.db
+      .prepare('UPDATE github_repos SET release_id=?, release_tag=?, last_polled_at=?, last_error=? WHERE repo=?')
+      .run(lastId, lastTag, now, '', key);
+    if (pending > 0) {
+      this.log.info({ githubRepo: repo.repo, releases: pending, tag: lastTag }, '发现 GitHub 仓库新 Release');
+    }
+    return pending;
+  }
+
+  private insertRepoEvent(
+    eventId: string,
+    login: string,
+    type: string,
+    repo: string,
+    rendered: { summary: string; text: string; url: string },
+    occurredAt: number,
+    now: number,
+  ): number {
+    const result = this.store.db
+      .prepare(
+        `INSERT OR IGNORE INTO github_events(event_id,login,type,repo,summary,text,url,occurred_at,fetched_at,state)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(eventId, login, type, repo, rendered.summary, rendered.text, rendered.url, occurredAt, now, 'pending');
+    return Number(result.changes);
+  }
+
   // ============================================================
   // 推送
   // ============================================================
@@ -646,28 +1155,68 @@ export class GithubTracker {
     // 面板取消某类事件后，已经排队的同类型事件不再补发（保留记录，便于面板查看）
     const enabledTypes = new Set<string>(this.cfg.eventTypes);
     let delivered = 0;
-    for (const author of this.cfg.authors.filter((a) => a.enabled)) {
-      if (this.stopped) break;
-      const rows = this.store.db
-        .prepare(
-          `SELECT * FROM github_events
-           WHERE state='pending' AND lower(login)=?
-           ORDER BY occurred_at ASC LIMIT ?`,
-        )
-        .all(author.login.toLowerCase(), this.cfg.maxEventsPerPoll) as unknown as EventRow[];
-      for (const row of rows) {
+
+    if (this.tracksAuthors()) {
+      for (const author of this.cfg.authors.filter((a) => a.enabled)) {
         if (this.stopped) break;
-        if (!enabledTypes.has(row.type)) {
-          this.markEvent(row.event_id, 'skipped', '事件类型已在面板取消', row.attempts);
-          continue;
+        const rows = this.store.db
+          .prepare(
+            `SELECT * FROM github_events
+             WHERE state='pending' AND lower(login)=? AND type NOT IN (?,?)
+             ORDER BY occurred_at ASC LIMIT ?`,
+          )
+          .all(
+            author.login.toLowerCase(),
+            GITHUB_REPO_PUSH_TYPE,
+            GITHUB_REPO_RELEASE_TYPE,
+            this.cfg.maxEventsPerPoll,
+          ) as unknown as EventRow[];
+        for (const row of rows) {
+          if (this.stopped) break;
+          if (!enabledTypes.has(row.type)) {
+            this.markEvent(row.event_id, 'skipped', '事件类型已在面板取消', row.attempts);
+            continue;
+          }
+          if (!row.text) {
+            this.markEvent(row.event_id, 'skipped', '事件正文为空', row.attempts);
+            continue;
+          }
+          const outcome = await this.deliverEvent(row, now);
+          if (outcome === 'sent') delivered++;
+          if (outcome === 'offline') return delivered;
         }
-        if (!row.text) {
-          this.markEvent(row.event_id, 'skipped', '事件正文为空', row.attempts);
-          continue;
+      }
+    }
+
+    if (this.tracksRepos()) {
+      for (const repo of this.cfg.repos.filter((r) => r.enabled)) {
+        if (this.stopped) break;
+        const rows = this.store.db
+          .prepare(
+            `SELECT * FROM github_events
+             WHERE state='pending' AND lower(repo)=? AND type IN (?,?)
+             ORDER BY occurred_at ASC LIMIT ?`,
+          )
+          .all(
+            repo.repo.toLowerCase(),
+            GITHUB_REPO_PUSH_TYPE,
+            GITHUB_REPO_RELEASE_TYPE,
+            this.cfg.maxEventsPerPoll,
+          ) as unknown as EventRow[];
+        for (const row of rows) {
+          if (this.stopped) break;
+          if (row.type === GITHUB_REPO_RELEASE_TYPE && !repo.releases) {
+            this.markEvent(row.event_id, 'skipped', '仓库已取消 Release 订阅', row.attempts);
+            continue;
+          }
+          if (!row.text) {
+            this.markEvent(row.event_id, 'skipped', '事件正文为空', row.attempts);
+            continue;
+          }
+          const outcome = await this.deliverEvent(row, now);
+          if (outcome === 'sent') delivered++;
+          if (outcome === 'offline') return delivered;
         }
-        const outcome = await this.deliverEvent(row, now);
-        if (outcome === 'sent') delivered++;
-        if (outcome === 'offline') return delivered;
       }
     }
     return delivered;
@@ -753,7 +1302,12 @@ export class GithubTracker {
 
   private applyConfig(next: GithubConfig): void {
     const previous = this.cfg;
+    const authChanged = previous.token !== next.token || previous.apiBase !== next.apiBase;
     this.cfg = next;
+
+    // 旧的限额/阻塞来自上一组凭证。最常见的情况是匿名 60 次/小时用完后才填 Token；
+    // 如果继续沿用旧的 rateBlockedUntil，新 Token 要等到旧的 reset 时间才生效。
+    if (authChanged) this.resetRateState();
 
     // 作者被移除/暂停后，不再补发它遗留的待推送事件
     this.skipInactivePending();
@@ -761,31 +1315,84 @@ export class GithubTracker {
     if (this.stopped) return;
     const turnedOn = !previous.enabled && next.enabled;
     const authorsChanged = !sameAuthors(previous.authors, next.authors);
+    const reposChanged = !sameRepos(previous.repos, next.repos);
     const targetsChanged = !sameTargets(previous.targets, next.targets);
-    if (turnedOn || previous.intervalSec !== next.intervalSec) {
-      this.scheduleNext(turnedOn ? 0 : next.intervalSec * 1000);
-    } else if (next.enabled && (authorsChanged || targetsChanged)) {
-      // 新加作者要尽快建立基线；新加/恢复推送会话要尽快补发积压事件。
-      // 这里只提前一轮，不改写轮询间隔。
+    const modeChanged = previous.mode !== next.mode;
+    if (turnedOn) {
+      this.scheduleNext(0);
+    } else if (next.enabled && (authChanged || authorsChanged || reposChanged || targetsChanged || modeChanged)) {
+      // 新 Token / 新作者 / 新仓库 / 新模式 / 新会话都尽快跑一轮：
+      // 验证凭证、建立基线、补发积压。这里只提前一轮，不改写轮询间隔。
       this.scheduleNext(1_000);
+    } else if (previous.intervalSec !== next.intervalSec) {
+      this.scheduleNext(next.intervalSec * 1000);
     }
   }
 
-  /** 把「作者已停用/移除」的待推送事件标记为 skipped */
+  /** 凭证或 API 地址变了，上一次响应里的限额信息不再适用于新凭证 */
+  private resetRateState(): void {
+    this.rateLimit = null;
+    this.rateRemaining = null;
+    this.rateResetAt = null;
+    this.rateBlockedUntil = 0;
+    this.lastError = '';
+  }
+
+  /** 把「已停用/移除/切换模式后不再追踪」的待推送事件标记为 skipped */
   private skipInactivePending(): void {
-    const activeKeys = this.cfg.authors.filter((a) => a.enabled).map((a) => a.login.toLowerCase());
-    if (activeKeys.length > 0) {
-      const placeholders = activeKeys.map(() => '?').join(',');
+    const activeAuthors = this.tracksAuthors()
+      ? this.cfg.authors.filter((a) => a.enabled).map((a) => a.login.toLowerCase())
+      : [];
+    if (activeAuthors.length > 0) {
+      const placeholders = activeAuthors.map(() => '?').join(',');
       this.store.db
         .prepare(
           `UPDATE github_events SET state='skipped', last_error=?
-           WHERE state='pending' AND lower(login) NOT IN (${placeholders})`,
+           WHERE state='pending' AND type NOT IN (?,?)
+             AND lower(login) NOT IN (${placeholders})`,
         )
-        .run('作者已暂停或移除', ...activeKeys);
+        .run('作者已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE, ...activeAuthors);
     } else {
       this.store.db
-        .prepare("UPDATE github_events SET state='skipped', last_error=? WHERE state='pending'")
-        .run('作者已暂停或移除');
+        .prepare(
+          `UPDATE github_events SET state='skipped', last_error=?
+           WHERE state='pending' AND type NOT IN (?,?)`,
+        )
+        .run('作者已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE);
+    }
+
+    const activeRepos = this.tracksRepos()
+      ? this.cfg.repos.filter((r) => r.enabled).map((r) => r.repo.toLowerCase())
+      : [];
+    if (activeRepos.length > 0) {
+      const placeholders = activeRepos.map(() => '?').join(',');
+      this.store.db
+        .prepare(
+          `UPDATE github_events SET state='skipped', last_error=?
+           WHERE state='pending' AND type IN (?,?)
+             AND lower(repo) NOT IN (${placeholders})`,
+        )
+        .run('仓库已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE, ...activeRepos);
+    } else {
+      this.store.db
+        .prepare(
+          `UPDATE github_events SET state='skipped', last_error=?
+           WHERE state='pending' AND type IN (?,?)`,
+        )
+        .run('仓库已暂停或移除', GITHUB_REPO_PUSH_TYPE, GITHUB_REPO_RELEASE_TYPE);
+    }
+
+    const noReleaseRepos = this.cfg.repos
+      .filter((r) => r.enabled && !r.releases)
+      .map((r) => r.repo.toLowerCase());
+    if (noReleaseRepos.length > 0) {
+      const placeholders = noReleaseRepos.map(() => '?').join(',');
+      this.store.db
+        .prepare(
+          `UPDATE github_events SET state='skipped', last_error=?
+           WHERE state='pending' AND type=? AND lower(repo) IN (${placeholders})`,
+        )
+        .run('仓库已取消 Release 订阅', GITHUB_REPO_RELEASE_TYPE, ...noReleaseRepos);
     }
   }
 
@@ -807,6 +1414,27 @@ export class GithubTracker {
     this.ensureAuthorRow(key);
     this.store.db
       .prepare('UPDATE github_authors SET last_error=?, last_polled_at=? WHERE login=?')
+      .run(cleanGithubText(message, 300), this.now(), key);
+  }
+
+  private repoRow(key: string): RepoRow | undefined {
+    return this.store.db.prepare('SELECT * FROM github_repos WHERE repo=?').get(key) as RepoRow | undefined;
+  }
+
+  private ensureRepoRow(key: string): RepoRow {
+    const existing = this.repoRow(key);
+    if (existing) return existing;
+    this.store.db
+      .prepare('INSERT OR IGNORE INTO github_repos(repo,baseline_at,last_polled_at) VALUES(?,?,?)')
+      .run(key, 0, 0);
+    return this.repoRow(key)!;
+  }
+
+  private markRepoError(repo: string, message: string): void {
+    const key = repo.toLowerCase();
+    this.ensureRepoRow(key);
+    this.store.db
+      .prepare('UPDATE github_repos SET last_error=?, last_polled_at=? WHERE repo=?')
       .run(cleanGithubText(message, 300), this.now(), key);
   }
 
