@@ -467,6 +467,10 @@ export class GithubTracker {
     this.store.onClose(() => {
       void this.stop();
     });
+    // 旧版本把「动作成功但没有可靠 message_id」当成失败，导致已发出的消息一直 pending。
+    // 修复历史记录，并把所有启用会话都已成功的 pending/failed 事件对齐为 sent。
+    this.repairAmbiguousDeliveries();
+    this.reconcileDeliveredEvents();
     // 作者已从配置移除/暂停时，连同它名下的自动仓库一起取消
     this.pruneInactiveAuthorRepos();
     // 手工改配置/停机期间被停用的作者，其遗留的待推送事件不应无限挂着
@@ -1696,15 +1700,16 @@ export class GithubTracker {
           throwOnError: true,
           timeoutMs: REQUEST_TIMEOUT_MS,
         });
-        if (!Number.isSafeInteger(sent.message_id) || sent.message_id <= 0) {
-          throw new Error('投递回执没有可靠消息ID');
-        }
+        // 部分 OneBot/NapCat 版本动作成功但不返回可靠 message_id；消息已经发出，
+        // 不能再按失败重试，否则会重复推送且面板一直显示“待推送”。
+        const rawId = Number(sent.message_id);
+        const messageId = Number.isSafeInteger(rawId) && rawId > 0 ? rawId : undefined;
         this.store.db
           .prepare(
             'INSERT INTO github_deliveries(event_id,scope,status,message_id,error,created_at) VALUES(?,?,?,?,?,?)',
           )
-          .run(row.event_id, target.scope, 'sent', sent.message_id, '', now);
-        this.recordHistory(target.scope, row.text, sent.message_id);
+          .run(row.event_id, target.scope, 'sent', messageId ?? null, '', now);
+        this.recordHistory(target.scope, row.text, messageId);
       } catch (e) {
         failed++;
         const message = cleanGithubText((e as Error).message, 300) || '发送失败';
@@ -1734,7 +1739,7 @@ export class GithubTracker {
   }
 
   /** 推送成功的事件记进会话历史，让机器人自己的上下文里也有这条消息 */
-  private recordHistory(scope: string, text: string, messageId: number): void {
+  private recordHistory(scope: string, text: string, messageId?: number): void {
     try {
       const scopeType = scope.startsWith('group:') ? 'group' : 'private';
       const targetId = Number(scope.split(':')[1]);
@@ -1749,6 +1754,51 @@ export class GithubTracker {
       });
     } catch (e) {
       this.log.warn({ scope, ...errorDetails(e) }, 'GitHub 动态已发送，但写入会话历史失败');
+    }
+  }
+
+  /** 修复旧版本“动作成功但无 message_id”被误记为失败的投递 */
+  private repairAmbiguousDeliveries(): void {
+    const result = this.store.db
+      .prepare(
+        "UPDATE github_deliveries SET status='sent', error='' WHERE status='failed' AND error='投递回执没有可靠消息ID'",
+      )
+      .run();
+    const changed = Number(result.changes);
+    if (changed > 0) {
+      this.log.info({ deliveries: changed }, '已修复缺少回执 ID 但实际已发送的 GitHub 投递记录');
+    }
+  }
+
+  /** 所有当前启用会话都已成功的事件，不应再停留在 pending/failed */
+  private reconcileDeliveredEvents(): void {
+    const scopes = this.cfg.targets.filter((target) => target.enabled).map((target) => target.scope);
+    if (scopes.length === 0) return;
+    const events = this.store.db
+      .prepare("SELECT event_id FROM github_events WHERE state IN ('pending','failed')")
+      .all() as unknown as Array<{ event_id: string }>;
+    let changed = 0;
+    const deliveryStmt = this.store.db.prepare(
+      'SELECT scope,status FROM github_deliveries WHERE event_id=?',
+    );
+    for (const event of events) {
+      const deliveries = deliveryStmt.all(event.event_id) as unknown as Array<{ scope: string; status: string }>;
+      if (deliveries.length === 0) continue;
+      const sentScopes = new Set(
+        deliveries.filter((delivery) => delivery.status === 'sent').map((delivery) => delivery.scope),
+      );
+      // 当前没有启用会话时，退回到该事件已有的投递记录判断；
+      // 避免用户关掉会话后，已经实际送达的事件仍显示待推送。
+      const targetScopes = scopes.length > 0 ? scopes : [...new Set(deliveries.map((delivery) => delivery.scope))];
+      if (targetScopes.length > 0 && targetScopes.every((scope) => sentScopes.has(scope))) {
+        this.store.db
+          .prepare("UPDATE github_events SET state='sent', last_error='', attempts=0 WHERE event_id=?")
+          .run(event.event_id);
+        changed++;
+      }
+    }
+    if (changed > 0) {
+      this.log.info({ events: changed }, '已对齐 GitHub 事件的已推送状态');
     }
   }
 

@@ -32,8 +32,9 @@
 - 新增 `repoDiscoverySec`（默认 10800 秒 / 3 小时），与追踪轮询独立；手动「立即检查」强制刷新仓库列表。发现失败时保留已有仓库并在面板显示错误。
 - 新增跨源去重：`PushEvent` ↔ `RepoPush` 按 repo + head SHA、`ReleaseEvent` ↔ `RepoRelease` 按 repo + release id；两条都待推送时仓库消息优先，已发送时先到者优先。
 - Token 输入框新增「保存 Token」按钮、回车保存和格式识别；完整 Token 自动保存，输入框下方显示「Token 已保存 / 未设置」；保存日志增加 `tokenSet`。限额显示标注 Token/匿名，保存后下一轮请求刷新；401 明确提示 Token 无效或过期。
+- 修复 OneBot/NapCat 动作成功但回执缺少可靠 `message_id` 时被误判为失败的问题：现在按已发送处理，面板状态为「已推送」，不会重复补发；启动时自动修复历史误记记录并对齐已全部送达的事件。
 - 仓库事件复用现有 `github_events` / `github_deliveries`，按 `repo-push:{repo}:{sha}` / `repo-release:{repo}:{id}` 去重，与作者动态共用本页推送会话。
-- 数据库 schema 升到 v8：`github_events` 新增 `dedupe_key`，`github_authors` 新增公开仓库发现状态，新增 `github_author_repos` 映射表；升级前自动备份。新增 4 项作者仓库/去重/隔离回归，GitHub 追踪测试共 26 项。
+- 数据库 schema 升到 v8：`github_events` 新增 `dedupe_key`，`github_authors` 新增公开仓库发现状态，新增 `github_author_repos` 映射表；升级前自动备份。新增 6 项作者仓库/去重/隔离/回执回归，GitHub 追踪测试共 28 项。
 
 ### 按用途 Token 预算
 
@@ -56,7 +57,7 @@
 
 ### 验证
 
-`npm run typecheck` 通过；`npm run test:github-tracker` 通过（26 项，含作者公开仓库发现/取消、手动与作者重叠、Push/Release 跨源去重、AI 总结）；`npm run test:panel-isolated` 通过（5 项）；`test:persona-context` 12 项、`test-database-maintenance` 2 项、`test-config-atomic` 1 项通过。其余完整离线/接入回归沿用上一版记录；全部使用本地夹具和测试子进程，未调用真实模型、未发送真实 QQ 消息、未打开用户账号数据库。
+`npm run typecheck` 通过；`npm run test:github-tracker` 通过（28 项，含作者公开仓库发现/取消、手动与作者重叠、Push/Release 跨源去重、AI 总结、无 message_id 回执与启动修复）；`npm run test:panel-isolated` 通过（5 项）；`test:persona-context` 12 项、`test-database-maintenance` 2 项、`test-config-atomic` 1 项通过。其余完整离线/接入回归沿用上一版记录；全部使用本地夹具和测试子进程，未调用真实模型、未发送真实 QQ 消息、未打开用户账号数据库。
 
 ## Windows 启动脚本修复
 

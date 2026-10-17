@@ -210,6 +210,8 @@ interface FixtureOptions {
   fetchImpl?: GithubFetch;
   ready?: boolean;
   summarize?: GithubSummarizer;
+  /** 模拟 OneBot 动作成功但回执 message_id 为 0/缺失 */
+  messageId?: number;
 }
 
 function fixture(opts: FixtureOptions = {}) {
@@ -239,7 +241,7 @@ function fixture(opts: FixtureOptions = {}) {
         ? message.map((segment) => String(segment.data['text'] ?? '')).join('')
         : String(message);
       sent.push({ scope, text, message });
-      return { message_id: sent.length };
+      return { message_id: opts.messageId ?? sent.length };
     },
   };
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-github-'));
@@ -1027,6 +1029,82 @@ test('部分会话失败时只重试失败的那个，不重复打扰已送达�
     assert.equal(f.sent.filter((item) => item.scope === 'group:10001').length, 1); // 群没有收到第二遍
     const done = f.store.db.prepare("SELECT state FROM github_events WHERE event_id='new'").get() as { state: string };
     assert.equal(done.state, 'sent');
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('动作成功但回执没有可靠 message_id 时仍记为已推送，不重复补发', async () => {
+  const f = fixture({
+    messageId: 0,
+    plan: {
+      octocat: [
+        { body: [pushEvent('base', 30)] },
+        { body: [pushEvent('base', 30), pushEvent('new', 1)] },
+      ],
+    },
+  });
+  try {
+    await f.tracker.pollNow();
+    await f.tracker.pollNow();
+    assert.equal(f.sent.length, 2); // 两个会话各一条，没有重复
+    const event = f.store.db
+      .prepare("SELECT state,attempts,last_error FROM github_events WHERE type='PushEvent' AND state='sent'")
+      .get() as { state: string; attempts: number; last_error: string } | undefined;
+    assert.equal(event?.state, 'sent');
+    assert.equal(event?.attempts, 0);
+    assert.equal(event?.last_error, '');
+    const deliveries = f.store.db
+      .prepare("SELECT status,message_id,error FROM github_deliveries WHERE status='sent'")
+      .all() as unknown as Array<{ status: string; message_id: number | null; error: string }>;
+    assert.equal(deliveries.length, 2);
+    assert.ok(deliveries.every((row) => row.message_id === null && row.error === ''));
+
+    await f.tracker.pollNow();
+    assert.equal(f.sent.length, 2); // 不再重试
+    assert.equal(f.tracker.snapshot().recentEvents[0]!.state, 'sent');
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('启动修复：缺少回执 ID 的旧投递按已送达处理并对齐事件状态', async () => {
+  const f = fixture({
+    ready: false,
+    config: { targets: [{ scope: 'group:10001', enabled: true }] },
+    plan: {
+      octocat: [
+        { body: [pushEvent('base', 30)] },
+        { body: [pushEvent('base', 30), pushEvent('new', 1)] },
+      ],
+    },
+  });
+  try {
+    await f.tracker.pollNow();
+    await f.tracker.pollNow();
+    const eventId = 'new';
+    f.store.db
+      .prepare(
+        'INSERT INTO github_deliveries(event_id,scope,status,message_id,error,created_at) VALUES(?,?,?,?,?,?)',
+      )
+      .run(eventId, 'group:10001', 'failed', null, '投递回执没有可靠消息ID', NOW);
+    const tracker = f.tracker as unknown as {
+      repairAmbiguousDeliveries(): void;
+      reconcileDeliveredEvents(): void;
+    };
+    tracker.repairAmbiguousDeliveries();
+    tracker.reconcileDeliveredEvents();
+    const event = f.store.db
+      .prepare('SELECT state,last_error,attempts FROM github_events WHERE event_id=?')
+      .get(eventId) as { state: string; last_error: string; attempts: number };
+    assert.equal(event.state, 'sent');
+    assert.equal(event.last_error, '');
+    assert.equal(event.attempts, 0);
+    const delivery = f.store.db
+      .prepare('SELECT status,error FROM github_deliveries WHERE event_id=?')
+      .get(eventId) as { status: string; error: string };
+    assert.equal(delivery.status, 'sent');
+    assert.equal(delivery.error, '');
   } finally {
     await f.dispose();
   }
