@@ -27,8 +27,9 @@
 - 订阅 `owner/repo`（分支留空 = 默认分支），每轮用 `/repos/{owner}/{repo}/commits` 比对 HEAD SHA，有新提交就推送一条汇总：提交数、作者、每条提交首行、compare / commit 链接。
 - 上次 HEAD 不在最近 50 条里时自动用 `compare/{old}...{new}` 拿准确数量；compare 失败按最新一条汇总并注明；修改订阅分支会重建基线，不把新分支历史当新提交。
 - 每个仓库可单独开启 Release 订阅：首次只记录最新版本，之后有新版本才推送，预发布标 🧪。
+- 新增 `aiSummary` 开关（默认开启）：仓库新提交/新 Release 使用「上下文摘要」模型生成 2~4 行 AI 总结，追加在原始消息下方；基于提交信息/发布说明，不拉 diff。模型未配置、超时或失败时仍发送原文；关闭开关后完全不调用摘要模型。
 - 仓库事件复用现有 `github_events` / `github_deliveries`，按 `repo-push:{repo}:{sha}` / `repo-release:{repo}:{id}` 去重，与作者动态共用本页推送会话。
-- 数据库 schema 升到 v7，新增 `github_repos` 表；升级前自动备份。新增 5 项仓库订阅回归，GitHub 追踪测试共 20 项。
+- 数据库 schema 升到 v7，新增 `github_repos` 表；升级前自动备份。新增 7 项仓库订阅 / AI 总结回归，GitHub 追踪测试共 22 项。
 
 ### 按用途 Token 预算
 
@@ -47,11 +48,11 @@
 - 新增文档：逐指令权限、GitHub 追踪、日志诊断、记忆/上下文/Embedding/情绪详解、人格上下文与结构化设定、主动发言相关度、回复窗口与对象归属、Token 预算、内置 SnowLuma。
 - 数据库 schema 升到 v7；升级前自动用 `VACUUM INTO` 生成 `data/brain.db.pre-v7.<时间戳>.bak`，检测到数据库版本高于程序版本时拒绝降级启动。
 - 未新增 npm 依赖，`engines` 仍为 `>=22.16.0`；三个 Windows 批处理与启动回归保持不变。
-- 新增 `config/github.yaml` 脱敏模板（`enabled: false`、`token` 为空、`mode: authors`、`repos: []`）；`config/app.yaml` 补充 `llm.roles.asr`、`llm.tokenBudgets`、`tasks`、`speech` 示例项，其余默认值保持保守。
+- 新增 `config/github.yaml` 脱敏模板（`enabled: false`、`token` 为空、`mode: authors`、`aiSummary: true`、`repos: []`）；`config/app.yaml` 补充 `llm.roles.asr`、`llm.tokenBudgets`、`tasks`、`speech` 示例项，其余默认值保持保守。
 
 ### 验证
 
-`npm run typecheck` 通过；`npm run test:github-tracker` 通过（20 项，含 5 项仓库订阅）；`npm run test:panel-isolated` 通过（5 项）；`test:persona-context` 12 项、`test-database-maintenance` 2 项、`test-config-atomic` 1 项通过。其余完整离线/接入回归沿用上一版记录；全部使用本地夹具和测试子进程，未调用真实模型、未发送真实 QQ 消息、未打开用户账号数据库。
+`npm run typecheck` 通过；`npm run test:github-tracker` 通过（22 项，含仓库订阅与 AI 总结）；`npm run test:panel-isolated` 通过（5 项）；`test:persona-context` 12 项、`test-database-maintenance` 2 项、`test-config-atomic` 1 项通过。其余完整离线/接入回归沿用上一版记录；全部使用本地夹具和测试子进程，未调用真实模型、未发送真实 QQ 消息、未打开用户账号数据库。
 
 ## Windows 启动脚本修复
 

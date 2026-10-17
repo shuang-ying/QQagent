@@ -118,6 +118,8 @@ export const GithubConfigSchema = z.object({
   enabled: z.boolean().default(false),
   /** 作者动态 / 仓库订阅 / 两者；老配置没有该字段时默认沿用作者动态 */
   mode: z.enum(GITHUB_MODES).default('authors'),
+  /** 仓库更新后是否调用摘要模型生成 AI 总结，追加在原始消息下方 */
+  aiSummary: z.boolean().default(true),
   /** 轮询间隔（秒）；GitHub 官方建议轮询不要太频繁 */
   intervalSec: z.number().int().min(60).max(3600).default(300),
   /** 单个作者/仓库每轮最多推送多少条，超出的下一轮继续 */
@@ -315,6 +317,10 @@ export function validateGithubConfig(
       config.enabled = input['enabled'];
     }
     if (input['mode'] !== undefined) config.mode = normalizeMode(input['mode']);
+    if (input['aiSummary'] !== undefined) {
+      if (typeof input['aiSummary'] !== 'boolean') throw new Error('AI 总结开关需要是布尔值');
+      config.aiSummary = input['aiSummary'];
+    }
     if (input['intervalSec'] !== undefined) {
       config.intervalSec = integerValue(input['intervalSec'], '轮询间隔', 60, 3600);
     }

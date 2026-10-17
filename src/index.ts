@@ -32,6 +32,7 @@ import { parseCommand } from './pipeline/command-permissions.js';
 import {SpeechService} from './llm/speech.js';
 import {ScheduledTasks,naturalReminder} from './tasks/scheduled.js';
 import { GithubTracker } from './github/tracker.js';
+import { createGithubSummarizer } from './github/summarize.js';
 import { loadGithubConfig } from './github/config.js';
 import { createServer } from './server/api.js';
 import { SnowLumaController } from './snowluma/controller.js';
@@ -227,6 +228,7 @@ async function main(): Promise<void> {
     log: getLogger('github'),
     ready: () => napcat.apiReady,
     timezone: app.app.timezone,
+    summarize: createGithubSummarizer(providersMgr, getLogger('github'), app.llm.fallback),
   });
   github.start();
   const commands = new CommandHandler(app, store, personaMgr, getLogger('cmd'),tasks);tasks.start();

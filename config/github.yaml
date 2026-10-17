@@ -15,6 +15,10 @@ enabled: false
 #   both    = 两者同时
 mode: authors
 
+# 仓库更新后是否调用摘要模型生成 AI 总结，追加在原始消息下方。
+# 使用「模型用途 → 上下文摘要」的模型；失败或未配置时仍发送原文。
+aiSummary: true
+
 # 轮询间隔（秒），60~3600。GitHub 建议不要轮询太频繁。
 intervalSec: 300
 

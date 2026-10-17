@@ -37,7 +37,10 @@ import {
   type GithubDeliverySender,
   type GithubFetch,
   type GithubHttpResponse,
+  type GithubSummarizer,
+  type GithubSummaryInput,
 } from '../src/github/tracker.js';
+import { createGithubSummarizer } from '../src/github/summarize.js';
 
 const NOW = Date.parse('2026-10-17T12:00:00Z');
 const log = pino({ level: 'silent' });
@@ -176,6 +179,7 @@ interface FixtureOptions {
   config?: Partial<GithubConfig>;
   fetchImpl?: GithubFetch;
   ready?: boolean;
+  summarize?: GithubSummarizer;
 }
 
 function fixture(opts: FixtureOptions = {}) {
@@ -218,6 +222,7 @@ function fixture(opts: FixtureOptions = {}) {
     timezone: 'Asia/Shanghai',
     fetchImpl: fake.fetchImpl,
     now: () => NOW,
+    summarize: opts.summarize,
   });
   tracker.start();
   return {
@@ -239,7 +244,11 @@ function fixture(opts: FixtureOptions = {}) {
   };
 }
 
-function repoFixture(opts: { plan: RepoPlan; config?: Partial<GithubConfig> }) {
+function repoFixture(opts: {
+  plan: RepoPlan;
+  config?: Partial<GithubConfig>;
+  summarize?: GithubSummarizer;
+}) {
   const fake = fakeRepoGithub(opts.plan);
   const f = fixture({
     fetchImpl: fake.fetchImpl,
@@ -249,12 +258,14 @@ function repoFixture(opts: { plan: RepoPlan; config?: Partial<GithubConfig> }) {
       repos: [{ repo: 'owner/repo', branch: 'main', releases: true, enabled: true }],
       ...(opts.config ?? {}),
     },
+    summarize: opts.summarize,
   });
   return { ...f, calls: fake.calls };
 }
 
 test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', () => {
   const base = defaultGithubConfig();
+  assert.equal(base.aiSummary, true);
 
   const ok = validateGithubConfig(
     { authors: ['octocat', 'OctoCat', 'torvalds'], targets: ['group:123456', 'group:123456', 'private:10001'] },
@@ -278,10 +289,14 @@ test('GitHub 配置：作者/会话去重、非法值拒绝、Token 不外泄', 
     { maxEventAgeHours: 0 },
     { eventTypes: ['PushEvent', 'NopeEvent'] },
     { token: 'has space' },
+    { aiSummary: 'yes' },
   ]) {
     assert.equal(validateGithubConfig(bad, base).ok, false, JSON.stringify(bad));
   }
   assert.equal(validateGithubConfig({ intervalSec: 3600 }, base).ok, true);
+  const noSummary = validateGithubConfig({ aiSummary: false }, base);
+  assert.equal(noSummary.ok, true);
+  if (noSummary.ok) assert.equal(noSummary.config.aiSummary, false);
 
   const publicCfg = publicGithubConfig(GithubConfigSchema.parse({ token: 'ghp_secret_value' }));
   assert.equal('token' in publicCfg, false);
@@ -484,6 +499,136 @@ test('修改订阅分支时重建 HEAD 基线，不把新分支历史当新提�
   } finally {
     await f.dispose();
   }
+});
+
+test('仓库订阅 AI 总结：开关、追加在原文下方、失败回退', async () => {
+  const makePlan = () => ({
+    commits: [
+      { body: [repoCommit('base', 30)] },
+      {
+        body: [
+          repoCommit('new', 1, { login: 'alice', message: 'feat: 新增登录\n\n详细说明' }),
+          repoCommit('base', 30),
+        ],
+      },
+    ],
+    releases: [
+      { body: [repoRelease(1, 'v1.0.0', 60)] },
+      { body: [repoRelease(2, 'v1.1.0', 1, { body: '新增登录与修复若干问题' }), repoRelease(1, 'v1.0.0', 60)] },
+    ],
+  });
+
+  const inputs: GithubSummaryInput[] = [];
+  const f = repoFixture({
+    plan: makePlan(),
+    summarize: async (input) => {
+      inputs.push(input);
+      return '新增登录能力\n修复若干问题';
+    },
+  });
+  try {
+    await f.tracker.pollNow(); // 基线
+    await f.tracker.pollNow();
+    assert.equal(inputs.length, 2);
+    assert.deepEqual(inputs.map((item) => item.kind), ['push', 'release']);
+    assert.equal(inputs[0]!.repo, 'owner/repo');
+    assert.equal(inputs[0]!.total, 1);
+    assert.equal(inputs[0]!.commits?.[0]?.author, 'alice');
+    assert.equal(inputs[1]!.release?.tag, 'v1.1.0');
+    assert.equal(f.sent.length, 4);
+    const pushText = f.sent.find((item) => item.text.includes('有 1 个新提交'))!.text;
+    const releaseText = f.sent.find((item) => item.text.includes('发布 v1.1.0'))!.text;
+    for (const text of [pushText, releaseText]) {
+      assert.match(text, /🤖 AI 总结/);
+      assert.match(text, /· 新增登录能力/);
+      assert.ok(text.indexOf('🤖 AI 总结') > text.indexOf('🕐'));
+    }
+  } finally {
+    await f.dispose();
+  }
+
+  let called = 0;
+  const off = repoFixture({
+    plan: makePlan(),
+    config: { aiSummary: false },
+    summarize: async () => {
+      called++;
+      return '不应出现';
+    },
+  });
+  try {
+    await off.tracker.pollNow();
+    await off.tracker.pollNow();
+    assert.equal(called, 0);
+    assert.equal(off.sent.length, 4);
+    assert.ok(off.sent.every((item) => !item.text.includes('AI 总结')));
+  } finally {
+    await off.dispose();
+  }
+
+  const fail = repoFixture({
+    plan: makePlan(),
+    summarize: async () => {
+      throw new Error('模拟摘要失败');
+    },
+  });
+  try {
+    await fail.tracker.pollNow();
+    await fail.tracker.pollNow();
+    assert.equal(fail.sent.length, 4);
+    assert.ok(fail.sent.every((item) => !item.text.includes('AI 总结')));
+    assert.ok(fail.sent.some((item) => item.text.includes('有 1 个新提交')));
+  } finally {
+    await fail.dispose();
+  }
+});
+
+test('AI 总结器：走 summary 角色并保留失败回退', async () => {
+  const calls: Array<{
+    messages: Array<{ role: string; content: string }>;
+    provider: string;
+    model?: string;
+    purpose?: string;
+  }> = [];
+  const fake = {
+    resolveRole: () => ({ provider: 'p', model: 'm' }),
+    chat: async (
+      messages: Array<{ role: string; content: string }>,
+      provider: string,
+      model: string | undefined,
+      opts: { purpose?: string },
+    ) => {
+      calls.push({ messages, provider, model, purpose: opts.purpose });
+      return { content: '摘要结果' };
+    },
+  } as unknown as Parameters<typeof createGithubSummarizer>[0];
+  const text = await createGithubSummarizer(fake, log)({
+    kind: 'push',
+    repo: 'owner/repo',
+    branch: 'main',
+    commits: [{ sha: 'abc1234', author: 'alice', message: 'feat: 新功能' }],
+  });
+  assert.equal(text, '摘要结果');
+  assert.equal(calls[0]!.provider, 'p');
+  assert.equal(calls[0]!.purpose, 'summary');
+  assert.match(calls[0]!.messages[1]!.content, /owner\/repo/);
+  assert.match(calls[0]!.messages[1]!.content, /feat: 新功能/);
+
+  const failing = {
+    resolveRole: () => ({ provider: 'p', model: 'm' }),
+    chat: async () => {
+      throw new Error('模拟模型失败');
+    },
+  } as unknown as Parameters<typeof createGithubSummarizer>[0];
+  assert.equal(
+    await createGithubSummarizer(failing, log)({
+      kind: 'release',
+      repo: 'owner/repo',
+      branch: 'main',
+      release: { tag: 'v1', name: 'v1', body: 'notes', prerelease: false },
+    }),
+    '',
+  );
 });
 
 test('GitHub 配置文件：保存后可读回，损坏时退回默认配置而不是崩溃', () => {
@@ -920,14 +1065,16 @@ test('GitHub 面板 API：状态脱敏、保存校验、立即检查与测试消
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         mode: 'both',
+        aiSummary: false,
         repos: [{ repo: 'owner/repo', branch: 'main', releases: true }],
       }),
     });
     assert.equal(repoGood.status, 200);
     const savedRepo = (await json(repoGood)) as {
-      config: { mode: string; repos: Array<{ repo: string; branch: string }> };
+      config: { mode: string; aiSummary: boolean; repos: Array<{ repo: string; branch: string }> };
     };
     assert.equal(savedRepo.config.mode, 'both');
+    assert.equal(savedRepo.config.aiSummary, false);
     assert.equal(savedRepo.config.repos[0]!.repo, 'owner/repo');
     assert.equal(savedRepo.config.repos[0]!.branch, 'main');
 
@@ -947,6 +1094,8 @@ test('面板含 GitHub 追踪页，内嵌脚本可编译', () => {
   assert.match(html, /id="page-github"/);
   assert.match(html, /id="gh_settings"/);
   assert.match(html, /id="gh_mode"/);
+  assert.match(html, /id="gh_aiSummary"/);
+  assert.match(html, /用 AI 总结更新内容/);
   assert.match(html, /id="gh_repos"/);
   assert.match(html, /function renderGithubRepos/);
   assert.match(html, /\/api\/github\/state/);

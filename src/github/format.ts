@@ -319,8 +319,24 @@ export interface RepoPushInfo {
   occurredAt: number;
 }
 
+/** 追加 AI 总结：最多 4 行，单行截断，保持纯文本 */
+function appendAiSummary(lines: string[], aiSummary: string | undefined): void {
+  const cleaned = String(aiSummary ?? '')
+    .split(/\r?\n/)
+    .map((line) => cleanGithubText(line.replace(/^\s*[-*•]\s*/, ''), 120))
+    .filter(Boolean)
+    .slice(0, 4);
+  if (!cleaned.length) return;
+  lines.push('🤖 AI 总结');
+  for (const line of cleaned) lines.push(`· ${line}`);
+}
+
 /** 仓库订阅：一个分支 HEAD 变化后的新提交汇总 */
-export function renderRepoPush(info: RepoPushInfo, timezone: string): RenderedGithubEvent {
+export function renderRepoPush(
+  info: RepoPushInfo,
+  timezone: string,
+  aiSummary = '',
+): RenderedGithubEvent {
   const repo = cleanGithubText(info.repo, 120) || '未知仓库';
   const branch = cleanGithubText(info.branch, 80) || '默认分支';
   const total = Math.max(1, Math.trunc(info.total) || info.commits.length || 1);
@@ -338,6 +354,7 @@ export function renderRepoPush(info: RepoPushInfo, timezone: string): RenderedGi
   const url = safeGithubUrl(info.url);
   if (url) lines.push(`🔗 ${url}`);
   lines.push(`🕐 ${formatGithubTime(info.occurredAt, timezone)}`);
+  appendAiSummary(lines, aiSummary);
   return {
     summary: `🚀 ${repo} ${branch} +${total} 提交`,
     text: lines.join('\n'),
@@ -359,6 +376,7 @@ export function renderRepoRelease(
   repoName: string,
   release: RepoReleaseInfo,
   timezone: string,
+  aiSummary = '',
 ): RenderedGithubEvent {
   const repo = cleanGithubText(repoName, 120) || '未知仓库';
   const tag = cleanGithubText(release.tag, 60) || '未知版本';
@@ -370,6 +388,7 @@ export function renderRepoRelease(
   const url = safeGithubUrl(release.url);
   if (url) lines.push(`🔗 ${url}`);
   lines.push(`🕐 ${formatGithubTime(release.publishedAt, timezone)}`);
+  appendAiSummary(lines, aiSummary);
   return {
     summary: `${release.prerelease ? '🧪' : '🚀'} ${tag} · ${repo}`,
     text: lines.join('\n'),

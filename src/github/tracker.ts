@@ -68,6 +68,30 @@ export type GithubFetch = (
   init?: { headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<GithubHttpResponse>;
 
+export interface GithubSummaryCommit {
+  sha: string;
+  author: string;
+  message: string;
+}
+
+/** 交给 AI 总结的原始更新数据（提交信息/发布说明均来自 GitHub，属于不可信文本） */
+export interface GithubSummaryInput {
+  kind: 'push' | 'release';
+  repo: string;
+  branch: string;
+  /** 本次变更的总提交数；commits 可能只包含用于摘要的前几条 */
+  total?: number;
+  commits?: GithubSummaryCommit[];
+  release?: {
+    tag: string;
+    name: string;
+    body: string;
+    prerelease: boolean;
+  };
+}
+
+export type GithubSummarizer = (input: GithubSummaryInput) => Promise<string>;
+
 export interface GithubTrackerOptions {
   root: string;
   config: GithubConfig;
@@ -78,6 +102,8 @@ export interface GithubTrackerOptions {
   timezone?: string;
   fetchImpl?: GithubFetch;
   now?: () => number;
+  /** 可选：调用摘要模型生成 AI 总结；失败时不影响原始消息发送 */
+  summarize?: GithubSummarizer;
 }
 
 export interface GithubPollResult {
@@ -358,6 +384,7 @@ export class GithubTracker {
   private readonly timezone: string;
   private readonly fetchImpl: GithubFetch;
   private readonly now: () => number;
+  private readonly summarizeImpl?: GithubSummarizer;
 
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = true;
@@ -380,6 +407,7 @@ export class GithubTracker {
     this.timezone = opts.timezone || 'Asia/Shanghai';
     this.fetchImpl = opts.fetchImpl ?? ((url, init) => fetch(url, init));
     this.now = opts.now ?? (() => Date.now());
+    this.summarizeImpl = opts.summarize;
     this.store.onClose(() => {
       void this.stop();
     });
@@ -883,6 +911,30 @@ export class GithubTracker {
     return `GitHub 返回 ${response.status}${body ? `：${body}` : ''}`;
   }
 
+  /** 调用摘要模型；关闭开关、未注入实现或失败时返回空串，不影响原始消息 */
+  private async summarize(input: GithubSummaryInput): Promise<string> {
+    if (!this.cfg.aiSummary || !this.summarizeImpl) return '';
+    try {
+      const text = await this.summarizeImpl(input);
+      return String(text ?? '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map((line) => cleanGithubText(line.replace(/^\s*[-*•]\s*/, ''), 120))
+        .filter(Boolean)
+        .slice(0, 4)
+        .join('\n');
+    } catch (e) {
+      this.log.warn({ githubRepo: input.repo, ...errorDetails(e) }, 'GitHub 更新 AI 总结失败，保留原始消息');
+      return '';
+    }
+  }
+
+  private eventExists(eventId: string): boolean {
+    return Boolean(
+      this.store.db.prepare('SELECT 1 AS hit FROM github_events WHERE event_id=? LIMIT 1').get(eventId),
+    );
+  }
+
   // ============================================================
   // 仓库订阅：commits / releases
   // ============================================================
@@ -973,21 +1025,39 @@ export class GithubTracker {
         ? `https://github.com/${repo.repo}/compare/${row.head_sha}...${head.sha}`
         : fresh[0]!.url || head.url || `https://github.com/${repo.repo}/commit/${head.sha}`;
     const occurredAt = Math.max(...fresh.map((item) => item.date), head.date) || now;
+    const commitInfos = fresh.map((item) => ({ sha: item.sha, author: item.author, message: item.message }));
+    const eventId = `repo-push:${key}:${head.sha}`;
+    const existing = this.eventExists(eventId);
+    const aiSummary = existing
+      ? ''
+      : await this.summarize({
+          kind: 'push',
+          repo: repo.repo,
+          branch: branchLabel,
+          total,
+          commits: commitInfos,
+        });
     const rendered = renderRepoPush(
       {
         repo: repo.repo,
         branch: branchLabel,
         total,
-        commits: fresh.map((item) => ({ sha: item.sha, author: item.author, message: item.message })),
+        commits: commitInfos,
         url,
         occurredAt,
       },
       this.timezone,
+      aiSummary,
     );
-    if (rewritten) rendered.text += '\n· 历史被重写或变更过多，按当前分支最新提交汇总';
+    if (rewritten) {
+      const note = '\n· 历史被重写或变更过多，按当前分支最新提交汇总';
+      const marker = '\n🤖 AI 总结';
+      const index = rendered.text.indexOf(marker);
+      rendered.text = index >= 0 ? rendered.text.slice(0, index) + note + rendered.text.slice(index) : rendered.text + note;
+    }
 
     const inserted = this.insertRepoEvent(
-      `repo-push:${key}:${head.sha}`,
+      eventId,
       repoOwner(repo.repo),
       GITHUB_REPO_PUSH_TYPE,
       repo.repo,
@@ -1091,6 +1161,21 @@ export class GithubTracker {
     let lastId = row.release_id;
     let lastTag = row.release_tag;
     for (const release of fresh.slice(0, this.cfg.maxEventsPerPoll)) {
+      const eventId = `repo-release:${key}:${release.id}`;
+      const existing = this.eventExists(eventId);
+      const aiSummary = existing
+        ? ''
+        : await this.summarize({
+            kind: 'release',
+            repo: repo.repo,
+            branch: repo.branch || '默认分支',
+            release: {
+              tag: release.tag,
+              name: release.name,
+              body: release.body,
+              prerelease: release.prerelease,
+            },
+          });
       const rendered = renderRepoRelease(
         repo.repo,
         {
@@ -1102,9 +1187,10 @@ export class GithubTracker {
           publishedAt: release.publishedAt,
         },
         this.timezone,
+        aiSummary,
       );
       const inserted = this.insertRepoEvent(
-        `repo-release:${key}:${release.id}`,
+        eventId,
         repoOwner(repo.repo),
         GITHUB_REPO_RELEASE_TYPE,
         repo.repo,

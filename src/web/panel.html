@@ -1984,6 +1984,9 @@ function renderGithubSettings() {
   $('gh_settings').innerHTML =
     '<div class="toggle-row"><div class="txt"><div class="t">启用 GitHub 动态追踪</div><div class="d">关闭后不再自动轮询；「立即检查」仍可手动试跑</div></div>' +
     '<label class="switch"><input type="checkbox" id="gh_enabled"' + (cfg.enabled ? ' checked' : '') + ' onchange="ghMarkDirty()"><span class="slider"></span></label></div>' +
+    '<div class="toggle-row" style="margin-top:12px;align-items:center"><div class="txt"><div class="t">用 AI 总结更新内容</div>' +
+    '<div class="d">在仓库提交 / Release 原始消息下追加摘要；使用「上下文摘要」模型，失败或未配置时仍发送原文</div></div>' +
+    '<label class="switch"><input type="checkbox" id="gh_aiSummary"' + (cfg.aiSummary ? ' checked' : '') + ' onchange="ghMarkDirty()"><span class="slider"></span></label></div>' +
     '<div style="margin-top:12px"><label>追踪模式</label><select id="gh_mode" onchange="ghMarkDirty()">' + modeOptions + '</select>' +
     '<div class="muted">作者动态读公开事件流；仓库订阅直接比对 HEAD SHA 与 Release，更即时。两种模式共用下面的推送会话。</div>' +
     '<div class="muted">修改后自动保存并热更新；「立即保存」仅用于自动保存失败时重试。</div></div>' +
@@ -2256,6 +2259,7 @@ window.saveGithubConfig = async (auto = false) => {
   const clearToken = $('gh_clearToken');
   const payload = {
     enabled: $('gh_enabled').checked,
+    aiSummary: $('gh_aiSummary').checked,
     mode: $('gh_mode').value,
     intervalSec: Number($('gh_interval').value),
     maxEventsPerPoll: Number($('gh_max').value),
